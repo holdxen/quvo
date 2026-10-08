@@ -1,0 +1,15 @@
+[package]
+name = "test_dioxus_qt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cxx = "1.0"
+
+cxx-qt-lib = { version = "0.10", features = ["qt_full"] }
+
+dioxus = { version = "=0.7.10", default-features = false, features = [ "macro", "html", "third-party-renderer", ]}
+dioxus-signals = "0.7.10"
+
+[build-dependencies]
+cxx-qt-build = { version = "0.10", features = ["link_qt_object_files"]}

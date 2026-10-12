@@ -6,6 +6,7 @@ use dioxus::dioxus_core::{
     AttributeValue,
     ElementId,
     Template,
+    TemplateAttribute,
     TemplateNode,
     VirtualDom,
     WriteMutations,
@@ -44,11 +45,39 @@ mod ffi {
             id: u64,
         );
 
-        fn set_text(
+        fn set_property(
             self: Pin<&mut QtHost>,
             id: u64,
-            text: &str,
+            name: &str,
+            value: &str,
         );
+    }
+}
+
+
+// ============================================================
+// Dioxus 侧的原语：Text
+// ============================================================
+//
+// rsx! 的标签名规则（在 dioxus-rsx/src/node.rs）：
+//
+//     text { }     小写单个标识符            -> 元素
+//     qt-text { }  标识符后面跟 `-`          -> 元素
+//     Text { }     首字母大写                -> 组件
+//
+// 也就是说 "Text" 这种写法在 Dioxus 眼里一定是组件，
+// 所以它必须是一个作用域里真实存在的函数。
+//
+// 这个组件自己不认识 Qt，它只把 props 翻译成一个自定义元素；
+// 真正创建 QtQuick.Text 的是下面的 renderer。
+// ============================================================
+
+#[component]
+fn Text(text: String) -> Element {
+    rsx! {
+        qt-text {
+            text: "{text}",
+        }
     }
 }
 
@@ -65,7 +94,9 @@ fn app() -> Element {
     // 屏幕最终出现的这句话，
     // 来源就是这个 Dioxus text node。
     rsx! {
-        "Hello from Dioxus -> Qt Quick >>>>>"
+        Text {
+            text: "Hello from Dioxus -> Qt Quick >>>>>"
+        }
     }
 }
 
@@ -231,32 +262,125 @@ impl WriteMutations for QtRenderer {
             &template.roots[index];
 
 
-        let text =
-            Self::template_text(root)
-                .expect(
-                    "demo only supports static text"
+        // Dioxus 送来的模板告诉我们：
+        //
+        //     这个节点在 Qt 里应该长什么样
+        //
+        // 组件的边界在这里是「透明」的：
+        // rsx! { Text { text: "..." } } 送过来的模板
+        // 已经是组件内部那个 <qt-text> 元素，
+        // 所以 renderer 完全不需要知道 Text 是个组件。
+        //
+        // 真正创建 QtQuick.Text 的就是下面这一段。
+
+        let object = match root {
+            // --------------------------------
+            // 元素：<qt-text text="..." />
+            // --------------------------------
+
+            TemplateNode::Element {
+                tag,
+                attrs,
+                ..
+            } => {
+                // 元素里写死的文本子节点，例如
+                //
+                //     qt-text { "hello" }
+                //
+                // 当作初始 text。
+                // 写在属性上的值后面会覆盖它。
+                let initial =
+                    Self::template_text(root)
+                        .unwrap_or_default();
+
+
+                let object = match *tag {
+                    "qt-text" => self
+                        .host
+                        .pin_mut()
+                        .create_text(initial),
+
+                    other => panic!(
+                        "QtRenderer 不认识元素 \
+                         <{other}>，目前只有 qt-text"
+                    ),
+                };
+
+
+                // 模板里写死的属性（text: "字面量"）此刻就能应用；
+                // 动态属性（text: "{expr}"）Dioxus 稍后会通过
+                // set_attribute 送过来。
+                for attr in attrs.iter() {
+                    if let TemplateAttribute::Static {
+                        name,
+                        value,
+                        ..
+                    } = attr
+                    {
+                        self.host
+                            .pin_mut()
+                            .set_property(
+                                object,
+                                name,
+                                value,
+                            );
+                    }
+                }
+
+
+                println!(
+                    "[Dioxus] LoadTemplate \
+                     id={} <{tag}>",
+                    id.0
                 );
 
 
-        println!(
-            "[Dioxus] LoadTemplate \
-             id={} text={text:?}",
-            id.0
-        );
+                object
+            }
 
 
-        // ================================================
-        // Dioxus mutation
-        //
-        //      ↓
-        //
-        // 真正创建 QtQuick.Text
-        // ================================================
+            // --------------------------------
+            // 裸文本节点：rsx! { "hello" }
+            // --------------------------------
 
-        let object =
-            self.host
-                .pin_mut()
-                .create_text(text);
+            TemplateNode::Text {
+                ..
+            } => {
+                let text =
+                    Self::template_text(root)
+                        .unwrap_or_default();
+
+
+                println!(
+                    "[Dioxus] LoadTemplate \
+                     id={} text={text:?}",
+                    id.0
+                );
+
+
+                self.host
+                    .pin_mut()
+                    .create_text(text)
+            }
+
+
+            // --------------------------------
+            // 动态根节点：组件嵌在元素里、if/for 之类
+            //
+            // 这些需要 placeholder + 路径寻址，
+            // 这一版还没实现。
+            // --------------------------------
+
+            TemplateNode::Dynamic {
+                ..
+            } => {
+                panic!(
+                    "模板根节点是动态节点，\
+                     需要实现 create_placeholder / \
+                     replace_placeholder_with_nodes"
+                );
+            }
+        };
 
 
         assert_ne!(
@@ -400,8 +524,9 @@ impl WriteMutations for QtRenderer {
             if object != 0 {
                 self.host
                     .pin_mut()
-                    .set_text(
+                    .set_property(
                         object,
+                        "text",
                         value,
                     );
             }
@@ -499,11 +624,70 @@ impl WriteMutations for QtRenderer {
 
     fn set_attribute(
         &mut self,
-        _name: &'static str,
+        name: &'static str,
         _ns: Option<&'static str>,
-        _value: &AttributeValue,
-        _id: ElementId,
+        value: &AttributeValue,
+        id: ElementId,
     ) {
+        // 动态属性走这里。
+        //
+        // 例如组件传下来的 text：
+        //
+        //     模板里是 @dynamic#0
+        //
+        //     Dioxus:
+        //
+        //     SetAttribute {
+        //         id: 1,
+        //         text: "Hello ..."
+        //     }
+        //
+        // id 就是 load_template 里那个元素的 ElementId。
+
+        let Some(object) =
+            self.lookup(id)
+        else {
+            println!(
+                "[renderer] SetAttribute \
+                 id={} 还没有映射到 Qt 对象",
+                id.0
+            );
+
+            return;
+        };
+
+
+        // 这一版只处理字符串值。
+        //
+        // Int / Float / Bool 也会从 Dioxus 过来，
+        // 但那要在 C++ 侧包成对应类型的 QVariant 才有意义，
+        // 例如 x / y（int）、color（QColor）。
+
+        let AttributeValue::Text(text) = value
+        else {
+            println!(
+                "[renderer] 暂不支持非字符串属性 \
+                 {name}={value:?}"
+            );
+
+            return;
+        };
+
+
+        println!(
+            "[Dioxus] SetAttribute \
+             id={} {name}={text:?}",
+            id.0
+        );
+
+
+        self.host
+            .pin_mut()
+            .set_property(
+                object,
+                name,
+                text,
+            );
     }
 
 

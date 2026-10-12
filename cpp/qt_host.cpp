@@ -1,5 +1,6 @@
 #include "qt_host.h"
 
+#include <QtCore/QByteArray>
 #include <QtCore/QDebug>
 #include <QtCore/QObject>
 #include <QtCore/QString>
@@ -252,9 +253,10 @@ QtHost::append_to_root(
 
 
 void
-QtHost::set_text(
+QtHost::set_property(
     std::uint64_t id,
-    rust::Str text
+    rust::Str name,
+    rust::Str value
 )
 {
     const auto it =
@@ -264,12 +266,32 @@ QtHost::set_text(
         it == impl_->objects.end() ||
         it->second == nullptr
     ) {
+        qWarning()
+            << "unknown object id"
+            << id;
+
         return;
     }
 
 
-    it->second->setProperty(
-        "text",
-        to_qstring(text)
-    );
+    const QByteArray property =
+        to_qstring(name).toUtf8();
+
+
+    // setProperty 返回 false 说明这个 Qt 对象上没有这个属性，
+    // 或者值没法转换成属性需要的类型。
+    // 例如 color 是 QColor、font.pixelSize 是嵌套属性，
+    // 都不是 QString 能直接写进去的。
+    if (
+        !it->second->setProperty(
+            property.constData(),
+            to_qstring(value)
+        )
+    ) {
+        qWarning()
+            << "[Qt] cannot set property"
+            << property
+            << "="
+            << to_qstring(value);
+    }
 }

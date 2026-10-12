@@ -18,8 +18,14 @@ public:
     // 真正加入 visual tree。
     void append_to_root(std::uint64_t id);
 
-    // 为下一步动态文本更新准备。
-    void set_text(std::uint64_t id, rust::Str text);
+    // 把 Dioxus 侧送来的属性写到 Qt 对象上。
+    // 目前就是 QObject::setProperty(name, value)，
+    // 属性名与 Qt 属性名同名（Dioxus 的 text -> QtQuick.Text::text）。
+    void set_property(
+        std::uint64_t id,
+        rust::Str name,
+        rust::Str value
+    );
 
 private:
     struct Impl;

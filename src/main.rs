@@ -1,3 +1,75 @@
+//! # 这个项目在做什么
+//!
+//! 一句话：把 Dioxus 当成一个「只吐 UI 指令流的 diff 引擎」用，
+//! 自己写一个 renderer，把指令流翻译成 Qt Quick 对象树的建/挂/改。
+//!
+//!
+//! ## 三块东西的分工
+//!
+//! ```text
+//!  Dioxus Core（纯 Rust，crate 依赖）
+//!      app() + rsx! 编译出来的静态模板
+//!      VirtualDom::rebuild / render_immediate
+//!          │
+//!          │  产出 Mutation 流：LoadTemplate / SetAttribute /
+//!          │  AppendChildren / ReplacePlaceholder / ...
+//!          ▼
+//!  QtRenderer（本文件，Rust）
+//!      实现 WriteMutations：把每条 Mutation 翻译成
+//!      「建对象 / 挂父子 / 写属性」这三类动作，
+//!      并自己维护一棵跟 Dioxus 下标一致的节点树
+//!          │
+//!          │  cxx bridge（本文件的 mod ffi）
+//!          ▼
+//!  QtHost（cpp/qt_host.h / cpp/qt_host.cpp，C++）
+//!      唯一真正碰 Qt 的地方：QQuickWindow + QQmlEngine，
+//!      每种控件是一段内联 QML 字符串，
+//!      用 QQmlComponent::setData + create() 实例化
+//! ```
+//!
+//!
+//! ## 没有任何 QML 文件
+//!
+//! 没有 main.qml，没有 QQmlApplicationEngine，load() 一个 QML 文件都没有。
+//! 屏幕上那个 Text 和 Rectangle 全是 Dioxus 的 Mutation 驱动着建出来的。
+//! C++ 侧只提供「原子操作」，不提供 UI、不提供布局。
+//!
+//!
+//! ## id 有四层，别搞混
+//!
+//! ```text
+//!  ElementId        Dioxus 的编号，只在 root/动态节点上有；
+//!                   模板深处的静态元素默认没有 id（要 AssignId 才有）
+//!      ↓  element_to_node
+//!  node id          本 renderer 的树节点编号；占位节点也有，
+//!                   因为 Dioxus 的 path 数是它在模板里的位置
+//!      ↓  Node::object
+//!  object id        C++ 那边 QtHost::Impl::objects 的 key，0 = 窗口根
+//!      ↓  objects
+//!  QObject*         真正的 QtQuick 对象
+//! ```
+//!
+//!
+//! ## 阅读顺序建议
+//!
+//! 1. `app()` —— 用户写的 UI 就三行
+//! 2. `mod ffi` —— Rust 能让 C++ 做的全部六件事
+//! 3. `QtRenderer` 的三个字段 —— renderer 记了哪三本账
+//! 4. `impl WriteMutations` —— 指令如何变成 Qt 调用（核心）
+//! 5. `main()` —— 拼起来的顺序
+//!
+//!
+//! ## 当前边界（重要）
+//!
+//! 只跑通了 mount（首次渲染）这一条路，diff（更新）那条路是断的：
+//!
+//! - 更新路径要用的 `replace_node_with` / `remove_node` /
+//!   `insert_nodes_after` / `insert_nodes_before` 在本文件里还是 panic；
+//! - `main()` 里没有把 Dioxus 的异步 runtime 接到 Qt 的事件循环上，
+//!   signal 变了没人去唤醒 VirtualDom。
+//!
+//! 所以现在是「渲染一次就定住」。详见 `main()` 上方的注释。
+
 use cxx::UniquePtr;
 
 use cxx_qt_lib::QGuiApplication;
@@ -20,6 +92,24 @@ use std::collections::HashMap;
 // ============================================================
 // Rust <-> C++ Qt bridge
 // ============================================================
+//
+// 这六个函数就是 renderer 能对 Qt 做的全部事情。
+// 一次完整的首次渲染，调用顺序是：
+//
+//     new_qt_host()          建 QtHost：内部有 QQuickWindow + QQmlEngine
+//     show()                 窗口先显示，之后边建边能看见
+//
+//     create_text /
+//     create_rectangle       每碰到一个元素就实例化一个 Qt 对象；
+//                            此刻它还没有 parent，等于屏幕上不存在
+//     set_property()         写属性。静态属性在建对象时就写，
+//                            动态属性由 Dioxus 稍后补发
+//     mount()                挂进 visual tree —— 到这一步才真的可见
+//     stack_before()         调同一 parent 下的叠放顺序
+//
+// 注意「建对象」和「挂到树上」被刻意拆成两步：
+// Dioxus 会先把一棵子树整个 LoadTemplate 出来（还没 parent），
+// 之后才用 AppendChildren / ReplacePlaceholder 决定它挂哪、排第几。
 
 #[cxx::bridge]
 mod ffi {
@@ -28,36 +118,65 @@ mod ffi {
             "test_dioxus_qt/cpp/qt_host.h"
         );
 
+        // C++ 侧那个类的 opaque 类型。
+        // Rust 只能通过 UniquePtr<QtHost> 持有它，
+        // 里面的 Qt 对象 Rust 完全看不见。
         type QtHost;
 
+        // 只能在 QGuiApplication 建好之后调用（见 main()）。
         fn new_qt_host()
             -> UniquePtr<QtHost>;
 
+        // QQuickWindow::show()。
+        // 这里先 show 再渲染，是为了跑起来能肉眼看到内容一点点出现。
         fn show(
             self: Pin<&mut QtHost>
         );
 
+        // 实例化一个 QtQuick.Text。
+        // 返回值是 C++ 侧分配的 object id（0 表示创建失败）。
+        //
+        // 两个地方会调它：
+        //   - 模板里的静态文本（TemplateNode::Text）
+        //   - 动态文本 / <qt-text> 元素本身
         fn create_text(
             self: Pin<&mut QtHost>,
             text: &str,
         ) -> u64;
 
+        // 实例化一个 QtQuick.Rectangle。
+        // 它没有属性需要从 Rust 传，宽高颜色全写死在 C++ 那段内联 QML 里。
         fn create_rectangle(
             self: Pin<&mut QtHost>,
         ) -> u64;
 
+        // 把 child 挂到 parent 下面，正式进 visual tree。
+        //
+        // parent_id == 0 是约定好的「窗口根」，
+        // C++ 那边翻译成 window.contentItem()。
         fn mount(
             self: Pin<&mut QtHost>,
             parent_id: u64,
             child_id: u64,
         );
 
+        // 让 child 在叠放顺序上排到 sibling 前面。
+        //
+        // 为什么需要：mount 只能往末尾追加，
+        // 而 ReplacePlaceholder 要把新节点插回坑位原来的位置，
+        // 所以挂完还要再往前挪一下。
         fn stack_before(
             self: Pin<&mut QtHost>,
             child_id: u64,
             sibling_id: u64,
         );
 
+        // QObject::setProperty(name, QVariant( QString(value)) )。
+        //
+        // 属性名直接对上 Qt 的属性名：
+        // Dioxus 侧写 text: "..."，这里就落到 QtQuick.Text::text。
+        // 写不进去的（类型不匹配，比如 color 要 QColor、
+        // font.pixelSize 要 int）会在 C++ 侧 qWarning。
         fn set_property(
             self: Pin<&mut QtHost>,
             id: u64,
@@ -72,17 +191,32 @@ mod ffi {
 // Dioxus 侧的原语：Text
 // ============================================================
 //
-// rsx! 的标签名规则（在 dioxus-rsx/src/node.rs）：
+// 先说 rsx! 怎么区分「元素」和「组件」，规则在
+// dioxus-rsx-0.7.10/src/node.rs:87-94，判据是名字本身：
 //
-//     text { }     小写单个标识符            -> 元素
-//     qt-text { }  标识符后面跟 `-`          -> 元素
-//     Text { }     首字母大写                -> 组件
+//     单个标识符 + 首字母小写 + 名字里不含下划线   ->   元素
+//     其它（首字母大写 / 含下划线 / 是路径）        ->   组件
 //
-// 也就是说 "Text" 这种写法在 Dioxus 眼里一定是组件，
-// 所以它必须是一个作用域里真实存在的函数。
+//     text { }       -> 元素
+//     qt_text { }    -> 组件（因为有下划线）
+//     Text { }       -> 组件
+//     crate::Text {} -> 组件
 //
-// 这个组件自己不认识 Qt，它只把 props 翻译成一个自定义元素；
-// 真正创建 QtQuick.Text 的是下面的 renderer。
+// 带 `-` 的标签也算元素：标签是先按 `-` 切开再拼回去解析的
+// （dioxus-rsx-0.7.10/src/element.rs:352），所以 qt-text 能用，
+// 而且 renderer 拿到的 tag 字符串就是 "qt-text"。
+//
+// 也就是说 <Text> 这种写法在 Dioxus 眼里一定是组件，
+// 它必须是作用域里真实存在的函数 —— 就是下面的 #[component]。
+//
+// 这两个组件的作用只是「把好看的 API 翻译成一个自定义元素」，
+// 它们自己完全不认识 Qt；
+// 真正建出 QtQuick.Text 的是下面 QtRenderer 里的 create_element。
+//
+// props 那侧也没什么魔法：
+//     text: String   -> 变成元素上的一个动态属性
+//     children: Element -> 变成元素里的一个动态坑位（Dynamic）
+// 这两条路分别对应 set_attribute 和 replace_placeholder_with_nodes。
 // ============================================================
 
 #[component]
@@ -112,6 +246,29 @@ fn Rectangle() -> Element {
 // 用户的 Dioxus UI
 // ============================================================
 
+// 就这三行是「应用」，其余全是 renderer。
+//
+// 这句 rsx! 编译完之后，Dioxus 侧其实是两个模板：
+//
+//     app() 的模板
+//         roots         = [ Dynamic ]              ← 根上就一个动态节点
+//         dynamic_nodes = [ Component(Text) ]       ← 它是组件调用
+//
+//     Text() 的模板
+//         roots         = [ Element(qt-text) ]
+//         dynamic_attrs = [ ("text", 动态值) ]      → 走 set_attribute
+//         dynamic_nodes = [ Dynamic ]               → children 的那个坑位
+//                                                     走 replace_placeholder_with_nodes
+//
+// 组件嵌套在 mount 时是「透明」的：
+// renderer 只会收到 LoadTemplate(<qt-text>)、
+// SetAttribute(text)、LoadTemplate(<qt-rectangle>)、
+// ReplacePlaceholder([0], 1)、AppendChildren(ElementId(0), 1)，
+// 全程不知道 Text / Rectangle 是组件。
+//
+// Rectangle 没有子节点、没有动态属性，
+// 所以它那个模板只产生一条 LoadTemplate。
+
 fn app() -> Element {
     // 注意：
     //
@@ -139,16 +296,39 @@ fn app() -> Element {
 //                         树里有它，Qt 里还没有东西，
 //                         等着被 ReplacePlaceholder 顶掉
 //
+// children 的顺序就是 Dioxus 模板里的顺序，占位节点也占一格 ——
+// resolve_slot 拿 path 的下标直接索引它，顺序错一个就全错。
+//
 // 根节点的 object 是 Some(0)：0 在 C++ 那边表示「窗口根」。
 
 #[derive(Default)]
 struct Node {
     object: Option<u64>,
 
+    // 子节点的 node id，按模板顺序
     children: Vec<u64>,
 }
 
 
+// renderer 的全部状态就是这四个字段。
+//
+// 本质工作是在翻译两套编号：
+//
+//     Dioxus 只会说  ElementId / 模板里的 path
+//     Qt   只认     object id
+//
+// 所以中间必须有一棵树把两者接起来，而且要维持住 Dioxus 期望的
+// 「第几个孩子」的顺序 —— 哪怕那个位置上的东西在 Qt 里根本不存在。
+//
+//     nodes            node id -> Node（它有没有 Qt 对象 + 孩子顺序）
+//                      这是「按 Dioxus 的视角」建的树，占位节点也算一格
+//     element_to_node  ElementId -> node id
+//                      所有按 id 寻址的 mutation 都靠它落地
+//     stack            Dioxus 约定的临时栈，见 WriteMutations 的注释
+//     host             唯一能碰 Qt 的入口
+//
+// C++ 那边还有第四本账：QtHost::Impl::objects（object id -> QObject*），
+// Rust 侧看不到它，也不需要看到 —— Rust 只握着 id。
 struct QtRenderer {
     host: UniquePtr<ffi::QtHost>,
 
@@ -162,6 +342,9 @@ struct QtRenderer {
     nodes: HashMap<u64, Node>,
 
 
+    // 只增不减的 node id 分配器。
+    // 节点被占位符顶掉之后 id 不回收（nodes.remove 了但 id 不会重用），
+    // 这样旧 id 万一被引用到，也不会撞上新节点。
     next_node: u64,
 
 
@@ -175,6 +358,16 @@ struct QtRenderer {
     //
     // [ROOT]
     //
+    // 规则散在 dioxus-core 的注释和实现里，归纳起来是：
+    //     LoadTemplate / CreateTextNode / CreatePlaceholder / PushRoot
+    //             → 往栈上压自己新建的节点，且个数是写死的
+    //               （diff/node.rs:632-634「This creates one node on the stack」）
+    //     AppendChildren / ReplacePlaceholder { m }
+    //             → 弹掉栈顶 m 个（mutations.rs:53-63）
+    // 所以「弹完 m 个之后的栈顶」就是这 m 个节点的锚点，
+    // 下面好几个方法都靠这个性质找父节点
+    // （diff/node.rs:622「This operation relies on the fact that
+    //   the root node is the top node on the stack」）。
     stack: Vec<u64>,
 
 
@@ -186,11 +379,15 @@ struct QtRenderer {
     //
     // 我们树里的节点 id
     //
+    // 用 Vec 而不是 HashMap 是因为 ElementId 就是连续的小整数，
+    // 偶尔会跳着分配，所以中间允许出现 None。
     element_to_node: Vec<Option<u64>>,
 }
 
 
 impl QtRenderer {
+    // 注意调用时机：必须等 QGuiApplication 建好，
+    // 否则下面的 new_qt_host() 里构造 QQuickWindow 会炸。
     fn new() -> Self {
         let mut host =
             ffi::new_qt_host();
@@ -226,12 +423,22 @@ impl QtRenderer {
 
             nodes,
 
+            // 0 号 node 已经被 root 占了，所以从 1 开始发
             next_node: 1,
 
             // Dioxus renderer root
+            //
+            // 栈里预置这一个元素，rebuild 结束时
+            // AppendChildren 正好把它当锚点用。
             stack: vec![0],
 
             // ElementId(0) == renderer root
+            //
+            // 这不是随便挑的编号：VirtualDom::rebuild 的最后一步
+            // 固定发 to.append_children(ElementId(0), m)
+            // （dioxus-core-0.7.10/src/virtual_dom.rs:593），
+            // 所以这里必须先把 0 号位置占住，
+            // 否则第一条 AppendChildren 就找不到父节点。
             element_to_node: vec![Some(0)],
         }
     }
@@ -281,6 +488,12 @@ impl QtRenderer {
     }
 
 
+    // 这个 node 的 node id 挂到 Dioxus 的 ElementId 上。
+    //
+    // 会被绑定的只有 Dioxus 「点名」过的那几个节点：
+    // LoadTemplate 的根、CreateTextNode、CreatePlaceholder。
+    // 模板深处的静态元素默认没有 ElementId ——
+    // 想要的话得实现 assign_node_id（这一版是空的，见下面）。
     fn bind(
         &mut self,
         id: ElementId,
@@ -299,6 +512,10 @@ impl QtRenderer {
     }
 
 
+    // ElementId -> node id。
+    //
+    // Dioxus 的 ElementId 不是连续分配的（每次 next_element() 拿一个），
+    // 所以数组里会有洞，这里用 get().copied().flatten() 而不是直接索引。
     fn lookup(
         &self,
         id: ElementId,
@@ -316,6 +533,10 @@ impl QtRenderer {
 
 
     // 这个 ElementId 对应的 Qt 对象（占位节点没有）。
+    //
+    // 返回 None 的两种情况：这个 id 压根没绑过，
+    // 或者绑的是个占位节点。调用方目前都是「那就跳过」，
+    // 也就是说这类属性/文本更新会被丢掉。
     fn object_of(
         &self,
         id: ElementId,
@@ -324,6 +545,14 @@ impl QtRenderer {
     }
 
 
+    // 按 Dioxus 的栈契约取走栈顶 m 个节点。
+    //
+    // 注意只弹 m 个：锚点（父节点 / 模板根）要留在栈上别动，
+    // AppendChildren 和 ReplacePlaceholder 弹完还要用它。
+    //
+    // 那个 assert 值得留着：一旦这里的 m 和 Dioxus 实际压栈的数量
+    // 不一致，后面每个节点都会挂错父节点，静默错下去非常难查，
+    // 不如当场炸。
     fn pop_m(
         &mut self,
         m: usize,
@@ -343,7 +572,8 @@ impl QtRenderer {
     // --------------------------------------------------------
     // 建模板
     //
-    // Dioxus 的模板是一棵静态树，节点只有三种：
+    // Dioxus 的模板是一棵静态树，节点只有三种
+    // （定义在 dioxus-core-0.7.10/src/nodes.rs:420-475）：
     //
     //     Text { }        静态文本
     //     Element { }     元素
@@ -351,6 +581,19 @@ impl QtRenderer {
     //
     // 静态部分在这里一次性建好；
     // 动态位置先立一个占位节点，之后被顶掉。
+    //
+    // Template 本体是三块数据（nodes.rs:274-300）：
+    //
+    //     roots        静态树本体，rsx! 允许多个根
+    //     node_paths   每个动态节点在树里的位置，深度优先排列
+    //     attr_paths   每个动态属性的位置
+    //
+    // path 的格式是 [第几个 root, 进第几个孩子, 再进第几个孩子...]；
+    // 发给 renderer 时会去掉第一位（相对栈顶那个 root），见 diff/node.rs:774。
+    //
+    // 于是这条递归有个硬性要求：children 的建序必须和模板完全一致，
+    // Dynamic 也要老老实实建出一个占位节点，
+    // 否则后面 resolve_slot 按下标找位置就会找错。
     // --------------------------------------------------------
 
     fn create_template_node(
@@ -420,6 +663,12 @@ impl QtRenderer {
             TemplateNode::Text {
                 text,
             } => {
+                // 静态文本：内容直接写死在模板里，
+                // 建出来之后 Dioxus 永远不会再对它发 mutation，
+                // 所以这一类节点根本不需要 ElementId。
+                //
+                // 会变的那种文本是 dynamic text，
+                // 走的是 create_text_node / set_node_text。
                 let object =
                     self.host
                         .pin_mut()
@@ -432,6 +681,12 @@ impl QtRenderer {
 
             // 动态位置：先占个坑，
             // 之后 ReplacePlaceholder 会拿真节点顶掉它。
+            //
+            // 这里被忽略的那个 id（TemplateNode::Dynamic { id }）
+            // 是 dynamic_nodes 和 node_paths 里的下标。
+            // 本 renderer 不需要它 ——
+            // 我们是按「它在树的哪个位置」来找这个坑的，
+            // 下标信息已经在父子顺序里了。
             TemplateNode::Dynamic {
                 ..
             } => self.new_node(None),
@@ -441,9 +696,23 @@ impl QtRenderer {
 
     // Dioxus 的元素名 -> Qt 对象。
     //
-    // 这就是「自定义内置控件」的落点：
-    // 加一个新控件 = 这里加一个 tag，
-    // 加上 C++ 那边一个 create_*。
+    // 这就是「自定义内置控件」的落点，
+    // 也是整个 renderer 唯一认识「有哪些控件」的地方。
+    //
+    // 加一个新控件要动三处：
+    //
+    //     1. 这里的 match 加一个分支（tag 就是 rsx! 里写的标签名）
+    //     2. cpp/qt_host.h + .cpp 加一个 create_xxx()，
+    //        里面写好该控件对应的内联 QML
+    //     3. 本文件顶部 mod ffi 里声明这个函数
+    //
+    // 属性不用登记：set_property 走 QObject::setProperty，
+    // 名字对上 Qt 的属性名就行。
+    //
+    // 为什么 qt-text 传空串进来：
+    // text 在模板里是动态属性（text: "{text}"），
+    // 建对象这一刻值还没送过来，得等随后的 SetAttribute；
+    // 静态字面量那条路是在 create_template_node 里直接写上的。
     fn create_element(
         &mut self,
         tag: &str,
@@ -459,6 +728,9 @@ impl QtRenderer {
                 .pin_mut()
                 .create_rectangle(),
 
+            // 大小写规则见文件里 Text 组件上方的注释：
+            // 走到这里的一定是被当成元素的标签，
+            // 所以命中这条说明 rsx! 里写了个 renderer 不认识的标签名。
             other => panic!(
                 "QtRenderer 不认识元素 <{other}>"
             ),
@@ -467,6 +739,8 @@ impl QtRenderer {
 
 
     // 把 child 挂到 parent 下面。
+    //
+    // 树这边无条件记；Qt 那边只有一边已经有对象了才动手。
     fn attach(
         &mut self,
         parent: u64,
@@ -484,6 +758,11 @@ impl QtRenderer {
         // Qt 侧：把 child 的对象挂到 parent 的对象下。
         //
         // 有一方还没有 Qt 对象（占位节点）时先只记树。
+        //
+        // 这里只记树不挂载是安全的：
+        // 挂不了是因为 child 那一侧根本还没有对象，
+        // 而它后来变成真节点时，
+        // ReplacePlaceholder / AppendChildren 会补上这次 mount。
         if let (
             Some(parent_object),
             Some(child_object),
@@ -504,6 +783,21 @@ impl QtRenderer {
     // 路径 -> (父节点, 在父节点里的下标)
     //
     // 路径是「第几个子节点」的序列。
+    //
+    // 语义见 dioxus-core-0.7.10/src/mutations.rs:59-63：
+    //     []        栈顶节点自己
+    //     [0]       第一个孩子
+    //     [0,1,2]   第 1 个孩子的第 2 个孩子的第 3 个孩子
+    //
+    // 下标数的是「模板里的位置」，占位节点也算一格，
+    // 这正是 nodes 里要维护那些没有 Qt 对象的节点的原因。
+    //
+    // 一个不太明显的约束：一次 ReplacePlaceholder 会把 1 个位置变成
+    // m 个，父节点后面的下标全右移了。
+    // Dioxus 侧对同一模板的多个坑位是「倒着处理」的
+    // （diff/node.rs:749-761，issue 2809 就是这么修的），
+    // 所以从前往后读到的 path 不会被污染。
+    // 我们如果哪天自己造 mutation，这条不变式得自己守住。
     fn resolve_slot(
         &self,
         from: u64,
@@ -526,6 +820,12 @@ impl QtRenderer {
 
 
     // 节点从树里拿掉之后，清掉指向它的 ElementId 映射。
+    //
+    // 不清的话，lookup 会命中一个不在树里的 node id ——
+    // 目前 lookup 里有 contains_key 兜底，所以这里是双保险。
+    //
+    // 代价是每次都要线性扫一遍全部 ElementId，
+    // 节点多了得换成反向索引。
     fn forget_element_ids(
         &mut self,
         node: u64,
@@ -544,11 +844,37 @@ impl QtRenderer {
 // ============================================================
 // Dioxus -> Qt
 // ============================================================
+//
+// 这个 impl 就是整个项目的「渲染层」，
+// WriteMutations 是 Dioxus 给第三方 renderer 的全部接口
+// （dioxus-core-0.7.10/src/mutations.rs:14）。
+// 实现到哪条，UI 上就支持哪种写法，没实现的要么 panic 要么默默丢掉。
+//
+// 首次渲染（mount）实际会发出的那几条，按本项目的 app() 排一下：
+//
+//     LoadTemplate(<qt-text>)         id=ElementId(1)   → 压栈 1 个
+//     SetAttribute(text, "Hello…")    id=1              → 写 Qt 属性
+//     LoadTemplate(<qt-rectangle>)    id=ElementId(2)   → 压栈 1 个
+//     ReplacePlaceholder([0], m=1)    → 弹 1 个，挂进 qt-text 的坑位
+//     AppendChildren(ElementId(0), m=1) → 弹 1 个，挂进窗口根
+//
+// 更新（diff）走的是另外一组：SetText、ReplaceWith、Remove、
+// InsertAfter/InsertBefore —— 见下面「这一版用不到」那一节的注释。
 
 impl WriteMutations for QtRenderer {
     // ========================================================
     // 最重要 #1
     // ========================================================
+    //
+    // LoadTemplate 是「把一棵静态 Qt 子树建出来」的入口，
+    // 也是本项目里唯一会调用 create_element 的地方
+    // （换句话说：只有它认识 <qt-text> / <qt-rectangle>）。
+    //
+    // 契约：必须在栈上留下恰好 1 个节点。
+    // Dioxus 那边是硬编码这个数量的
+    // （diff/node.rs:632-634「This creates one node on the stack」），
+    // 后面 AppendChildren / ReplacePlaceholder 就按这个数目去弹，
+    // 所以这里的 stack.push 既不能省、也不能多。
 
     fn load_template(
         &mut self,
@@ -566,11 +892,21 @@ impl WriteMutations for QtRenderer {
         //
         // 送过来的模板已经是组件内部那个 <qt-text> 元素，
         // 所以 renderer 完全不需要知道 Text 是个组件。
+        //
+        // 组件嵌套只是 VirtualDom 里的 scope 嵌套，
+        // 落到指令流层面跟手写 <qt-text> 没有区别。
+        //
+        // index（也就是 template.roots 的下标）为什么用不上：
+        // rsx! 允许多根，但我们的组件全是单根，
+        // 所以每个模板只会走到 roots[0]。
 
         let node =
             self.create_template_node(root);
 
 
+        // 只有根节点带 ElementId；
+        // 模板深处的静态元素要等 AssignId 才有 id，
+        // 而 assign_node_id 目前是空实现。
         self.bind(id, node);
 
 
@@ -584,6 +920,15 @@ impl WriteMutations for QtRenderer {
         );
     }
 
+    // 把栈顶 m 个节点挂到 id 那个节点下面。
+    //
+    // 本项目里它只在最外层出现一次：VirtualDom::rebuild 收尾时固定发
+    // append_children(ElementId(0), m)（virtual_dom.rs:593），
+    // 也就是「把 app() 渲染出来的那 m 个根节点挂到窗口根上」。
+    //
+    // 注意父节点是用 id 找的，不是用栈顶找的 ——
+    // 跟下面的 replace_placeholder_with_nodes 正好相反，
+    // 那个是靠栈顶当锚点。
     fn append_children(
         &mut self,
         id: ElementId,
@@ -617,6 +962,14 @@ impl WriteMutations for QtRenderer {
         }
     }
 
+    // 动态文本第一次出现。
+    //
+    // 对应 rsx! 里插值出来的那种文本（"{some_value}" 独立成一个节点），
+    // 不是模板里写死的静态文本 —— 静态那条在
+    // create_template_node 的 TemplateNode::Text 分支里已经建好了。
+    //
+    // 同样要压栈：Dioxus 侧认为这个操作在栈上留 1 个节点
+    // （diff/node.rs:876-890）。
     fn create_text_node(
         &mut self,
         value: &str,
@@ -645,6 +998,12 @@ impl WriteMutations for QtRenderer {
         self.stack.push(node);
     }
 
+    // 改一个已存在文本节点的内容 —— 这是 diff（更新）路径的活儿
+    // （dioxus-core-0.7.10/src/diff/node.rs:217）。
+    //
+    // 实现上就是往 Qt 对象的 text 属性再写一次。
+    // 注意找不到对象时直接跳过：这是「更新丢失」而不是错误，
+    // 现在 app() 是静态的所以不会走到，接上 signal 之后要留意。
     fn set_node_text(
         &mut self,
         value: &str,
@@ -671,6 +1030,19 @@ impl WriteMutations for QtRenderer {
     }
 
 
+    // 把一个「早就建好的节点」重新压回栈。
+    //
+    // 为什么需要：栈是 m 的来源。
+    // 列表 diff（key 变了、if 换了分支、for 重排）要把旧节点搬个位置，
+    // 旧节点不在任何新建流程里，就只能靠 PushRoot 手动放回栈上，
+    // 后面的 InsertAfter / InsertBefore / ReplaceWith 才弹得到它。
+    //
+    // 唯一发出点是 dioxus-core-0.7.10/src/diff/iterator.rs:506 和 :511
+    // （VNode::push_all_root_nodes）。
+    //
+    // 也就是说：这个方法目前根本不会被调用 ——
+    // 它服务的那几条 Insert*/Replace* 在本文件里还是 panic。
+    // 实现留在这里纯粹是因为 trait 要求它有实现。
     fn push_root(
         &mut self,
         id: ElementId,
@@ -692,13 +1064,38 @@ impl WriteMutations for QtRenderer {
     // ========================================================
     // 下面这些这一版用不到。
     //
-    // 因为我们的 app() 只有：
+    // 先打个补丁：这个分组标题现在已经不太准了。
+    // create_placeholder 和 replace_placeholder_with_nodes
+    // 现在就在一起跑 —— Rectangle 顶掉 <qt-text> 里那个坑位
+    // 走的正是这两条，它们属于 mount 路径。
     //
-    //     一个 static Text
+    // 剩下几个真正「用不到」的原因是它们只出现在 diff（更新）路径，
+    // 首次渲染根本不会发：
+    //
+    //     assign_node_id      → AssignId，
+    //                           给模板深处的元素补 id（diff/node.rs:871）
+    //     replace_node_with   → 旧节点整坨被换掉（diff/node.rs:326、381）
+    //     remove_node         → 旧节点删除（diff/node.rs:328、383）
+    //     insert_nodes_before → 列表重排（diff/iterator.rs:447）
+    //     insert_nodes_after  → 列表重排（diff/iterator.rs:467）
+    //
+    // 结论：光把 Qt 的事件接上、让 signal 能触发 diff 还不够，
+    // panic 的那几个必须一起实现，否则第一次更新就炸。
     //
     // 下一版再真正实现。
     // ========================================================
 
+    // 给模板深处的静态元素补一个 ElementId。
+    //
+    // path 语义跟 resolve_slot 一样（相对栈顶那个模板根）。
+    //
+    // 现在为空实现的后果：
+    // 只要嵌套深一层，比如 <qt-text> 里面还有一个静态 <qt-row>，
+    // 那个内层元素就永远拿不到 ElementId，
+    // Dioxus 之后 SetAttribute(id=内层) 找不到节点，
+    // 属性更新被 object_of 那层静默丢弃
+    // （见 set_attribute 里「还没有映射到 Qt 对象」那个分支）。
+    // 这一版所有属性都挂在模板根上，所以看不出问题。
     fn assign_node_id(
         &mut self,
         _path: &'static [u8],
@@ -707,6 +1104,16 @@ impl WriteMutations for QtRenderer {
     }
 
 
+    // 建一个「以后可能长成东西」的空位。
+    //
+    // Dioxus 自己给的理由写在 mutations.rs:30-34：
+    // 列表 diff 需要一个可重入的锚点，
+    // 现在什么都没有的位置也得在真实树里留个格子，
+    // 不然下次这一格变成真节点时没地方插。
+    //
+    // 发出点：diff/node.rs:892-905，
+    // 对应 dynamic node 的值是 Placeholder 的情况
+    // （组件没传 children、或者 `{None}` 这类空 Element）。
     fn create_placeholder(
         &mut self,
         id: ElementId,
@@ -745,6 +1152,33 @@ impl WriteMutations for QtRenderer {
     }
 
 
+    // ========================================================
+    // 最重要 #2：模板里的动态坑位被真节点顶掉
+    // ========================================================
+    //
+    // 这是整个 renderer 里唯一真正的「动态内容」入口，
+    // 也是把 Dioxus 的 diff 能力接过来的关键一步。
+    //
+    // 全 dioxus-core 只有一个发出点：diff/node.rs:776，
+    // 在 load_placeholders 里面 —— 换句话说这条只属于 mount 路径，
+    // 更新时同一个位置走的是 ReplaceWith / InsertAfter（见上面那节）。
+    //
+    // 三条必须遵守的契约，都是库那边写死的：
+    //
+    // 1. path 相对「栈顶节点」，而栈顶此刻必须是模板根。
+    //    node.rs:622 的注释直接写着
+    //    "This operation relies on the fact that the root node is the
+    //    top node on the stack"；
+    //    node.rs:774-775 传的是 &node_paths[idx][1..]，
+    //    即把「第几个 root」那一段剥掉之后的剩余部分。
+    //
+    // 2. m 是刚压上栈的节点个数，弹完 m 个，栈顶得回到模板根。
+    //    这就是下面 anchor 敢用 stack.last() 的原因。
+    //
+    // 3. 同一个模板里多个坑位是「倒序」处理的（node.rs:749-761），
+    //    因为一次替换会把 1 个下标变成 m 个，污染后面的 path；
+    //    倒着做就只会污染已经处理完的位置。
+    //    issue 2809 就是没倒序导致的，别把这条弄坏了。
     fn replace_placeholder_with_nodes(
         &mut self,
         path: &'static [u8],
@@ -766,6 +1200,14 @@ impl WriteMutations for QtRenderer {
 
         // Qt 侧要插在「原来那个位置的下一个兄弟」前面，
         // 子节点顺序才跟 Dioxus 一致。
+        //
+        // 两个细节：
+        //   - 从 slot+1 往后找，是因为坑位自己就在 slot；
+        //   - 用 find_map 而不是直接取 slot+1，是因为后面的兄弟
+        //     可能还是个占位节点，在 Qt 里没有对象，拿它当锚点没意义。
+        //
+        // 也正因为坑位右侧的兄弟会先被处理（契约 3 的倒序），
+        // 到这里它们通常已经是真对象了，这个查找才有东西可找到。
         let next_sibling =
             self.node(parent)
                 .children
@@ -776,6 +1218,14 @@ impl WriteMutations for QtRenderer {
                 });
 
 
+        // Qt 侧的挂载。
+        //
+        // mount 只能往 parent 的孩子末尾追加（QQuickItem 后挂的排上面），
+        // 所以插回原位还得再补一次 stack_before。
+        //
+        // 多个新节点共用同一个 sibling 也不会把顺序弄反：
+        // stackBefore 的语义是「紧贴在这个 sibling 下方」，
+        // 于是 [A, B] 依次 stackBefore(sib) 得到 [A, B, sib]。
         if let Some(parent_object) =
             self.object_of_node(parent)
         {
@@ -784,6 +1234,8 @@ impl WriteMutations for QtRenderer {
                     self.object_of_node(*node)
                 else {
                     // 占位节点没有 Qt 对象，不用挂。
+                    // 树那边照样给它留位置（下面 splice），
+                    // 它以后长成真节点时由那时候的 mutation 负责挂载。
                     continue;
                 };
 
@@ -809,6 +1261,14 @@ impl WriteMutations for QtRenderer {
 
 
         // 树里：用新节点顶掉占位节点。
+        //
+        // 顺序是「先 Qt 后树」：上面已经把 Qt 对象挂好了，
+        // 这里才动自己的账本。
+        //
+        // 外面套一层 {} 不是风格问题：
+        // children 是 self.nodes 的可变借用，
+        // 借用没结束就没法调用 self.nodes.remove / self.forget_element_ids，
+        // 所以把借用限制在这个块里，出来之后 placeholder 还是个普通 u64。
         let placeholder = {
             let children =
                 &mut self.nodes
@@ -827,6 +1287,8 @@ impl WriteMutations for QtRenderer {
                 });
 
 
+            // 1 个位置换成 m 个 —— 父节点里 slot 之后的下标全部右移，
+            // 这就是契约 3（Dioxus 倒序处理坑位）存在的原因。
             children.splice(
                 slot..slot + 1,
                 new_nodes.clone(),
@@ -837,6 +1299,9 @@ impl WriteMutations for QtRenderer {
         };
 
 
+        // 坑位节点本身作废：从账本里删掉，
+        // 并把指向它的 ElementId 映射清空
+        // （不删的话 object_of 之类会命中一个不在树里的节点）。
         self.nodes.remove(&placeholder);
         self.forget_element_ids(placeholder);
 
@@ -871,6 +1336,20 @@ impl WriteMutations for QtRenderer {
     }
 
 
+    // 属性分两条路，别混：
+    //
+    //     模板里写死的   text: "字面量"
+    //         → TemplateAttribute::Static，
+    //           在 create_template_node 里建元素时就 apply 了，
+    //           永远不会再发 mutation
+    //
+    //     模板里是插值   text: "{expr}"
+    //         → TemplateAttribute::Dynamic，
+    //           mount 时由 write_attrs（diff/node.rs:795 起）发 SetAttribute，
+    //           之后每次值变化还会各发一次
+    //
+    // 本项目 app() 里 "Hello from Dioxus…" 是组件的 props，
+    // 对 <qt-text> 的模板来说它就是插值，所以走这条。
     fn set_attribute(
         &mut self,
         name: &'static str,
@@ -970,11 +1449,34 @@ impl WriteMutations for QtRenderer {
 // ============================================================
 // Main
 // ============================================================
+//
+// 现在这个 main 只做了一次 mount，之后就交给 Qt 了。
+// 想让它「活」起来，缺的是第 5 步和第 6 步之间那条回路。
+//
+// 顺便说明为什么 Qt 和 Dioxus 谁当主循环：
+// 这里让 Qt 当（app.exec()），因为 QQuickWindow 的渲染、
+// 输入、vsync 全在 Qt 的事件循环里；
+// Dioxus 那边只需要被「叫醒」一次就能跑完一轮 diff，
+// 所以正确的形状是：Qt 循环里找机会 poll Dioxus。
 
 fn main() {
     // --------------------------------------------------------
     // 1. Qt application
     // --------------------------------------------------------
+    //
+    // 必须是第一件事：Qt 不允许在没有 QGuiApplication 的时候
+    // 构造任何 QWindow / QQmlEngine。
+    //
+    // cxx-qt-lib 那边返回的是 UniquePtr（qguiapplication.rs:186），
+    // 所以最后 exec 时是 `qt_app.as_mut()` 判空；
+    // C++ 侧其实有 Q_ASSERT(ptr != nullptr)（qguiapplication.cpp:26），
+    // 也就是说真起不来（没显示环境 / 平台插件缺失）时是当场 assert，
+    // 而不是安静地给你一个 None。
+    //
+    // 顺带一个顺序上的坑：窗口是在第 2 步 QtRenderer::new() 里建的，
+    // 而这里直到第 5 步才判空。也就是说如果 application 没建起来，
+    // 程序在构造 QQuickWindow 那里就先出事了，
+    // 这个判空实际上救不了什么。
 
     let mut qt_app =
         QGuiApplication::new();
@@ -983,6 +1485,9 @@ fn main() {
     // --------------------------------------------------------
     // 2. 我们自己的 renderer
     // --------------------------------------------------------
+    //
+    // QtRenderer::new() 里已经 show() 了窗口，
+    // 所以后面的建节点过程是能肉眼看到的。
 
     let mut renderer =
         QtRenderer::new();
@@ -997,6 +1502,14 @@ fn main() {
     // dioxus-desktop
     // webview
     // --------------------------------------------------------
+    //
+    // 注意 new() 这一步并没有跑 app()：
+    // 库那边写得很明白 —— "the VirtualDom is not progressed on creation"
+    // （virtual_dom.rs:271），这里只是把 root scope 登记好。
+    //
+    // app() 第一次真正被调用是在下面 rebuild 里的
+    // run_scope(ScopeId::ROOT)（virtual_dom.rs:584），
+    // 所以此刻屏幕上什么都没有，Qt 那边也一个对象都还没建。
 
     let mut vdom =
         VirtualDom::new(app);
@@ -1011,6 +1524,17 @@ fn main() {
     // AppendChildren
     //
     // 这些 mutation 进入 QtRenderer。
+    //
+    // 精确一点，本项目实际产生的顺序是：
+    //
+    //     LoadTemplate(<qt-text>)       建 Text + 一个坑位
+    //     SetAttribute("text", "Hello") 组件 props 是动态值
+    //     LoadTemplate(<qt-rectangle>)  建 Rectangle
+    //     ReplacePlaceholder([0], 1)    Rectangle 顶掉坑位
+    //     AppendChildren(ElementId(0),1)整棵挂到窗口根
+    //
+    // rebuild 的定义就在 virtual_dom.rs:579，
+    // 最后那句 append_children(ElementId(0), m) 是它硬编码的收尾。
     // --------------------------------------------------------
 
     vdom.rebuild(
@@ -1021,6 +1545,38 @@ fn main() {
     // --------------------------------------------------------
     // 5. Qt 接管主循环
     // --------------------------------------------------------
+    //
+    // ⚠️ 到这里就结束了：后面没有任何东西再去碰 vdom。
+    //
+    // 所以现在是「一次性渲染」：
+    //     - app() 里没有 signal，UI 本来也不会变；
+    //     - 就算加了 signal，也没人 poll VirtualDom；
+    //     - 就算 poll 了，diff 发出的 ReplaceWith / Remove /
+    //       InsertAfter 在本文件里还是 panic。
+    //
+    // 要接上的是这三件事，都在 Qt 的事件循环里做：
+    //
+    // 1) 拿一个 executor 去 poll vdom.wait_for_work()
+    //    （async，virtual_dom.rs:445；它内部会 process_events，
+    //      有脏 scope 就返回）。
+    //    常见做法是 QAbstractEventDispatcher::processEvents 的
+    //    前后挂钩子，或者干脆一个 QTimer 起来 poll 一次，
+    //    千万别 block_on 把它卡死主线程。
+    //
+    // 2) 它返回之后调 vdom.render_immediate(&mut renderer)
+    //    （virtual_dom.rs:599）走 diff，
+    //    前提是把上面 panic 的那几个 WriteMutations 实现掉。
+    //
+    // 3) 把 Qt 的鼠标/键盘事件转成 Dioxus 的事件送进去：
+    //    vdom.handle_event(name, Rc<dyn Any>, ElementId, bubbling)
+    //    （virtual_dom.rs:765），
+    //    送之前得先进 runtime（vdom.runtime()，virtual_dom.rs:759），
+    //    不然 signal 读写找不到上下文。
+    //    这也是 create_event_listener / remove_event_listener
+    //    那两个空实现该被填的地方。
+    //
+    // 另外 Cargo.toml 里 dioxus-signals 已经引了但还没用上，
+    // 第一个试验可以从 app() 里加一个 signal + 一个按钮开始。
 
     println!(
         "Qt event loop started. \

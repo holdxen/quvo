@@ -12,6 +12,7 @@ public:
 
     void show();
 
+    std::uint64_t create_rectangle();
     // 创建 QtQuick.Text，但暂时不挂到窗口。
     std::uint64_t create_text(rust::Str text);
 

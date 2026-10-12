@@ -40,6 +40,10 @@ mod ffi {
             text: &str,
         ) -> u64;
 
+        fn create_rectangle(
+            self: Pin<&mut QtHost>,
+        ) -> u64;
+
         fn append_to_root(
             self: Pin<&mut QtHost>,
             id: u64,
@@ -82,6 +86,15 @@ fn Text(text: String) -> Element {
 }
 
 
+#[component]
+fn Rectangle() -> Element {
+    rsx! {
+        qt-rectangle {
+        }
+    }
+}
+
+
 // ============================================================
 // 用户的 Dioxus UI
 // ============================================================
@@ -95,8 +108,9 @@ fn app() -> Element {
     // 来源就是这个 Dioxus text node。
     rsx! {
         Text {
-            text: "Hello from Dioxus -> Qt Quick >>>>>"
+            text: "Hello from Dioxus -> Qt Quick >>>>>",
         }
+        Rectangle {  }
     }
 }
 
@@ -300,6 +314,9 @@ impl WriteMutations for QtRenderer {
                         .pin_mut()
                         .create_text(initial),
 
+                    "qt-rectangle" => {
+                        self.host.pin_mut().create_rectangle()
+                    },
                     other => panic!(
                         "QtRenderer 不认识元素 \
                          <{other}>，目前只有 qt-text"

@@ -95,6 +95,72 @@ void QtHost::show()
 }
 
 
+std::uint64_t QtHost::create_rectangle() {
+    QQmlComponent component(&impl_->engine);
+
+    component.setData(R"QML(
+import QtQuick
+Rectangle {
+    width: 30
+    height: 30
+    color: 'red'
+}
+)QML", QUrl());
+    if (component.isError()) {
+        for (
+            const auto& error :
+            component.errors()
+        ) {
+            qWarning().noquote()
+                << error.toString();
+        }
+
+        return 0;
+    }
+
+        QObject* object =
+        component.create();
+
+    if (object == nullptr) {
+        qWarning()
+            << "QQmlComponent::create failed";
+
+        return 0;
+    }
+
+
+    auto* item =
+        qobject_cast<QQuickItem*>(
+            object
+        );
+
+    if (item == nullptr) {
+        qWarning()
+            << "created object is not QQuickItem";
+
+        delete object;
+
+        return 0;
+    }
+
+    const std::uint64_t id =
+    impl_->next_id++;
+
+
+    impl_->objects.emplace(
+        id,
+        object
+    );
+
+
+    qDebug()
+    << "[Qt] create Text id ="
+    << id
+    << "but NOT mounted yet";
+
+    return id;
+}
+
 std::uint64_t
 QtHost::create_text(rust::Str text)
 {

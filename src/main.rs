@@ -14,6 +14,8 @@ use dioxus::dioxus_core::{
 
 use dioxus::prelude::*;
 
+use std::collections::HashMap;
+
 
 // ============================================================
 // Rust <-> C++ Qt bridge
@@ -44,9 +46,16 @@ mod ffi {
             self: Pin<&mut QtHost>,
         ) -> u64;
 
-        fn append_to_root(
+        fn mount(
             self: Pin<&mut QtHost>,
-            id: u64,
+            parent_id: u64,
+            child_id: u64,
+        );
+
+        fn stack_before(
+            self: Pin<&mut QtHost>,
+            child_id: u64,
+            sibling_id: u64,
         );
 
         fn set_property(
@@ -77,10 +86,14 @@ mod ffi {
 // ============================================================
 
 #[component]
-fn Text(text: String) -> Element {
+fn Text(
+    text: String,
+    children: Element,
+) -> Element {
     rsx! {
         qt-text {
             text: "{text}",
+            {children}
         }
     }
 }
@@ -109,8 +122,8 @@ fn app() -> Element {
     rsx! {
         Text {
             text: "Hello from Dioxus -> Qt Quick >>>>>",
+            Rectangle {}
         }
-        Rectangle {  }
     }
 }
 
@@ -119,13 +132,44 @@ fn app() -> Element {
 // 最小 Qt renderer
 // ============================================================
 
+// 树里的一个节点。
+//
+//     object = Some(id)   已经在 Qt 里实体化了的对象
+//     object = None       占位节点（模板里的动态位置），
+//                         树里有它，Qt 里还没有东西，
+//                         等着被 ReplacePlaceholder 顶掉
+//
+// 根节点的 object 是 Some(0)：0 在 C++ 那边表示「窗口根」。
+
+#[derive(Default)]
+struct Node {
+    object: Option<u64>,
+
+    children: Vec<u64>,
+}
+
+
 struct QtRenderer {
     host: UniquePtr<ffi::QtHost>,
 
 
+    // 节点 id -> 节点
+    //
+    // 注意这不是 Qt 的 object id：
+    // 占位节点没有 Qt 对象，但树里得有它的位置，
+    // 而且 mutation 里的路径是按「第几个子节点」走的，
+    // 所以要自己维护父子关系。
+    nodes: HashMap<u64, Node>,
+
+
+    next_node: u64,
+
+
     // Dioxus 的 mutation stack。
     //
-    // 0 是我们自己定义的 root sentinel。
+    // 里面放的是我们的节点 id。
+    //
+    // 0 是 renderer root：
     //
     // 初始：
     //
@@ -140,9 +184,9 @@ struct QtRenderer {
     //
     //      ↓
     //
-    // 我们 QtHost 的 object id
+    // 我们树里的节点 id
     //
-    objects: Vec<Option<u64>>,
+    element_to_node: Vec<Option<u64>>,
 }
 
 
@@ -161,33 +205,97 @@ impl QtRenderer {
         host.pin_mut().show();
 
 
+        let mut nodes =
+            HashMap::new();
+
+
+        // renderer root：没有真的 Qt 对象，
+        // 但它的目标就是窗口根，
+        // 所以直接按 C++ 那边的约定记成 0。
+        nodes.insert(
+            0,
+            Node {
+                object: Some(0),
+                children: Vec::new(),
+            },
+        );
+
+
         Self {
             host,
+
+            nodes,
+
+            next_node: 1,
 
             // Dioxus renderer root
             stack: vec![0],
 
             // ElementId(0) == renderer root
-            objects: vec![Some(0)],
+            element_to_node: vec![Some(0)],
         }
+    }
+
+
+    fn new_node(
+        &mut self,
+        object: Option<u64>,
+    ) -> u64 {
+        let id = self.next_node;
+
+        self.next_node += 1;
+
+
+        self.nodes.insert(
+            id,
+            Node {
+                object,
+                children: Vec::new(),
+            },
+        );
+
+
+        id
+    }
+
+
+    fn node(
+        &self,
+        id: u64,
+    ) -> &Node {
+        self.nodes
+            .get(&id)
+            .unwrap_or_else(|| {
+                panic!("unknown node id {id}")
+            })
+    }
+
+
+    fn object_of_node(
+        &self,
+        id: u64,
+    ) -> Option<u64> {
+        self.nodes
+            .get(&id)
+            .and_then(|node| node.object)
     }
 
 
     fn bind(
         &mut self,
         id: ElementId,
-        object: u64,
+        node: u64,
     ) {
-        if self.objects.len() <= id.0 {
-            self.objects.resize(
+        if self.element_to_node.len() <= id.0 {
+            self.element_to_node.resize(
                 id.0 + 1,
                 None,
             );
         }
 
 
-        self.objects[id.0] =
-            Some(object);
+        self.element_to_node[id.0] =
+            Some(node);
     }
 
 
@@ -195,10 +303,24 @@ impl QtRenderer {
         &self,
         id: ElementId,
     ) -> Option<u64> {
-        self.objects
+        self.element_to_node
             .get(id.0)
             .copied()
             .flatten()
+            // 节点被替换掉之后，映射可能指向一个
+            // 已经不在树里的节点，这里顺手过滤掉。
+            .filter(|node| {
+                self.nodes.contains_key(node)
+            })
+    }
+
+
+    // 这个 ElementId 对应的 Qt 对象（占位节点没有）。
+    fn object_of(
+        &self,
+        id: ElementId,
+    ) -> Option<u64> {
+        self.object_of_node(self.lookup(id)?)
     }
 
 
@@ -219,38 +341,200 @@ impl QtRenderer {
 
 
     // --------------------------------------------------------
-    // 从 Dioxus Template 里面找静态 Text。
+    // 建模板
     //
-    // 这一版只支持一个文本，所以故意做得极简。
+    // Dioxus 的模板是一棵静态树，节点只有三种：
+    //
+    //     Text { }        静态文本
+    //     Element { }     元素
+    //     Dynamic { }     动态位置（组件、if/for、children）
+    //
+    // 静态部分在这里一次性建好；
+    // 动态位置先立一个占位节点，之后被顶掉。
     // --------------------------------------------------------
 
-    fn template_text(
+    fn create_template_node(
+        &mut self,
         node: &TemplateNode,
-    ) -> Option<&'static str> {
+    ) -> u64 {
         match node {
-            TemplateNode::Text {
-                text
-            } => {
-                Some(*text)
-            }
-
-
             TemplateNode::Element {
+                tag,
+                attrs,
                 children,
                 ..
             } => {
-                children
-                    .iter()
-                    .find_map(
-                        Self::template_text
-                    )
+                let object =
+                    self.create_element(tag);
+
+
+                // 模板里写死的属性（text: "字面量"）此刻就能应用；
+                // 动态属性（text: "{expr}"）Dioxus 稍后会通过
+                // set_attribute 送过来。
+                for attr in attrs.iter() {
+                    if let TemplateAttribute::Static {
+                        name,
+                        value,
+                        ..
+                    } = attr
+                    {
+                        self.host
+                            .pin_mut()
+                            .set_property(
+                                object,
+                                name,
+                                value,
+                            );
+                    }
+                }
+
+
+                let element_node =
+                    self.new_node(Some(object));
+
+
+                // 静态子节点递归建；
+                // 动态位置建出一个占位节点。
+                for child in children.iter() {
+                    let child_node =
+                        self.create_template_node(child);
+
+
+                    self.attach(
+                        element_node,
+                        child_node,
+                    );
+                }
+
+
+                println!(
+                    "[renderer] <{tag}> -> node \
+                     {element_node} (QtObject {object})"
+                );
+
+
+                element_node
             }
 
 
+            TemplateNode::Text {
+                text,
+            } => {
+                let object =
+                    self.host
+                        .pin_mut()
+                        .create_text(text);
+
+
+                self.new_node(Some(object))
+            }
+
+
+            // 动态位置：先占个坑，
+            // 之后 ReplacePlaceholder 会拿真节点顶掉它。
             TemplateNode::Dynamic {
                 ..
-            } => {
-                None
+            } => self.new_node(None),
+        }
+    }
+
+
+    // Dioxus 的元素名 -> Qt 对象。
+    //
+    // 这就是「自定义内置控件」的落点：
+    // 加一个新控件 = 这里加一个 tag，
+    // 加上 C++ 那边一个 create_*。
+    fn create_element(
+        &mut self,
+        tag: &str,
+    ) -> u64 {
+        match tag {
+            "qt-text" => self
+                .host
+                .pin_mut()
+                .create_text(""),
+
+            "qt-rectangle" => self
+                .host
+                .pin_mut()
+                .create_rectangle(),
+
+            other => panic!(
+                "QtRenderer 不认识元素 <{other}>"
+            ),
+        }
+    }
+
+
+    // 把 child 挂到 parent 下面。
+    fn attach(
+        &mut self,
+        parent: u64,
+        child: u64,
+    ) {
+        self.nodes
+            .get_mut(&parent)
+            .unwrap_or_else(|| {
+                panic!("unknown parent node {parent}")
+            })
+            .children
+            .push(child);
+
+
+        // Qt 侧：把 child 的对象挂到 parent 的对象下。
+        //
+        // 有一方还没有 Qt 对象（占位节点）时先只记树。
+        if let (
+            Some(parent_object),
+            Some(child_object),
+        ) = (
+            self.object_of_node(parent),
+            self.object_of_node(child),
+        ) {
+            self.host
+                .pin_mut()
+                .mount(
+                    parent_object,
+                    child_object,
+                );
+        }
+    }
+
+
+    // 路径 -> (父节点, 在父节点里的下标)
+    //
+    // 路径是「第几个子节点」的序列。
+    fn resolve_slot(
+        &self,
+        from: u64,
+        path: &'static [u8],
+    ) -> (u64, usize) {
+        let (last, head) =
+            path.split_last()
+                .expect("空路径");
+
+
+        let parent = head
+            .iter()
+            .fold(from, |node, step| {
+                self.node(node).children[*step as usize]
+            });
+
+
+        (parent, *last as usize)
+    }
+
+
+    // 节点从树里拿掉之后，清掉指向它的 ElementId 映射。
+    fn forget_element_ids(
+        &mut self,
+        node: u64,
+    ) {
+        for entry in
+            self.element_to_node.iter_mut()
+        {
+            if *entry == Some(node) {
+                *entry = None;
             }
         }
     }
@@ -276,168 +560,29 @@ impl WriteMutations for QtRenderer {
             &template.roots[index];
 
 
-        // Dioxus 送来的模板告诉我们：
-        //
-        //     这个节点在 Qt 里应该长什么样
-        //
         // 组件的边界在这里是「透明」的：
-        // rsx! { Text { text: "..." } } 送过来的模板
-        // 已经是组件内部那个 <qt-text> 元素，
+        //
+        //     rsx! { Text { text: "..." } }
+        //
+        // 送过来的模板已经是组件内部那个 <qt-text> 元素，
         // 所以 renderer 完全不需要知道 Text 是个组件。
-        //
-        // 真正创建 QtQuick.Text 的就是下面这一段。
 
-        let object = match root {
-            // --------------------------------
-            // 元素：<qt-text text="..." />
-            // --------------------------------
-
-            TemplateNode::Element {
-                tag,
-                attrs,
-                ..
-            } => {
-                // 元素里写死的文本子节点，例如
-                //
-                //     qt-text { "hello" }
-                //
-                // 当作初始 text。
-                // 写在属性上的值后面会覆盖它。
-                let initial =
-                    Self::template_text(root)
-                        .unwrap_or_default();
+        let node =
+            self.create_template_node(root);
 
 
-                let object = match *tag {
-                    "qt-text" => self
-                        .host
-                        .pin_mut()
-                        .create_text(initial),
-
-                    "qt-rectangle" => {
-                        self.host.pin_mut().create_rectangle()
-                    },
-                    other => panic!(
-                        "QtRenderer 不认识元素 \
-                         <{other}>，目前只有 qt-text"
-                    ),
-                };
+        self.bind(id, node);
 
 
-                // 模板里写死的属性（text: "字面量"）此刻就能应用；
-                // 动态属性（text: "{expr}"）Dioxus 稍后会通过
-                // set_attribute 送过来。
-                for attr in attrs.iter() {
-                    if let TemplateAttribute::Static {
-                        name,
-                        value,
-                        ..
-                    } = attr
-                    {
-                        self.host
-                            .pin_mut()
-                            .set_property(
-                                object,
-                                name,
-                                value,
-                            );
-                    }
-                }
-
-
-                println!(
-                    "[Dioxus] LoadTemplate \
-                     id={} <{tag}>",
-                    id.0
-                );
-
-
-                object
-            }
-
-
-            // --------------------------------
-            // 裸文本节点：rsx! { "hello" }
-            // --------------------------------
-
-            TemplateNode::Text {
-                ..
-            } => {
-                let text =
-                    Self::template_text(root)
-                        .unwrap_or_default();
-
-
-                println!(
-                    "[Dioxus] LoadTemplate \
-                     id={} text={text:?}",
-                    id.0
-                );
-
-
-                self.host
-                    .pin_mut()
-                    .create_text(text)
-            }
-
-
-            // --------------------------------
-            // 动态根节点：组件嵌在元素里、if/for 之类
-            //
-            // 这些需要 placeholder + 路径寻址，
-            // 这一版还没实现。
-            // --------------------------------
-
-            TemplateNode::Dynamic {
-                ..
-            } => {
-                panic!(
-                    "模板根节点是动态节点，\
-                     需要实现 create_placeholder / \
-                     replace_placeholder_with_nodes"
-                );
-            }
-        };
-
-
-        assert_ne!(
-            object,
-            0,
-            "Qt failed to create Text"
-        );
-
-
-        self.bind(
-            id,
-            object,
-        );
-
-
-        // 新节点还处于 detached 状态。
-        //
-        // stack:
-        //
-        // [ROOT]
-        //
-        //      ↓
-        //
-        // [ROOT, TEXT]
-        //
-        self.stack.push(object);
+        self.stack.push(node);
 
 
         println!(
-            "[renderer] ElementId({}) \
-             -> QtObject({})",
-            id.0,
-            object
+            "[Dioxus] LoadTemplate \
+             index={index} id={} -> node {node}",
+            id.0
         );
     }
-
-
-    // ========================================================
-    // 最重要 #2
-    // ========================================================
 
     fn append_children(
         &mut self,
@@ -456,34 +601,21 @@ impl WriteMutations for QtRenderer {
             self.pop_m(m);
 
 
-        // 这一版只支持挂到 renderer root。
-        assert_eq!(
-            id,
-            ElementId(0),
-            "demo only supports root parent"
-        );
+        let parent =
+            self.lookup(id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "AppendChildren 的父节点 \
+                         ElementId({}) 不存在",
+                        id.0
+                    )
+                });
 
 
         for child in children {
-            if child == 0 {
-                continue;
-            }
-
-
-            // ============================================
-            // 到这一刻 QtQuick.Text 才真正进入 visual tree。
-            // ============================================
-
-            self.host
-                .pin_mut()
-                .append_to_root(child);
+            self.attach(parent, child);
         }
     }
-
-
-    // ========================================================
-    // 动态 text 后面会使用这个。
-    // ========================================================
 
     fn create_text_node(
         &mut self,
@@ -503,25 +635,15 @@ impl WriteMutations for QtRenderer {
                 .create_text(value);
 
 
-        assert_ne!(
-            object,
-            0
-        );
+        let node =
+            self.new_node(Some(object));
 
 
-        self.bind(
-            id,
-            object,
-        );
+        self.bind(id, node);
 
 
-        self.stack.push(object);
+        self.stack.push(node);
     }
-
-
-    // ========================================================
-    // Signal 更新 text 时以后会进这里。
-    // ========================================================
 
     fn set_node_text(
         &mut self,
@@ -536,17 +658,15 @@ impl WriteMutations for QtRenderer {
 
 
         if let Some(object) =
-            self.lookup(id)
+            self.object_of(id)
         {
-            if object != 0 {
-                self.host
-                    .pin_mut()
-                    .set_property(
-                        object,
-                        "text",
-                        value,
-                    );
-            }
+            self.host
+                .pin_mut()
+                .set_property(
+                    object,
+                    "text",
+                    value,
+                );
         }
     }
 
@@ -555,7 +675,7 @@ impl WriteMutations for QtRenderer {
         &mut self,
         id: ElementId,
     ) {
-        let object =
+        let node =
             self.lookup(id)
                 .unwrap_or_else(|| {
                     panic!(
@@ -565,7 +685,7 @@ impl WriteMutations for QtRenderer {
                 });
 
 
-        self.stack.push(object);
+        self.stack.push(node);
     }
 
 
@@ -589,8 +709,28 @@ impl WriteMutations for QtRenderer {
 
     fn create_placeholder(
         &mut self,
-        _id: ElementId,
+        id: ElementId,
     ) {
+        // 占位节点：树里有位置，Qt 里还没有对象。
+        //
+        // 组件没传 children 时 Dioxus 会发这个，
+        // 紧接着用 ReplacePlaceholder 把它塞进
+        // 模板里的动态位置。
+        let node =
+            self.new_node(None);
+
+
+        self.bind(id, node);
+
+
+        self.stack.push(node);
+
+
+        println!(
+            "[Dioxus] CreatePlaceholder \
+             id={} -> node {node}",
+            id.0
+        );
     }
 
 
@@ -607,12 +747,104 @@ impl WriteMutations for QtRenderer {
 
     fn replace_placeholder_with_nodes(
         &mut self,
-        _path: &'static [u8],
-        _m: usize,
+        path: &'static [u8],
+        m: usize,
     ) {
-        panic!(
-            "replace_placeholder_with_nodes \
-             not implemented"
+        let new_nodes =
+            self.pop_m(m);
+
+
+        // 路径是相对「模板根」的，
+        // 而模板根就是把 m 个节点弹掉之后的栈顶。
+        let anchor =
+            *self.stack.last().expect("空栈");
+
+
+        let (parent, slot) =
+            self.resolve_slot(anchor, path);
+
+
+        // Qt 侧要插在「原来那个位置的下一个兄弟」前面，
+        // 子节点顺序才跟 Dioxus 一致。
+        let next_sibling =
+            self.node(parent)
+                .children
+                .iter()
+                .skip(slot + 1)
+                .find_map(|node| {
+                    self.object_of_node(*node)
+                });
+
+
+        if let Some(parent_object) =
+            self.object_of_node(parent)
+        {
+            for node in new_nodes.iter() {
+                let Some(child_object) =
+                    self.object_of_node(*node)
+                else {
+                    // 占位节点没有 Qt 对象，不用挂。
+                    continue;
+                };
+
+
+                self.host
+                    .pin_mut()
+                    .mount(
+                        parent_object,
+                        child_object,
+                    );
+
+
+                if let Some(sibling) = next_sibling {
+                    self.host
+                        .pin_mut()
+                        .stack_before(
+                            child_object,
+                            sibling,
+                        );
+                }
+            }
+        }
+
+
+        // 树里：用新节点顶掉占位节点。
+        let placeholder = {
+            let children =
+                &mut self.nodes
+                    .get_mut(&parent)
+                    .expect("unknown parent node")
+                    .children;
+
+
+            let placeholder = *children
+                .get(slot)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "ReplacePlaceholder 的路径 \
+                         指向的子节点不存在"
+                    )
+                });
+
+
+            children.splice(
+                slot..slot + 1,
+                new_nodes.clone(),
+            );
+
+
+            placeholder
+        };
+
+
+        self.nodes.remove(&placeholder);
+        self.forget_element_ids(placeholder);
+
+
+        println!(
+            "[Dioxus] ReplacePlaceholder \
+             path={path:?} m={m} \
+             node {placeholder} 被顶掉"
         );
     }
 
@@ -662,7 +894,7 @@ impl WriteMutations for QtRenderer {
         // id 就是 load_template 里那个元素的 ElementId。
 
         let Some(object) =
-            self.lookup(id)
+            self.object_of(id)
         else {
             println!(
                 "[renderer] SetAttribute \

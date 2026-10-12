@@ -154,12 +154,14 @@ Rectangle {
 
 
     qDebug()
-    << "[Qt] create Text id ="
+    << "[Qt] create Rectangle id ="
     << id
     << "but NOT mounted yet";
 
+
     return id;
 }
+
 
 std::uint64_t
 QtHost::create_text(rust::Str text)
@@ -260,61 +262,112 @@ Text {
 
 
 void
-QtHost::append_to_root(
-    std::uint64_t id
+QtHost::mount(
+    std::uint64_t parent_id,
+    std::uint64_t child_id
 )
 {
-    const auto it =
-        impl_->objects.find(id);
+    QObject* child =
+        object_for(child_id);
 
-    if (
-        it == impl_->objects.end() ||
-        it->second == nullptr
-    ) {
-        qWarning()
-            << "unknown object id"
-            << id;
-
-        return;
-    }
-
-
-    QObject* object =
-        it->second;
-
-
-    auto* item =
+    auto* child_item =
         qobject_cast<QQuickItem*>(
-            object
+            child
         );
 
-    if (item == nullptr) {
+    if (
+        child == nullptr ||
+        child_item == nullptr
+    ) {
+        qWarning()
+            << "[Qt] cannot mount object"
+            << child_id;
+
         return;
     }
 
 
-    QQuickItem* root =
-        impl_->window.contentItem();
+    // parent_id == 0 就是窗口根。
+    QQuickItem* parent =
+        parent_id == 0
+            ? impl_->window.contentItem()
+            : qobject_cast<QQuickItem*>(
+                  object_for(parent_id)
+              );
+
+    if (parent == nullptr) {
+        qWarning()
+            << "[Qt] unknown parent"
+            << parent_id;
+
+        return;
+    }
 
 
     // -----------------------------
     // QObject ownership tree
     // -----------------------------
 
-    object->setParent(root);
+    child->setParent(parent);
 
 
     // -----------------------------
     // Qt Quick visual tree
     // -----------------------------
 
-    item->setParentItem(root);
+    child_item->setParentItem(parent);
 
 
     qDebug()
-        << "[Qt] mounted object"
-        << id
-        << "into window";
+        << "[Qt] mount object"
+        << child_id
+        << "into parent"
+        << parent_id;
+}
+
+
+void
+QtHost::stack_before(
+    std::uint64_t child_id,
+    std::uint64_t sibling_id
+)
+{
+    auto* child =
+        qobject_cast<QQuickItem*>(
+            object_for(child_id)
+        );
+
+    auto* sibling =
+        qobject_cast<QQuickItem*>(
+            object_for(sibling_id)
+        );
+
+    if (
+        child == nullptr ||
+        sibling == nullptr
+    ) {
+        return;
+    }
+
+
+    child->stackBefore(sibling);
+}
+
+
+QObject*
+QtHost::object_for(
+    std::uint64_t id
+) const
+{
+    const auto it =
+        impl_->objects.find(id);
+
+    if (it == impl_->objects.end()) {
+        return nullptr;
+    }
+
+
+    return it->second;
 }
 
 
@@ -325,13 +378,10 @@ QtHost::set_property(
     rust::Str value
 )
 {
-    const auto it =
-        impl_->objects.find(id);
+    QObject* object =
+        object_for(id);
 
-    if (
-        it == impl_->objects.end() ||
-        it->second == nullptr
-    ) {
+    if (object == nullptr) {
         qWarning()
             << "unknown object id"
             << id;
@@ -349,7 +399,7 @@ QtHost::set_property(
     // 例如 color 是 QColor、font.pixelSize 是嵌套属性，
     // 都不是 QString 能直接写进去的。
     if (
-        !it->second->setProperty(
+        !object->setProperty(
             property.constData(),
             to_qstring(value)
         )

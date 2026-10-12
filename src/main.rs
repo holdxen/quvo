@@ -237,6 +237,7 @@ fn Text(
 fn Rectangle() -> Element {
     rsx! {
         qt-rectangle {
+            color: "green"
         }
     }
 }

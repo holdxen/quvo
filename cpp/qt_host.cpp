@@ -103,7 +103,6 @@ import QtQuick
 Rectangle {
     width: 30
     height: 30
-    color: 'red'
 }
 )QML", QUrl());
     if (component.isError()) {

@@ -205,7 +205,7 @@ mod ffi {
             self: Pin<&mut QtHost>,
             id: u64,
             name: &str,
-            value: &str,
+            value: &QVariant,
         );
 
         // 布局结果写给 Qt：几何的唯一入口。
@@ -761,13 +761,16 @@ impl QtRenderer {
                             value,
                         );
 
+                        let value = cxx_qt_lib::QString::from(*value);
+                        let value = cxx_qt_lib::QVariant::from(&value);
+
                         if !is_layout_prop(name) {
                             self.host
                                 .pin_mut()
                                 .set_property(
                                     object,
                                     name,
-                                    value,
+                                    &value,
                                 );
                         }
                     }
@@ -1436,12 +1439,14 @@ impl WriteMutations for QtRenderer {
         if let Some(object) =
             self.object_of(id)
         {
+            let value = cxx_qt_lib::QString::from(value);
+            let value = cxx_qt_lib::QVariant::from(&value);
             self.host
                 .pin_mut()
                 .set_property(
                     object,
                     "text",
-                    value,
+                    &value,
                 );
         }
     }
@@ -1849,13 +1854,16 @@ impl WriteMutations for QtRenderer {
             id.0
         );
 
+        
+        let value = cxx_qt_lib::QString::from(text);
+        let value = cxx_qt_lib::QVariant::from(&value);
 
         self.host
             .pin_mut()
             .set_property(
                 object,
                 name,
-                text,
+                &value,
             );
     }
 

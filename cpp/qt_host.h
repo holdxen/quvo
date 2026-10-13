@@ -146,6 +146,9 @@ public:
         QQuickItem* parent
     ) const;
 
+
+    void process_events(std::int32_t ms);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

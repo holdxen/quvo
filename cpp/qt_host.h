@@ -23,6 +23,20 @@ public:
 
     void show();
 
+    // 起一个 QTimer，每 interval_ms 把「回路」叫起来一次。
+    //
+    // timeout 里调的是 Rust 那边的 qt_pump_tick —— cxx 把 `extern "Rust"`
+    // 的自由函数在生成头里声明成一个全局 C++ 函数（`void qt_pump_tick() noexcept;`），
+    // 所以这里 include 生成头就能直接调。
+    //
+    // 为什么是 Qt 反过来叫 Rust：Dioxus 的 wait_for_work 是 async，
+    // 而这条线程已经被 app.exec() 占了，不能再自己转圈。
+    // 于是借 Qt 的循环当 executor —— 每次 timeout poll 一次，
+    // 没活就立刻把控制权还回去。
+    void start_pump(
+        int interval_ms
+    );
+
     // 窗口根 = window.contentItem()。
     //
     // 以前 Rust 侧用约定的 id 0 表示「挂到窗口根」；

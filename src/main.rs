@@ -85,6 +85,8 @@ use cxx_qt_lib::QGuiApplication;
 use dioxus::dioxus_core::{
     AttributeValue,
     ElementId,
+    RuntimeGuard,
+    ScopeId,
     Template,
     TemplateAttribute,
     TemplateNode,
@@ -94,10 +96,17 @@ use dioxus::dioxus_core::{
 
 use dioxus::prelude::*;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{
     AtomicUsize,
     Ordering,
+};
+use std::task::{
+    Context,
+    Wake,
+    Waker,
 };
 
 
@@ -325,12 +334,31 @@ mod ffi {
             item: *mut QQuickItem,
         ) -> f64;
 
+        // 起一个 QTimer，每 interval_ms 把 Qt 事件循环叫起来一次，
+        // 每次 timeout 都去调下面那个 `extern "Rust"` 的 qt_pump_tick。
+        //
+        // 这就是「借 Qt 的循环当 executor」的那一半：
+        // Dioxus 这边不再自己转圈，只是搭 Qt 的便车。
+        fn start_pump(
+            self: Pin<&mut QtHost>,
+            interval_ms: i32,
+        );
+
         // 诊断用：读 Qt 侧 childItems 的实际顺序（对象地址）。
         // 见 cpp/qt_host.h 的注释 —— 插到中间这件事，从坐标上看不出来。
         unsafe fn child_order(
             self: &QtHost,
             parent: *mut QQuickItem,
         ) -> Vec<u64>;
+    }
+
+    // 反方向：C++ 调 Rust。
+    //
+    // cxx 会把 `extern "Rust"` 里的自由函数在生成头里声明成一个 C++ 函数，
+    // C++ 那边（cpp/qt_host.cpp）include 生成头就能直接调 ——
+    // QTimer::timeout 的 lambda 里就是这么把控制权交回 Rust 的。
+    extern "Rust" {
+        fn qt_pump_tick();
     }
 }
 
@@ -451,7 +479,10 @@ fn Rectangle(
 //     老 key 一个都不留    → 先 create 新的，再把最后一个老的
 //                           换成 ReplaceWith        （diff/iterator.rs:305-308）
 //
-// 事件回路接上之后，这张表连同 main() 里第 4.7 步都该删掉。
+// 事件回路已经接上了，这张表现在只是**假的事件源**：
+// driver_send_work 每 TICKS_PER_STEP 个 tick 推一格、发一张纸条。
+// 等 create_event_listener + handle_event 落地，该删的是这张表，
+// 回路本身不动。
 const DIFF_SCRIPT: &[&[usize]] = &[
     &[0, 1],       // 第 4 步 mount 就是这个样子
     &[0],          // Remove
@@ -2830,12 +2861,220 @@ impl WriteMutations for QtRenderer {
 
 
 // ============================================================
+// 回路：借 Qt 的事件循环当 executor
+// ============================================================
+//
+// 形状就一句话：
+//
+//     Qt 的 QTimer 每 20ms 转一次 → 每次转都 poll 一遍 wait_for_work()
+//     → Pending 就什么都不做，Ready 就 render_immediate + relayout
+//
+// 为什么要「poll 一次」而不是 `.await`：
+// `wait_for_work` 是 `async fn`（virtual_dom.rs:445），`.await` 需要一个
+// executor 去驱动它；而这里唯一的线程已经被 `app.exec()` 占着
+// （`block_on` 会把纸条的来源也一起堵死）。所以把它当成一个
+// 「每次事件都问一句」的同步接口来用 —— 这就是借 Qt 的循环当 executor。
+//
+// 一个关键的好性质：future **不需要跨 tick 存着**。
+// wait_for_work 的全部状态都在 VirtualDom 自己身上：
+// 纸条在 `self.rx`（virtual_dom.rs:215 那个 UnboundedReceiver），
+// 脏 scope 在脏表里。future 本身只是「先看一眼，没有就等」这段流程，
+// 所以每个 tick 现场新建一个、poll 一次、丢掉，一条消息都不会漏。
+//
+// waker 为什么可以什么都不做：真正的唤醒源是 Qt 的 timer，不是 Rust 的 waker。
+// 纸条来了没人被 wake —— 下一个 tick 自己会再问一遍。
+// poll 因此不是「必须有人 wake 才能醒」，而是「主动问一句有没有活」。
+
+/// 什么都不做的 waker，见上面最后一段。
+struct IdleWaker;
+
+impl Wake for IdleWaker {
+    fn wake(self: Arc<Self>) {}
+    fn wake_by_ref(self: &Arc<Self>) {}
+}
+
+/// 回路的两端：VirtualDom（脏表 + 纸条队列）和我们的 renderer，
+/// 必须放在同一个地方才能同时拿到 `&mut` —— `wait_for_work(&mut self)`
+/// 借的是 vdom，`render_immediate(&mut renderer)` 借的是 renderer。
+struct Pump {
+    vdom: VirtualDom,
+    renderer: QtRenderer,
+    waker: Waker,
+    /// 已经转过多少个 tick
+    ticks: usize,
+    /// DIFF_SCRIPT 走到第几步
+    step: usize,
+}
+
+// Qt 的 timer 回调是这条线程上唯一碰 Pump 的地方，
+// 所以 thread_local + RefCell 就够（不需要 Sync，也不需要锁）。
+// 真正的 re-entrance（渲染中又触发一次 tick）会把 borrow_mut 打成 panic，
+// 那是「回路里又跑回路」的信号，不是要悄悄吞掉的情况。
+thread_local! {
+    static PUMP: RefCell<Option<Pump>> = const { RefCell::new(None) };
+}
+
+/// 多少个 tick 喂一次假纸条（下面 driver_send_work 用）。
+const TICKS_PER_STEP: usize = 3;
+
+/// QTimer 的间隔。
+const PUMP_INTERVAL_MS: i32 = 20;
+
+/// 把 vdom + renderer 交给回路，并让 Qt 开始 tick。
+fn install_pump(
+    vdom: VirtualDom,
+    mut renderer: QtRenderer,
+) {
+    // 先起 timer：这一步必须在把 renderer 交出去之前做，
+    // 因为 host 藏在 renderer 里面。
+    renderer
+        .host
+        .pin_mut()
+        .start_pump(PUMP_INTERVAL_MS);
+
+    PUMP.with(|slot| {
+        *slot.borrow_mut() = Some(Pump {
+            vdom,
+            renderer,
+            waker: Waker::from(Arc::new(IdleWaker)),
+            ticks: 0,
+            step: 0,
+        });
+    });
+
+    println!(
+        "[pump] 回路装好了：每 {PUMP_INTERVAL_MS}ms 一个 tick，\
+         每 {TICKS_PER_STEP} 个 tick 喂一张纸条（共 {} 步）",
+        DIFF_SCRIPT.len() - 1
+    );
+}
+
+
+/// 假的事件源：把 DIFF_SCRIPT 的下一步推进去，然后**走 channel** 发纸条。
+///
+/// 为什么用 `runtime().needs_update(ScopeId::APP)` 而不是 `mark_all_dirty()`：
+/// needs_update（runtime.rs:542）→ ScopeState::needs_update（scope_context.rs:135）
+/// → `sender.unbounded_send(SchedulerMsg::Immediate(id))`（:142）——
+/// 它是**真·纸条路径**，wait_for_work 得走一遍
+/// `wait_for_event().await`（virtual_dom.rs:460）才醒得过来。
+/// 而 mark_all_dirty 是直接往脏表里塞，醒都不醒就 Ready 了，
+/// 那条 await 根本没被验证过。
+///
+/// ScopeId::APP = 3（scopes.rs:50：0 是 RootScopeWrapper、
+/// 1 是默认 SuspenseBoundary、2 是 ErrorBoundary、3 才是 app()），
+/// 这也正是上次 mark_dirty(ScopeId::ROOT) 毫无反应的根源：标的是 0 那个壳。
+///
+/// ⚠️ 调之前要把 runtime 推进 thread-local 的栈里（RuntimeGuard）。
+///    不是形式主义：needs_update → ScopeState::needs_update_any
+///    → `self.sender()`，而 sender() 的实现是
+///    `Runtime::current().sender.clone()`（scope_context.rs:97-99）——
+///    它问的是「当前线程正在跑的那个 runtime」，不是我们手里的这个。
+///    第一次跑的时候没加 guard，当场 panic
+///    「Must be called from inside a Dioxus runtime」（runtime.rs:100）。
+fn driver_send_work(
+    pump: &mut Pump,
+) {
+    if pump.step + 1 >= DIFF_SCRIPT.len() {
+        // 脚本跑完了：静默，一个 tick 一行会淹掉日志。
+        return;
+    }
+
+    pump.step += 1;
+
+    DIFF_STEP
+        .store(pump.step, Ordering::Relaxed);
+
+    println!(
+        "[driver] tick {} → 发 Immediate(ScopeId::APP) 纸条，\
+         下一次渲染的 key = {:?}",
+        pump.ticks,
+        DIFF_SCRIPT[pump.step]
+    );
+
+    if pump.step + 1 >= DIFF_SCRIPT.len() {
+        println!(
+            "[driver] 这是最后一张纸条，之后回路只会 Pending，\
+             一行渲染都不会再产生"
+        );
+    }
+
+    let runtime = pump.vdom.runtime();
+
+    let _guard = RuntimeGuard::new(
+        runtime.clone(),
+    );
+
+    runtime.needs_update(ScopeId::APP);
+}
+
+
+/// 每个 Qt tick 干的事。这就是 C++ 那边 QTimer::timeout 调进来的函数。
+fn qt_pump_tick() {
+    PUMP.with(|slot| {
+        let mut guard = slot.borrow_mut();
+
+        let Some(pump) = guard.as_mut() else {
+            return;
+        };
+
+        pump.ticks += 1;
+
+        // 1. 定时喂一张纸条。发完就 return —— 故意不在这一次去醒：
+        //    这样「发纸条」和「醒过来渲染」一定落在两个不同的 tick 上，
+        //    日志里能看出因果不是同一句函数调用串起来的。
+        if pump.ticks % TICKS_PER_STEP == 0 {
+            driver_send_work(pump);
+
+            return;
+        }
+
+        let Pump {
+            vdom,
+            renderer,
+            waker,
+            ticks,
+            ..
+        } = pump;
+
+        // 2. poll wait_for_work 一次。
+        let woke = {
+            let mut fut = std::pin::pin!(
+                vdom.wait_for_work()
+            );
+
+            let mut cx = Context::from_waker(&*waker);
+
+            fut.as_mut().poll(&mut cx).is_ready()
+        };
+
+        if !woke {
+            println!("[pump] tick {ticks} → Pending，这一轮什么都不做");
+
+            return;
+        }
+
+        // 3. 醒了才干活。
+        println!("[pump] tick {ticks} → Ready，render_immediate");
+
+        vdom.render_immediate(
+            renderer
+        );
+
+        // 批量边界：这一轮 mutation 全落完了，算一次布局。
+        renderer.relayout();
+
+        renderer.dump_tree();
+    });
+}
+
+
+// ============================================================
 // Main
 // ============================================================
 //
-// 现在这个 main 做了两轮渲染：第 4 步 mount，第 4.7 步手动驱动一次 diff
-// （只为了验证 Remove → destroy 那条链路，不是 UI 自己会变）。
-// 之后就交给 Qt 了。想让它真的「活」起来，缺的是第 5 步那条回路。
+// 现在这个 main 只做两轮：第 4 步 mount，然后把 vdom + renderer 交给回路
+// （第 5 步 install_pump），剩下的全在 Qt 的事件循环里发生。
+// UI 会自己变 9 次 —— 但那 9 次的源头还是假的（DIFF_SCRIPT 喂的纸条）。
 //
 // 顺便说明为什么 Qt 和 Dioxus 谁当主循环：
 // 这里让 Qt 当（app.exec()），因为 QQuickWindow 的渲染、
@@ -2951,90 +3190,33 @@ fn main() {
 
 
     // --------------------------------------------------------
-    // 4.7 手动把 diff 驱动完一遍（DIFF_SCRIPT 那张表）
-    //
-    // 为什么要「手动」：事件回路还没接（下一步），没有东西会去 poll
-    // VirtualDom，所以 UI 不会自己变。但 diff 的输出侧得先能跑起来
-    // 才谈得上回路，于是每一步都做同样三件事：
-    //
-    //     DIFF_STEP.store(n)         让下一次渲染的树真的变一下
-    //     vdom.mark_all_dirty()      把所有 scope 标脏
-    //     vdom.render_immediate(...) 走 diff，把 mutation 吐给 renderer
-    //     vdom.relayout()            批量边界：一轮 diff 跑完才算一次布局
-    //
-    // 为什么是 mark_all_dirty 而不是 mark_dirty(ScopeId::ROOT)：
-    // VirtualDom::new_with_component（virtual_dom.rs:296）先把应用包了一层
-    // RootScopeWrapper，所以 scope 0 只是个壳，app 组件是它的**子 scope**。
-    // 只标壳的那个 scope，重跑时 diff 看到的是「同一个组件、props 没变」，
-    // 就不会再跑子 scope —— 一条 mutation 都不会发。
-    // （实测过：mark_dirty(ROOT) 之后 app() 根本没被再渲染第二次。）
-    //
-    // 每一步该看到什么 mutation，写在 DIFF_SCRIPT 那张表上方。
-    // 布局这边也要跟着验：每步之后 dump 一次树，
-    // 看 children 顺序、下标和尺寸是不是跟 diff 一致。
-    // --------------------------------------------------------
-
-    for step in 1..DIFF_SCRIPT.len() {
-        println!(
-            "\n===== 手动 diff 第 {step} 步：key {:?} → {:?} =====",
-            DIFF_SCRIPT[step - 1],
-            DIFF_SCRIPT[step]
-        );
-
-        DIFF_STEP.store(step, Ordering::Relaxed);
-
-        vdom.mark_all_dirty();
-
-        vdom.render_immediate(
-            &mut renderer
-        );
-
-        // 批量边界：这一轮 mutation 全落完了，重算一次布局。
-        // 被删掉的那些节点已经不在 nodes / taffy 里，
-        // 所以这一步不会再碰它们的任何指针。
-        renderer.relayout();
-
-        renderer.dump_tree();
-    }
-
-
-    // --------------------------------------------------------
-    // 5. Qt 接管主循环
+    // 5. 回路装上，然后交给 Qt 的主循环
     // --------------------------------------------------------
     //
-    // ⚠️ 从这里往后，没有任何东西会再去碰 vdom。
-    //    （第 4.7 步那次 diff 是 main 自己在 exec 之前手动推的，
-    //      不是回路跑起来的。）
+    // 原来这段是「第 4.7 步：exec 之前用 for 循环手动把 diff 推完」
+    // （store → mark_all_dirty → render_immediate → relayout → dump_tree）。
+    // 现在那三件事被拆进了 Qt 的循环里，而且拆成了两个不同的 tick：
     //
-    // 所以现在是「渲染两轮就定住」：
-    //     - app() 里没有 signal，UI 本来也不会自己变；
-    //     - 就算加了 signal，也没人 poll VirtualDom；
-    //     - 就算 poll 了，diff 还会用到 ReplaceWith / InsertAfter /
-    //       InsertBefore，那三个在本文件里仍是 panic。
+    //     tick 3k   → driver_send_work：needs_update(ScopeId::APP) 发纸条
+    //     tick 3k+1 → poll wait_for_work → Ready → render_immediate + relayout
+    //     其余 tick → Pending，一行渲染都不产生
     //
-    // 要接上的是这三件事，都在 Qt 的事件循环里做：
+    // main 到这里就把 vdom / renderer 整个交出去，之后自己再也不碰它们。
+
+    install_pump(
+        vdom,
+        renderer,
+    );
+
+
+    // 这条链上还剩什么是假的：纸条的**内容**。
+    // 真实形态应该是 Qt 的鼠标事件 → create_event_listener
+    // （那个空实现，见 impl WriteMutations）→ runtime().handle_event(...)
+    // （runtime.rs:369）→ handler 里写 signal → dioxus 自己发那张纸条。
+    // 现在用 DIFF_SCRIPT + 一个原子变量把它替了。
     //
-    // 1) 拿一个 executor 去 poll vdom.wait_for_work()
-    //    （async，virtual_dom.rs:445；它内部会 process_events，
-    //      有脏 scope 就返回）。
-    //    常见做法是 QAbstractEventDispatcher::processEvents 的
-    //    前后挂钩子，或者干脆一个 QTimer 起来 poll 一次，
-    //    千万别 block_on 把它卡死主线程。
-    //
-    // 2) 它返回之后调 vdom.render_immediate(&mut renderer)
-    //    （virtual_dom.rs:599）走 diff，
-    //    前提是把上面 panic 的那几个 WriteMutations 实现掉。
-    //
-    // 3) 把 Qt 的鼠标/键盘事件转成 Dioxus 的事件送进去：
-    //    vdom.handle_event(name, Rc<dyn Any>, ElementId, bubbling)
-    //    （virtual_dom.rs:765），
-    //    送之前得先进 runtime（vdom.runtime()，virtual_dom.rs:759），
-    //    不然 signal 读写找不到上下文。
-    //    这也是 create_event_listener / remove_event_listener
-    //    那两个空实现该被填的地方。
-    //
-    // 另外 Cargo.toml 里 dioxus-signals 已经引了但还没用上，
-    // 第一个试验可以从 app() 里加一个 signal + 一个按钮开始。
+    // 脚本跑完（9 步）之后 driver 不再发纸条，日志会一直停在 Pending ——
+    // 那就是「回路在转、但没有空转渲染」的证据。
 
     println!(
         "Qt event loop started. \

@@ -9,6 +9,7 @@
 #include <QtCore/QDebug>
 #include <QtCore/QObject>
 #include <QtCore/QString>
+#include <QtCore/QTimer>
 #include <QtCore/QUrl>
 
 
@@ -117,6 +118,10 @@ struct QtHost::Impl {
     QQmlEngine engine;
     QQuickWindow window;
 
+    // 回路的心跳。挂在 window 上（QObject 父子树负责释放），
+    // 所以 start_pump 里 new 完不用管它的死活。
+    QTimer *pump_timer = nullptr;
+
     // 这里不再存 id -> 对象的表：指针本身就是句柄，
     // Rust 侧拿着它直接调下面的方法。
     //
@@ -160,6 +165,33 @@ std::unique_ptr<QtHost> new_qt_host()
 void QtHost::show()
 {
     impl_->window.show();
+}
+
+
+void QtHost::start_pump(
+    int interval_ms
+)
+{
+    // 挂在 window 上当 QObject 父节点：窗口析构时 timer 一起走，
+    // 不需要自己 delete。
+    if (impl_->pump_timer == nullptr) {
+        impl_->pump_timer = new QTimer(&impl_->window);
+    }
+
+    // 直接调生成头里声明的那个全局函数（`void qt_pump_tick() noexcept;`）。
+    // lambda 形式的 connect 不需要 moc，QTimer 也不是信号发射方以外的东西。
+    QObject::connect(
+        impl_->pump_timer,
+        &QTimer::timeout,
+        []() {
+            qt_pump_tick();
+        }
+    );
+
+    impl_->pump_timer->start(interval_ms);
+
+    qDebug()
+        << "[Qt] pump timer started," << interval_ms << "ms";
 }
 
 

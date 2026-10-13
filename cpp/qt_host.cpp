@@ -10,12 +10,13 @@
 #include <QtCore/QObject>
 #include <QtCore/QString>
 #include <QtCore/QUrl>
-#include <QtCore/QCoreApplication>
+
 
 #include <QtGui/QColor>
 #include <QtGui/QFont>
 #include <QtGui/QTextLayout>
 #include <QtGui/QTextOption>
+#include <QtGui/QGuiApplication>
 
 #include <QtQml/QQmlComponent>
 #include <QtQml/QQmlEngine>
@@ -548,6 +549,6 @@ QtHost::child_order(
 }
 
 
-void QtHost::process_events(std::int32_t ms) {
-    QCoreApplication::processEvents(QEventLoop::AllEvents, ms);
+void QtHost::process_events(std::int32_t ms) const {
+    QGuiApplication::processEvents(QEventLoop::AllEvents, ms);
 }

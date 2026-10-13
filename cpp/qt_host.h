@@ -147,7 +147,7 @@ public:
     ) const;
 
 
-    void process_events(std::int32_t ms);
+    void process_events(std::int32_t ms) const;
 
 private:
     struct Impl;

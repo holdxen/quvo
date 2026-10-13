@@ -88,6 +88,18 @@ use dioxus::prelude::*;
 
 use std::collections::HashMap;
 
+use taffy::prelude::{
+    AvailableSpace,
+    Dimension,
+    Display,
+    FlexDirection,
+    NodeId,
+    Size,
+    Style,
+    TaffyTree,
+    length,
+};
+
 
 // ============================================================
 // Rust <-> C++ Qt bridge
@@ -145,8 +157,15 @@ mod ffi {
         ) -> u64;
 
         // 实例化一个 QtQuick.Rectangle。
-        // 它没有属性需要从 Rust 传，宽高颜色全写死在 C++ 那段内联 QML 里。
+        // 没有属性需要从 Rust 传：颜色是画的事，
+        // 而宽高是布局的事，走 set_geometry。
         fn create_rectangle(
+            self: Pin<&mut QtHost>,
+        ) -> u64;
+
+        // 实例化一个裸 Item 当容器（qt-column）。
+        // QML 侧不带 Layout / anchors —— 孩子摆哪里全由 taffy 决定。
+        fn create_column(
             self: Pin<&mut QtHost>,
         ) -> u64;
 
@@ -183,6 +202,28 @@ mod ffi {
             name: &str,
             value: &str,
         );
+
+        // 布局结果写给 Qt：几何的唯一入口。
+        //
+        // 不复用 set_property 是因为它只能塞 QString，
+        // 而 x / y / width / height 是数字属性。
+        fn set_geometry(
+            self: Pin<&mut QtHost>,
+            id: u64,
+            x: f64,
+            y: f64,
+            width: f64,
+            height: f64,
+        );
+
+        // 视口尺寸问 Qt 要，免得 Rust 和 C++ 各写一个数字。
+        fn window_width(
+            self: &QtHost,
+        ) -> f64;
+
+        fn window_height(
+            self: &QtHost,
+        ) -> f64;
     }
 }
 
@@ -215,28 +256,36 @@ mod ffi {
 //
 // props 那侧也没什么魔法：
 //     text: String   -> 变成元素上的一个动态属性
+//     width/height   -> 也是动态属性，但只进布局账本，不写给 Qt
 //     children: Element -> 变成元素里的一个动态坑位（Dynamic）
-// 这两条路分别对应 set_attribute 和 replace_placeholder_with_nodes。
+// 后两条分别对应 set_attribute 和 replace_placeholder_with_nodes。
 // ============================================================
 
 #[component]
 fn Text(
     text: String,
-    children: Element,
+    width: f64,
+    height: f64,
 ) -> Element {
     rsx! {
         qt-text {
             text: "{text}",
-            {children}
+            width: "{width}",
+            height: "{height}",
         }
     }
 }
 
 
 #[component]
-fn Rectangle() -> Element {
+fn Rectangle(
+    width: f64,
+    height: f64,
+) -> Element {
     rsx! {
         qt-rectangle {
+            width: "{width}",
+            height: "{height}",
             color: "green"
         }
     }
@@ -247,40 +296,47 @@ fn Rectangle() -> Element {
 // 用户的 Dioxus UI
 // ============================================================
 
-// 就这三行是「应用」，其余全是 renderer。
+// 这十几行是「应用」，其余全是 renderer + 布局。
 //
-// 这句 rsx! 编译完之后，Dioxus 侧其实是两个模板：
+// 三件事值得注意：
 //
-//     app() 的模板
-//         roots         = [ Dynamic ]              ← 根上就一个动态节点
-//         dynamic_nodes = [ Component(Text) ]       ← 它是组件调用
+// 1. 位置尺寸只在这里出现（width / height / gap / flex_direction）。
+//    C++ 那边的内联 QML 已经没有任何 x / y / width / height 了，
+//    几何只有一个作者：relayout()。
 //
-//     Text() 的模板
-//         roots         = [ Element(qt-text) ]
-//         dynamic_attrs = [ ("text", 动态值) ]      → 走 set_attribute
-//         dynamic_nodes = [ Dynamic ]               → children 的那个坑位
-//                                                     走 replace_placeholder_with_nodes
+// 2. 静态属性和动态属性两条路都走到了：
+//    <qt-column> 上那几个是模板里写死的 → TemplateAttribute::Static，
+//    在 create_template_node 里就记进布局账本；
+//    Text / Rectangle 那几个是组件 props 插值 → SetAttribute，
+//    在 set_attribute 里记账。
 //
-// 组件嵌套在 mount 时是「透明」的：
-// renderer 只会收到 LoadTemplate(<qt-text>)、
-// SetAttribute(text)、LoadTemplate(<qt-rectangle>)、
-// ReplacePlaceholder([0], 1)、AppendChildren(ElementId(0), 1)，
-// 全程不知道 Text / Rectangle 是组件。
+// 3. <qt-column> 的模板里现在有「两个洞」
+//    （Text 和 Rectangle 都是组件调用 → 各是一个 Dynamic 节点）：
 //
-// Rectangle 没有子节点、没有动态属性，
-// 所以它那个模板只产生一条 LoadTemplate。
+//        node_paths = [ [0,0], [0,1] ]
+//
+//    所以 ReplacePlaceholder 会被调用两次，而且 Dioxus 是
+//    倒着发的（先 [0,1] 再 [0,0]）—— 正好是那条不变式的活教材。
 
 fn app() -> Element {
-    // 注意：
-    //
-    // 没有 main.qml。
-    //
-    // 屏幕最终出现的这句话，
-    // 来源就是这个 Dioxus text node。
+    // 没有 main.qml，也没有 QML 的 Layout / anchors。
     rsx! {
-        Text {
-            text: "Hello from Dioxus -> Qt Quick >>>>>",
-            Rectangle {}
+        qt-column {
+            width: "600",
+            height: "180",
+            flex_direction: "column",
+            gap: "12",
+
+            Text {
+                text: "Hello from Dioxus -> Qt Quick (taffy layout)",
+                width: 560.0,
+                height: 44.0,
+            }
+
+            Rectangle {
+                width: 200.0,
+                height: 40.0,
+            }
         }
     }
 }
@@ -308,6 +364,19 @@ struct Node {
 
     // 子节点的 node id，按模板顺序
     children: Vec<u64>,
+
+    // 这个节点在 taffy 树里的位置。
+    //
+    // None 只有占位节点：它「以后可能长成东西」，
+    // 但现在既没有 Qt 对象，也没有参与布局的资格。
+    taffy: Option<NodeId>,
+
+    // 布局关心的那几个属性（见 LAYOUT_PROPS）。
+    //
+    // 记在这里而不是立刻用：属性可能比节点晚到
+    // （动态属性是 SetAttribute，静态属性在模板里），
+    // 真正的输入时刻是 relayout()。
+    style: Vec<(&'static str, String)>,
 }
 
 
@@ -383,6 +452,19 @@ struct QtRenderer {
     // 用 Vec 而不是 HashMap 是因为 ElementId 就是连续的小整数，
     // 偶尔会跳着分配，所以中间允许出现 None。
     element_to_node: Vec<Option<u64>>,
+
+
+    // 布局树。
+    //
+    // 它不是第二棵「UI 树」：每个有 Qt 对象的节点在这里有一个对应节点，
+    // 父子关系由 sync_taffy_children 在 Node 的孩子变化时同步过来，
+    // 占位节点不进这棵树。
+    tree: TaffyTree<()>,
+
+    // 布局根 = node 0（窗口内容区）。
+    // 它没有 Qt 对象可写几何（0 是约定的「窗口根」），
+    // 只有孩子会被 apply。
+    root_taffy: NodeId,
 }
 
 
@@ -407,14 +489,32 @@ impl QtRenderer {
             HashMap::new();
 
 
+        // 布局树建根。
+        let mut tree = TaffyTree::<()>::new();
+
+        let root_taffy = tree
+            .new_leaf(Style::default())
+            .expect("taffy: 建布局根失败");
+
+
         // renderer root：没有真的 Qt 对象，
         // 但它的目标就是窗口根，
         // 所以直接按 C++ 那边的约定记成 0。
+        //
+        // 它的样式也走「属性账本」这一条路，
+        // 这样 style_for 就是全项目唯一的样式来源。
         nodes.insert(
             0,
             Node {
                 object: Some(0),
                 children: Vec::new(),
+                taffy: Some(root_taffy),
+                style: vec![
+                    (
+                        "flex_direction",
+                        "column".to_string(),
+                    ),
+                ],
             },
         );
 
@@ -426,6 +526,10 @@ impl QtRenderer {
 
             // 0 号 node 已经被 root 占了，所以从 1 开始发
             next_node: 1,
+
+            tree,
+
+            root_taffy,
 
             // Dioxus renderer root
             //
@@ -454,11 +558,27 @@ impl QtRenderer {
         self.next_node += 1;
 
 
+        // 有 Qt 对象的节点才有布局节点：
+        // 一个连壳都没有的占位，摆在哪都没有意义。
+        // 它后来被真节点顶掉时，顶上来的是已经建好的节点。
+        let taffy = match object {
+            Some(_) => Some(
+                self.tree
+                    .new_leaf(Style::default())
+                    .expect("taffy: new_leaf 失败"),
+            ),
+
+            None => None,
+        };
+
+
         self.nodes.insert(
             id,
             Node {
                 object,
                 children: Vec::new(),
+                taffy,
+                style: Vec::new(),
             },
         );
 
@@ -612,9 +732,17 @@ impl QtRenderer {
                     self.create_element(tag);
 
 
+                // 节点先建出来，属性才有地方记。
+                let element_node =
+                    self.new_node(Some(object));
+
+
                 // 模板里写死的属性（text: "字面量"）此刻就能应用；
                 // 动态属性（text: "{expr}"）Dioxus 稍后会通过
                 // set_attribute 送过来。
+                //
+                // 布局属性（width / height / gap / flex-direction）
+                // 只记账，不写给 Qt —— 几何只有一个作者。
                 for attr in attrs.iter() {
                     if let TemplateAttribute::Static {
                         name,
@@ -622,19 +750,23 @@ impl QtRenderer {
                         ..
                     } = attr
                     {
-                        self.host
-                            .pin_mut()
-                            .set_property(
-                                object,
-                                name,
-                                value,
-                            );
+                        self.record_style(
+                            element_node,
+                            name,
+                            value,
+                        );
+
+                        if !is_layout_prop(name) {
+                            self.host
+                                .pin_mut()
+                                .set_property(
+                                    object,
+                                    name,
+                                    value,
+                                );
+                        }
                     }
                 }
-
-
-                let element_node =
-                    self.new_node(Some(object));
 
 
                 // 静态子节点递归建；
@@ -718,7 +850,7 @@ impl QtRenderer {
         &mut self,
         tag: &str,
     ) -> u64 {
-        match tag {
+        let object = match tag {
             "qt-text" => self
                 .host
                 .pin_mut()
@@ -729,12 +861,180 @@ impl QtRenderer {
                 .pin_mut()
                 .create_rectangle(),
 
+            "qt-column" => self
+                .host
+                .pin_mut()
+                .create_column(),
+
             // 大小写规则见文件里 Text 组件上方的注释：
             // 走到这里的一定是被当成元素的标签，
             // 所以命中这条说明 rsx! 里写了个 renderer 不认识的标签名。
             other => panic!(
                 "QtRenderer 不认识元素 <{other}>"
             ),
+        };
+
+
+        // C++ 那边实例化失败也是返回 0，而 0 在本项目里是
+        // 「窗口根」这个约定值 —— 不拦的话一个建失败的节点
+        // 会被当成窗口根去挂载、去写几何，症状会非常难读。
+        // 真正的错误信息（QML 报错）已经由 qWarning 打出去了。
+        assert_ne!(
+            object, 0,
+            "Qt 侧实例化 <{tag}> 失败，见上面的 qWarning"
+        );
+
+
+        object
+    }
+
+
+    // 把布局属性记到节点上（不写给 Qt）。
+    //
+    // 同一名字重复记没关系：style_for 按顺序读，后面的覆盖前面的。
+    fn record_style(
+        &mut self,
+        node: u64,
+        name: &'static str,
+        value: &str,
+    ) {
+        if !is_layout_prop(name) {
+            return;
+        }
+
+
+        self.nodes
+            .get_mut(&node)
+            .unwrap_or_else(|| {
+                panic!("unknown node id {node}")
+            })
+            .style
+            .push((name, value.to_string()));
+    }
+
+
+    // 父节点的孩子列表变了，就把布局树的 children 整体重设一遍。
+    //
+    // 刻意不做增量：这里的调用点是「树结构真的变了」的时刻
+    // （静态孩子建完、占位被顶掉），量很小，
+    // 整体覆盖比维护 diff 的边界条件可靠得多。
+    fn sync_taffy_children(
+        &mut self,
+        parent: u64,
+    ) {
+        let Some(parent_taffy) =
+            self.node(parent).taffy
+        else {
+            return;
+        };
+
+
+        let children: Vec<NodeId> = self
+            .node(parent)
+            .children
+            .iter()
+            .filter_map(|child| {
+                self.node(*child).taffy
+            })
+            .collect();
+
+
+        self.tree
+            .set_children(parent_taffy, &children)
+            .expect("taffy: set_children 失败");
+    }
+
+
+    // 布局的唯一计算入口：属性 → taffy → Qt。
+    //
+    // 调用时机是「批量边界」：现在是 rebuild 之后一次，
+    // 以后接上更新循环就是每次 render_immediate 之后一次。
+    // 绝对不要写成每条 mutation 算一次。
+    fn relayout(
+        &mut self,
+    ) {
+        // 1. 把每个节点记下的属性变成 taffy 的输入。
+        //    先 clone 出 props 是为了让 &self 的借用当场结束。
+        let ids: Vec<u64> =
+            self.nodes.keys().copied().collect();
+
+        for id in ids {
+            let Some(taffy) = self.node(id).taffy
+            else {
+                continue;
+            };
+
+            let props = self.node(id).style.clone();
+            let style = style_for(&props);
+
+            self.tree
+                .set_style(taffy, style)
+                .expect("taffy: set_style 失败");
+        }
+
+
+        // 2. 视口问 Qt 要，不在 Rust 里再写一个 640x220。
+        //    taffy 用 f32，bridge 用 f64，边界处换算一次。
+        let viewport = Size {
+            width: AvailableSpace::Definite(
+                self.host.window_width() as f32,
+            ),
+            height: AvailableSpace::Definite(
+                self.host.window_height() as f32,
+            ),
+        };
+
+        self.tree
+            .compute_layout(self.root_taffy, viewport)
+            .expect("taffy: compute_layout 失败");
+
+
+        // 3. 结果推给 Qt。
+        self.apply_geometry(0);
+    }
+
+
+    // 深度优先把布局结果写给每个节点。
+    //
+    // taffy 的 location 是相对父节点的，
+    // QQuickItem 的 x / y 也是相对 parentItem 的 —— 同一个口径，不用换算。
+    fn apply_geometry(
+        &mut self,
+        node: u64,
+    ) {
+        let children = self.node(node).children.clone();
+
+        for child in children {
+            // 占位节点不参与布局，也没有 Qt 对象可写。
+            let Some(taffy) = self.node(child).taffy
+            else {
+                continue;
+            };
+
+            let layout = self
+                .tree
+                .layout(taffy)
+                .expect("taffy: 缺布局结果");
+
+            let x = layout.location.x as f64;
+            let y = layout.location.y as f64;
+            let w = layout.size.width as f64;
+            let h = layout.size.height as f64;
+
+            // object 0 是「窗口根」那个约定值，
+            // C++ 的 objects 表里没有它，写进去只会刷一条警告。
+            let object = self
+                .node(child)
+                .object
+                .filter(|id| *id != 0);
+
+            if let Some(object) = object {
+                self.host
+                    .pin_mut()
+                    .set_geometry(object, x, y, w, h);
+            }
+
+            self.apply_geometry(child);
         }
     }
 
@@ -778,6 +1078,10 @@ impl QtRenderer {
                     child_object,
                 );
         }
+
+
+        // 布局树跟着同步。
+        self.sync_taffy_children(parent);
     }
 
 
@@ -839,6 +1143,113 @@ impl QtRenderer {
             }
         }
     }
+}
+
+
+// ============================================================
+// 布局（taffy）
+// ============================================================
+//
+// 分工定死了：
+//
+//     Qt 侧   只负责「画」和「谁是谁的孩子」
+//     taffy   只负责「每个孩子多大、摆在父节点的哪个位置」
+//
+// 所以 C++ 那段内联 QML 里不再有 x / y / width / height，
+// 几何的唯一作者是 relayout()。
+//
+// 检验办法（负向检查）：把 main() 里那句 relayout() 注释掉再跑，
+// 屏幕应该只剩背景色 —— 因为除了窗口本身，没有任何东西有尺寸。
+//
+// 两个还没接的东西，属于下一步：
+//   - 文本测量：现在文本框的宽高是 rsx 里显式写的，
+//     taffy 还没问过 Qt「这段字多大」。要做测量，
+//     字体必须只有一个来源（现在字号写在 QML 里），
+//     否则量出来的和画出来的对不上。
+//   - 窗口 resize：视口尺寸只在 relayout 那一刻读一次，
+//     拖动窗口不会重算（连重算的触发点都还没接）。
+
+// 这些属性名不写给 Qt，只进布局。
+// 名字同时接受下划线和短横两种写法：rsx! 里两种都能写。
+const LAYOUT_PROPS: &[&str] = &[
+    "width",
+    "height",
+    "gap",
+    "flex_direction",
+    "flex-direction",
+];
+
+
+fn is_layout_prop(
+    name: &str,
+) -> bool {
+    LAYOUT_PROPS.contains(&name)
+}
+
+
+// 只接受纯数字。
+//
+// 故意不接受 "50%"：百分比需要知道父节点尺寸，
+// 现在支持它就会让人以为整条百分比链路都通了。
+fn parse_length(
+    value: &str,
+) -> Option<f32> {
+    value.trim().parse::<f32>().ok()
+}
+
+
+// 把记下来的属性拼成 taffy 的输入。
+//
+// 没写 width / height 的节点就是 auto：flex 布局里意味着
+// 「按内容撑开」，而容器没有内容尺寸来源 → 会算出 0，
+// 屏幕上就是空白。这是刻意的：几何不写就没有，不会被 Qt 的
+// implicit size 偷偷填上。
+fn style_for(
+    props: &[(&'static str, String)],
+) -> Style {
+    let mut style = Style {
+        display: Display::Flex,
+        ..Default::default()
+    };
+
+
+    for (name, value) in props {
+        match (*name, parse_length(value)) {
+            ("width", Some(v)) => {
+                style.size.width =
+                    Dimension::length(v);
+            }
+
+            ("height", Some(v)) => {
+                style.size.height =
+                    Dimension::length(v);
+            }
+
+            ("gap", Some(v)) => {
+                style.gap = Size {
+                    width: length(v),
+                    height: length(v),
+                };
+            }
+
+            ("flex_direction", _)
+            | ("flex-direction", _) => {
+                style.flex_direction =
+                    if value == "column" {
+                        FlexDirection::Column
+                    } else {
+                        FlexDirection::Row
+                    };
+            }
+
+            // 数字解析不出来的（比如 "" / "abc" / "50%"）
+            // 当没写过，不猜。
+            _ => {}
+        }
+    }
+
+
+    style
 }
 
 
@@ -1307,6 +1718,10 @@ impl WriteMutations for QtRenderer {
         self.forget_element_ids(placeholder);
 
 
+        // 父节点的孩子列表刚刚从 1 格变成了 m 格：布局树跟上。
+        self.sync_taffy_children(parent);
+
+
         println!(
             "[Dioxus] ReplacePlaceholder \
              path={path:?} m={m} \
@@ -1373,6 +1788,43 @@ impl WriteMutations for QtRenderer {
         //
         // id 就是 load_template 里那个元素的 ElementId。
 
+        // 这一版只处理字符串值。
+        //
+        // Int / Float / Bool 也会从 Dioxus 过来，
+        // 但那要在 C++ 侧包成对应类型的 QVariant 才有意义，
+        // 例如 color（QColor）。
+        let AttributeValue::Text(text) = value
+        else {
+            println!(
+                "[renderer] 暂不支持非字符串属性 \
+                 {name}={value:?}"
+            );
+
+            return;
+        };
+
+
+        // 布局属性在这里只记账，不写给 Qt：
+        // width / height 之类的最终归宿是 taffy 的输入，
+        // 再由 relayout() 通过 set_geometry 推回去。
+        // 让 set_property 也写一遍就会出现两个作者。
+        if is_layout_prop(name) {
+            match self.lookup(id) {
+                Some(node) => self.record_style(
+                    node, name, text,
+                ),
+
+                None => println!(
+                    "[renderer] SetAttribute id={} \
+                     找不到节点，布局属性被丢弃",
+                    id.0
+                ),
+            }
+
+            return;
+        }
+
+
         let Some(object) =
             self.object_of(id)
         else {
@@ -1380,23 +1832,6 @@ impl WriteMutations for QtRenderer {
                 "[renderer] SetAttribute \
                  id={} 还没有映射到 Qt 对象",
                 id.0
-            );
-
-            return;
-        };
-
-
-        // 这一版只处理字符串值。
-        //
-        // Int / Float / Bool 也会从 Dioxus 过来，
-        // 但那要在 C++ 侧包成对应类型的 QVariant 才有意义，
-        // 例如 x / y（int）、color（QColor）。
-
-        let AttributeValue::Text(text) = value
-        else {
-            println!(
-                "[renderer] 暂不支持非字符串属性 \
-                 {name}={value:?}"
             );
 
             return;
@@ -1544,6 +1979,19 @@ fn main() {
 
 
     // --------------------------------------------------------
+    // 4.5 布局：属性 → taffy → Qt
+    //
+    // 这就是「批量边界」：mount 的全部 mutation 都跑完了，
+    // 每个节点的 width / height / gap 都记完账了，才算一次。
+    //
+    // 没算之前所有节点尺寸都是 0，屏幕上只有窗口背景色 ——
+    // 想验证几何确实只有一个作者，就把下面这行注释掉再跑。
+    // --------------------------------------------------------
+
+    renderer.relayout();
+
+
+    // --------------------------------------------------------
     // 5. Qt 接管主循环
     // --------------------------------------------------------
     //
@@ -1589,5 +2037,82 @@ fn main() {
         qt_app.as_mut()
     {
         app.exec();
+    }
+}
+
+
+// ============================================================
+// 不碰 Qt 的那半段：属性 → 布局输入
+// ============================================================
+//
+// relayout() 分两步：先把记下来的属性拼成 taffy 的输入，
+// 再把算好的几何推给 Qt。前一步是纯 Rust 的，
+// 所以能在这里断言，不需要窗口。
+//
+// 每个测试都带反向断言：光「解析成功」不够，
+// 还得证明非法输入不会被当成 0，以及 text / color 不该被吞掉。
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+
+    #[test]
+    fn parse_length_accepts_plain_numbers() {
+        assert_eq!(parse_length("460"), Some(460.0));
+        assert_eq!(parse_length("12.5"), Some(12.5));
+        assert_eq!(parse_length(" 60 "), Some(60.0));
+    }
+
+
+    #[test]
+    fn parse_length_rejects_anything_else() {
+        // 关键是 None，而不是 0.0 —— 当成 0 的话屏幕上就是一个
+        // 看不见又占位的盒子，比没有更难查。
+        assert_eq!(parse_length(""), None);
+        assert_eq!(parse_length("abc"), None);
+        assert_eq!(parse_length("50%"), None);
+    }
+
+
+    #[test]
+    fn only_layout_props_are_kept_from_qt() {
+        assert!(is_layout_prop("width"));
+        assert!(is_layout_prop("height"));
+        assert!(is_layout_prop("gap"));
+        assert!(is_layout_prop("flex-direction"));
+        assert!(is_layout_prop("flex_direction"));
+
+        // 反向：这些必须照常写给 Qt，不然文字和颜色没人画
+        assert!(!is_layout_prop("text"));
+        assert!(!is_layout_prop("color"));
+    }
+
+
+    #[test]
+    fn style_for_reads_every_supported_prop() {
+        let props = vec![
+            ("width", "600".to_string()),
+            ("height", "180".to_string()),
+            ("flex_direction", "column".to_string()),
+            ("gap", "12".to_string()),
+        ];
+
+        let style = style_for(&props);
+
+        assert_eq!(style.size.width, Dimension::length(600.0));
+        assert_eq!(style.size.height, Dimension::length(180.0));
+        assert_eq!(style.flex_direction, FlexDirection::Column);
+        assert_eq!(style.gap.width, length(12.0));
+    }
+
+
+    #[test]
+    fn style_for_treats_unparsable_value_as_absent() {
+        let props = vec![("width", "50%".to_string())];
+
+        let style = style_for(&props);
+
+        assert_eq!(style.size.width, Dimension::auto());
     }
 }

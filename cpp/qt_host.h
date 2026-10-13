@@ -20,6 +20,10 @@ public:
 
     std::uint64_t create_text(rust::Str text);
 
+    // 一个裸 Item：只当容器，不带任何 QML Layout / anchors。
+    // 它的位置和大小完全由 Rust 侧的布局器给（见 set_geometry）。
+    std::uint64_t create_column();
+
     // 把一个对象挂到父对象下面。
     //
     // parent_id == 0 表示窗口根（window.contentItem()）。
@@ -28,6 +32,23 @@ public:
         std::uint64_t parent_id,
         std::uint64_t child_id
     );
+
+    // 布局结果写给一个 QQuickItem。
+    //
+    // 这是几何的唯一入口：不走 set_property 的 QString 强转，
+    // 直接 setX/setY/setWidth/setHeight。
+    void set_geometry(
+        std::uint64_t id,
+        double x,
+        double y,
+        double width,
+        double height
+    );
+
+    // 视口尺寸由 Rust 侧来问，而不是两边各写一个数字。
+    double window_width() const;
+
+    double window_height() const;
 
     // 在 stacking 顺序上把 child 排到 sibling 前面。
     // 让 Qt 的子节点顺序跟 Dioxus 模板里的顺序一致。

@@ -11,5 +11,7 @@ cxx-qt-lib = { version = "0.10", features = ["qt_full"] }
 dioxus = { version = "=0.7.10", default-features = false, features = [ "macro", "html", "third-party-renderer", ]}
 dioxus-signals = "0.7.10"
 
+taffy = "0.15"
+
 [build-dependencies]
 cxx-qt-build = { version = "0.10", features = ["link_qt_object_files"]}

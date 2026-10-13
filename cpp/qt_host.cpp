@@ -26,6 +26,65 @@ QString to_qstring(rust::Str text)
     );
 }
 
+// 共用：把一段内联 QML 实例化成 QQuickItem，登记进 objects 并返回 id。
+//
+// 返回 0 表示失败（Rust 侧会把 0 当成「这个节点没有 Qt 对象」，
+// 于是既不挂载也不参与布局）。
+std::uint64_t instantiate(
+    QQmlEngine& engine,
+    std::unordered_map<std::uint64_t, QObject*>& objects,
+    std::uint64_t& next_id,
+    const char* qml,
+    const char* label
+)
+{
+    QQmlComponent component(&engine);
+
+    component.setData(
+        QByteArray(qml),
+        QUrl()
+    );
+
+    if (component.isError()) {
+        for (const auto& error : component.errors()) {
+            qWarning().noquote() << error.toString();
+        }
+
+        return 0;
+    }
+
+    QObject* object = component.create();
+
+    if (object == nullptr) {
+        qWarning()
+            << "QQmlComponent::create failed" << label;
+
+        return 0;
+    }
+
+    auto* item = qobject_cast<QQuickItem*>(object);
+
+    if (item == nullptr) {
+        qWarning()
+            << "created object is not QQuickItem" << label;
+
+        delete object;
+
+        return 0;
+    }
+
+    const std::uint64_t id = next_id++;
+
+    objects.emplace(id, object);
+
+    qDebug()
+        << "[Qt] create" << label
+        << "id =" << id
+        << "but NOT mounted yet";
+
+    return id;
+}
+
 } // namespace
 
 
@@ -96,165 +155,75 @@ void QtHost::show()
 
 
 std::uint64_t QtHost::create_rectangle() {
-    QQmlComponent component(&impl_->engine);
-
-    component.setData(R"QML(
+    // 注意这里没有 width / height：
+    // 几何一律由 Rust 侧的布局器通过 set_geometry 给。
+    return instantiate(
+        impl_->engine,
+        impl_->objects,
+        impl_->next_id,
+        R"QML(
 import QtQuick
+
 Rectangle {
-    width: 30
-    height: 30
 }
-)QML", QUrl());
-    if (component.isError()) {
-        for (
-            const auto& error :
-            component.errors()
-        ) {
-            qWarning().noquote()
-                << error.toString();
-        }
-
-        return 0;
-    }
-
-        QObject* object =
-        component.create();
-
-    if (object == nullptr) {
-        qWarning()
-            << "QQmlComponent::create failed";
-
-        return 0;
-    }
-
-
-    auto* item =
-        qobject_cast<QQuickItem*>(
-            object
-        );
-
-    if (item == nullptr) {
-        qWarning()
-            << "created object is not QQuickItem";
-
-        delete object;
-
-        return 0;
-    }
-
-    const std::uint64_t id =
-    impl_->next_id++;
-
-
-    impl_->objects.emplace(
-        id,
-        object
+)QML",
+        "Rectangle"
     );
+}
 
 
-    qDebug()
-    << "[Qt] create Rectangle id ="
-    << id
-    << "but NOT mounted yet";
+std::uint64_t QtHost::create_column() {
+    // 一个裸 Item —— 没有 Layout，没有 anchors。
+    // 它存在的唯一理由是给「容器」一个能装孩子的对象；
+    // 孩子摆在哪，完全是布局器的事。
+    return instantiate(
+        impl_->engine,
+        impl_->objects,
+        impl_->next_id,
+        R"QML(
+import QtQuick
 
-
-    return id;
+Item {
+}
+)QML",
+        "Column"
+    );
 }
 
 
 std::uint64_t
 QtHost::create_text(rust::Str text)
 {
-    QQmlComponent component(
-        &impl_->engine
-    );
-
-    // 注意：
+    // 注意：这不是用户写的 UI，
+    // 这是 renderer 对 Dioxus 文本 primitive 的 Qt 实现。
     //
-    // 这不是用户写的 UI。
-    //
-    // 这是 renderer 对
-    //
-    //     Dioxus Text
-    //
-    // 这个 primitive 的 Qt 实现。
-    component.setData(
+    // 字体/颜色留在 QML 里 —— 那是「怎么画」；
+    // 但 x / y / width / height 属于布局，只能由 set_geometry 决定。
+    const std::uint64_t id = instantiate(
+        impl_->engine,
+        impl_->objects,
+        impl_->next_id,
         R"QML(
 import QtQuick
 
 Text {
-    x: 36
-    y: 76
-
     color: "#17343b"
 
     font.pixelSize: 32
     font.weight: Font.DemiBold
 }
 )QML",
-        QUrl()
+        "Text"
     );
 
-    if (component.isError()) {
-        for (
-            const auto& error :
-            component.errors()
-        ) {
-            qWarning().noquote()
-                << error.toString();
-        }
-
+    if (id == 0) {
         return 0;
     }
 
-
-    QObject* object =
-        component.create();
-
-    if (object == nullptr) {
-        qWarning()
-            << "QQmlComponent::create failed";
-
-        return 0;
-    }
-
-
-    auto* item =
-        qobject_cast<QQuickItem*>(
-            object
-        );
-
-    if (item == nullptr) {
-        qWarning()
-            << "created object is not QQuickItem";
-
-        delete object;
-
-        return 0;
-    }
-
-
-    object->setProperty(
+    object_for(id)->setProperty(
         "text",
         to_qstring(text)
     );
-
-
-    const std::uint64_t id =
-        impl_->next_id++;
-
-
-    impl_->objects.emplace(
-        id,
-        object
-    );
-
-
-    qDebug()
-        << "[Qt] create Text id ="
-        << id
-        << "but NOT mounted yet";
-
 
     return id;
 }
@@ -350,6 +319,50 @@ QtHost::stack_before(
 
 
     child->stackBefore(sibling);
+}
+
+
+void
+QtHost::set_geometry(
+    std::uint64_t id,
+    double x,
+    double y,
+    double width,
+    double height
+)
+{
+    auto* item =
+        qobject_cast<QQuickItem*>(
+            object_for(id)
+        );
+
+    if (item == nullptr) {
+        qWarning()
+            << "[Qt] set_geometry on unknown object"
+            << id;
+
+        return;
+    }
+
+
+    // x / y 是相对 parentItem 的局部坐标，
+    // 和布局器输出的 location 是同一个口径，不用换算。
+    item->setX(x);
+    item->setY(y);
+    item->setWidth(width);
+    item->setHeight(height);
+}
+
+
+double QtHost::window_width() const
+{
+    return impl_->window.width();
+}
+
+
+double QtHost::window_height() const
+{
+    return impl_->window.height();
 }
 
 

@@ -100,6 +100,10 @@ use taffy::prelude::{
     length,
 };
 
+// 叶子节点的默认测量逻辑：把「测出来的尺寸」和 style 里的
+// width / height、可用空间夹在一起，算出最终的 LayoutOutput。
+use taffy::compute_leaf_layout;
+
 
 // ============================================================
 // Rust <-> C++ Qt bridge
@@ -240,7 +244,9 @@ mod ffi {
         // 量一段文本要多大 —— 走的是 QQuickText 同一套算法
         // （QTextLayout + design metrics），见 cpp/qt_host.cpp。
         //
-        // max_width <= 0 表示不限宽。
+        // max_width <= 0：不限宽，折一行，宽度 = Qt 的 implicitWidth 口径。
+        // max_width >  0：按这个宽度折行，返回的是「用到的宽度」
+        //                （最宽那一行，且不超过 max_width）和总高度。
         fn measure_text(
             self: &QtHost,
             text: &str,
@@ -295,17 +301,15 @@ mod ffi {
 // 后两条分别对应 set_attribute 和 replace_placeholder_with_nodes。
 // ============================================================
 
+// 文本的尺寸不写在这里：由 Qt 量出来决定（见 relayout 的测量回调）。
+// 想给文本定宽就写 width —— 那是布局输入，会被 taffy 当成已知宽度传给测量。
 #[component]
 fn Text(
     text: String,
-    width: f64,
-    height: f64,
 ) -> Element {
     rsx! {
         qt-text {
             text: "{text}",
-            width: "{width}",
-            height: "{height}",
         }
     }
 }
@@ -334,9 +338,17 @@ fn Rectangle(
 //
 // 三件事值得注意：
 //
-// 1. 位置尺寸只在这里出现（width / height / gap / flex_direction）。
+// 1. 位置尺寸只在这里出现（width / height / gap / flex_direction），
+//    而且现在只有容器和矩形写死了尺寸 —— Text 不写，
+//    它的大小是 relayout() 里回头问 Qt 量出来的。
 //    C++ 那边的内联 QML 已经没有任何 x / y / width / height 了，
 //    几何只有一个作者：relayout()。
+//
+//    负向检查（已跑过）：把 relayout 里测量回调的返回值换成
+//    Size { width: 333.0, height: 7.0 }，
+//    日志里「布局用到」立刻变成 600.0x7.0 —— 高度跟着测量走。
+//    （宽度一直是 600，因为列容器交叉轴默认 stretch 会把它拉满，
+//      所以宽度不是这条检查的信号，高度才是。）
 //
 // 2. 静态属性和动态属性两条路都走到了：
 //    <qt-column> 上那几个是模板里写死的 → TemplateAttribute::Static，
@@ -363,8 +375,6 @@ fn app() -> Element {
 
             Text {
                 text: "Hello from Dioxus -> Qt Quick (taffy layout)",
-                width: 560.0,
-                height: 44.0,
             }
 
             Rectangle {
@@ -414,8 +424,10 @@ struct Node {
 
     // 这个节点上显示的文本（只有文本类节点会有）。
     //
-    // 现在用来做「测量 vs Qt implicit size」的对照；
-    // 下一步接上 taffy 的 measure function，喂给它的也是这个。
+    // 两个用处：
+    //     1. relayout() 把它塞进 taffy 节点的 context，
+    //        测量回调拿到的就是它（见 compute_layout_with_measure）；
+    //     2. verify_text_measurement() 用它做「我们量的」vs「Qt 自己算的」对照。
     content: String,
 }
 
@@ -499,7 +511,10 @@ struct QtRenderer {
     // 它不是第二棵「UI 树」：每个有 Qt 对象的节点在这里有一个对应节点，
     // 父子关系由 sync_taffy_children 在 Node 的孩子变化时同步过来，
     // 占位节点不进这棵树。
-    tree: TaffyTree<()>,
+    //
+    // 泛型参数是 taffy 的「节点 context」：这里放这段文本的内容，
+    // 测量回调会原样拿到它（没有文本的节点不设 context，量出来就是 0）。
+    tree: TaffyTree<String>,
 
     // 布局根 = node 0（窗口内容区）。
     // 它没有 Qt 对象可写几何（0 是约定的「窗口根」），
@@ -530,7 +545,7 @@ impl QtRenderer {
 
 
         // 布局树建根。
-        let mut tree = TaffyTree::<()>::new();
+        let mut tree = TaffyTree::<String>::new();
 
         let root_taffy = tree
             .new_leaf(Style::default())
@@ -966,9 +981,8 @@ impl QtRenderer {
 
     // 记下这个节点显示的文本。
     //
-    // 现在唯一的用处是对照测量：拿同一个字符串去问 Qt
-    // 「你量出来多少」和「你自己渲染要多少」。
-    // 下一步接 taffy 的 measure function，喂给它的也是这个值。
+    // 这份账是布局的输入，不只是诊断用的：relayout() 会把它
+    // 交给 taffy 的节点 context，测量回调量的就是它。
     fn record_content(
         &mut self,
         node: u64,
@@ -1046,6 +1060,26 @@ impl QtRenderer {
             self.tree
                 .set_style(taffy, style)
                 .expect("taffy: set_style 失败");
+
+            // 文本内容送进 taffy 的节点 context。
+            //
+            // 测量是 taffy 反过来调我们的：它回调时只递给自己存的
+            // context 和 style，不认识我们的 Node，
+            // 所以「这段字是什么」必须在算之前就先放进去。
+            // 空文本（Rectangle / Item）不设 context ——
+            // 那些叶子的尺寸本来就该来自 style 里的 width / height。
+            let content = self.node(id).content.clone();
+
+            self.tree
+                .set_node_context(
+                    taffy,
+                    if content.is_empty() {
+                        None
+                    } else {
+                        Some(content)
+                    },
+                )
+                .expect("taffy: set_node_context 失败");
         }
 
 
@@ -1060,12 +1094,81 @@ impl QtRenderer {
             ),
         };
 
-        self.tree
-            .compute_layout(self.root_taffy, viewport)
-            .expect("taffy: compute_layout 失败");
+
+        // 3. 算布局。
+        //
+        //    用的是 compute_layout_with_measure 而不是 compute_layout：
+        //    叶子节点（taffy 眼里没有孩子的节点 = 文本和矩形）的尺寸
+        //    taffy 自己算不出来，得回头问 Qt。
+        //    compute_layout 其实就是「测量函数永远返 0」的特例。
+        //
+        //    借用要拆成字段级：tree 需要 &mut（它在写布局结果），
+        //    host 只需要 &（measure_text 是 const 的），
+        //    两者都在 self 上，整块借会互相撞上。
+        let QtRenderer {
+            tree,
+            host,
+            root_taffy,
+            ..
+        } = self;
+
+        let host = &**host;
+
+        tree
+            .compute_layout_with_measure(
+                *root_taffy,
+                viewport,
+                |inputs, _node, context, style| {
+                    // 叶子的通用那半：style 的 size / min / max、
+                    // padding、可用空间怎么和测量结果夹在一起。
+                    compute_leaf_layout(
+                        inputs,
+                        style,
+                        // calc 表达式本项目没用到，原样返回。
+                        |_calc_ptr, value| value,
+                        |known_dimensions, available_space| {
+                            // 没有文本的叶子问不出尺寸。
+                            // 它的宽高写在 style 里，
+                            // compute_leaf_layout 会用 style 覆盖这里的结果。
+                            let Some(content) = context else {
+                                return Size::ZERO;
+                            };
+
+                            // 只有父节点给了确定宽度才折行。
+                            // MaxContent / MinContent 是「按内容要多宽有多宽」，
+                            // 那时不限宽。
+                            // （MinContent 严格来说该量「最长的一个词」，
+                            //   这个 demo 里没有会问 min-content 的容器，
+                            //   所以先按不限宽处理。）
+                            let max_width = match available_space.width {
+                                AvailableSpace::Definite(width) => {
+                                    width as f64
+                                }
+                                _ => -1.0,
+                            };
+
+                            let measured = host.measure_text(
+                                content.as_str(),
+                                max_width,
+                            );
+
+                            // 已经知道的轴就用知道的，别拿测量值去盖。
+                            Size {
+                                width: known_dimensions
+                                    .width
+                                    .unwrap_or(measured.width as f32),
+                                height: known_dimensions
+                                    .height
+                                    .unwrap_or(measured.height as f32),
+                            }
+                        },
+                    )
+                },
+            )
+            .expect("taffy: compute_layout_with_measure 失败");
 
 
-        // 3. 结果推给 Qt。
+        // 4. 结果推给 Qt。
         self.apply_geometry(0);
     }
 
@@ -1117,10 +1220,14 @@ impl QtRenderer {
 
     // 对照检查：我们量的文本尺寸 vs Qt 自己报的 implicit size。
     //
-    // 这一步刻意不接进布局 —— 先把「测量口径」这个变量消掉。
-    // 两边不一致就先别往下接：差 1px 会在 flex 分配里累积成可见的错位。
+    // 测量已经进布局了，这个函数退化成「对测量口径做体检」：
+    // 两边不一致就先别信布局 —— 差 1px 会在 flex 分配里累积成可见的错位。
     //
-    // 期待看到什么：不限宽那一行 Δ 应该是 0.0/0.0。
+    // 期待看到什么：
+    //   - 「不限宽」那行 Δ 应该是 0.0/0.0（同一个字体、同一个算法）。
+    //   - 「限宽100」的宽度应 ≤ 100、高度是多行之和（这是折行后的口径，
+    //     Qt 的 implicitWidth 不看折行，所以这两行不和 implicit 比）。
+    //
     // 如果 Δ 不是 0，最可能的原因是字体两边不同（现在两边都该是
     // QGuiApplication::font()），或者 useDesignMetrics 没开。
     fn verify_text_measurement(
@@ -1170,6 +1277,26 @@ impl QtRenderer {
                 "   限宽100 我们 {:.1}x{:.1}",
                 wrapped.width, wrapped.height
             );
+
+            // 布局最终给这个节点的尺寸 —— 也就是 set_geometry 写进 Qt 的那个数。
+            //
+            // 它的高度应该等于测量高度（文本只有一行）；
+            // 宽度不等于量出来的 254.9，因为列容器的 align-items 默认是
+            // stretch：交叉轴（这里就是水平）上会被拉满成容器的 600。
+            // 所以宽度在这条日志上分不出「量了的」和「拉宽的」，
+            // 能分辨的是高度 —— 已经验过：把测量回调硬返回 height 7.0，
+            // 这里立刻变 600.0x7.0。
+            if let Some(taffy) = self.node(id).taffy {
+                if let Ok(layout) = self.tree.layout(taffy) {
+                    println!(
+                        "   布局用到 {:.1}x{:.1} @ ({:.1}, {:.1})",
+                        layout.size.width,
+                        layout.size.height,
+                        layout.location.x,
+                        layout.location.y,
+                    );
+                }
+            }
         }
 
         println!("====================\n");
@@ -1298,11 +1425,11 @@ impl QtRenderer {
 // 检验办法（负向检查）：把 main() 里那句 relayout() 注释掉再跑，
 // 屏幕应该只剩背景色 —— 因为除了窗口本身，没有任何东西有尺寸。
 //
-// 两个还没接的东西，属于下一步：
-//   - 文本测量：现在文本框的宽高是 rsx 里显式写的，
-//     taffy 还没问过 Qt「这段字多大」。要做测量，
-//     字体必须只有一个来源（现在字号写在 QML 里），
-//     否则量出来的和画出来的对不上。
+// 还没接的两件事：
+//   - 字体：两边现在都用 QGuiApplication::font()（C++ 那边是默认构造的
+//     QFont，QML 里那个 Text 没写 font）。所以「量的」和「画的」恰好是
+//     同一个字体，Δ 才是 0。一旦 font 变成 Rust 下发的样式属性，
+//     measure_text 必须收同一个 QFont，不能各拿各的。
 //   - 窗口 resize：视口尺寸只在 relayout 那一刻读一次，
 //     拖动窗口不会重算（连重算的触发点都还没接）。
 
@@ -1337,8 +1464,9 @@ fn parse_length(
 
 // 把记下来的属性拼成 taffy 的输入。
 //
-// 没写 width / height 的节点就是 auto：flex 布局里意味着
-// 「按内容撑开」，而容器没有内容尺寸来源 → 会算出 0，
+// 没写 width / height 的节点就是 auto。
+// 对文本节点，auto 现在有人接了：relayout 的测量回调会问 Qt 要尺寸。
+// 对矩形 / Item，auto 还是「按内容撑开」而内容没有尺寸来源 → 算出 0，
 // 屏幕上就是空白。这是刻意的：几何不写就没有，不会被 Qt 的
 // implicit size 偷偷填上。
 fn style_for(
@@ -2127,10 +2255,11 @@ fn main() {
 
 
     // --------------------------------------------------------
-    // 4.5 布局：属性 → taffy → Qt
+    // 4.5 布局：属性 + 文本测量 → taffy → Qt
     //
     // 这就是「批量边界」：mount 的全部 mutation 都跑完了，
-    // 每个节点的 width / height / gap 都记完账了，才算一次。
+    // 每个节点的 width / height / gap 记完账、文本内容也记完账了，
+    // 才算一次。文本节点没有显式尺寸，尺寸是这一步里问 Qt 量的。
     //
     // 没算之前所有节点尺寸都是 0，屏幕上只有窗口背景色 ——
     // 想验证几何确实只有一个作者，就把下面这行注释掉再跑。
@@ -2142,8 +2271,8 @@ fn main() {
     // --------------------------------------------------------
     // 4.6 文本测量对照（临时诊断，不是布局的一环）
     //
-    // 目的：证明「我们算的文本尺寸」和「Qt 渲染时认为需要的尺寸」
-    // 是同一个数。对上了才把 measure 接进 taffy。
+    // 目的：核对「我们量的」和「Qt 渲染时认为需要的」是同一个数，
+    // 顺便把布局最后写给的尺寸打出来。
     // --------------------------------------------------------
 
     renderer.verify_text_measurement();
@@ -2203,9 +2332,10 @@ fn main() {
 // 不碰 Qt 的那半段：属性 → 布局输入
 // ============================================================
 //
-// relayout() 分两步：先把记下来的属性拼成 taffy 的输入，
-// 再把算好的几何推给 Qt。前一步是纯 Rust 的，
-// 所以能在这里断言，不需要窗口。
+// relayout() 分三步：属性 → taffy 输入、算（叶子回头问 Qt 量）、
+// 把几何推给 Qt。第一步是纯 Rust 的，所以能在这里断言，不需要窗口。
+// 第二步的测量要 QGuiApplication 在场，测不了 ——
+// 它的断言在运行日志里（verify_text_measurement 打的 Δ 和「布局用到」）。
 //
 // 每个测试都带反向断言：光「解析成功」不够，
 // 还得证明非法输入不会被当成 0，以及 text / color 不该被吞掉。

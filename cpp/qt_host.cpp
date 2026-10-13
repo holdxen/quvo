@@ -474,6 +474,9 @@ QtHost::measure_text(
 
     qreal height = 0.0;
 
+    // 折行之后「真正用到」的宽度：所有行里最宽那一行的自然宽度。
+    qreal widest_line = 0.0;
+
     for (;;) {
         QTextLine line = layout.createLine();
 
@@ -484,6 +487,12 @@ QtHost::measure_text(
 
         line.setLineWidth(line_width);
 
+        // qtextlayout.cpp:1581：这一行文本的自然宽度（不做两端对齐）。
+        widest_line = qMax(
+            widest_line,
+            line.naturalTextWidth()
+        );
+
         // QTextLine::height() 内部会 ceil（qtextlayout.cpp:1524），
         // QQuickText 累加的也是同一个函数（qquicktext.cpp:1307）。
         height += line.height();
@@ -491,8 +500,23 @@ QtHost::measure_text(
 
     layout.endLayout();
 
-    // qquicktext.cpp:1044：implicitWidth 用的就是 maximumWidth()。
-    return { layout.maximumWidth(), height };
+    // 空串也会走出一行：QTextLayout 对 "" 照样给一个行高，
+    // 所以量出来是 0 x lineHeight，而不是 0 x 0。
+    // （负向检查时踩过这个坑：拿空串当「测不到尺寸」的探针是探不出来的。）
+
+    // 不限宽：宽度就是 QQuickText implicitWidth 的那个口径
+    // （qquicktext.cpp:1044 用的 maximumWidth()），
+    // 这样 verify_text_measurement 的 Δ 才有意义。
+    //
+    // 限宽：换成折行后的实际宽度 —— maximumWidth() 量的始终是
+    // 「最长那条逻辑行」，折了行它也还是 254.9，
+    // 而布局要的是「这段字在这宽度下占了多宽」。
+    // 再夹一次 max_width：行尾空格会让 naturalTextWidth 略微超出去。
+    const qreal width = max_width > 0.0
+        ? qMin(widest_line, max_width)
+        : layout.maximumWidth();
+
+    return { width, height };
 }
 
 

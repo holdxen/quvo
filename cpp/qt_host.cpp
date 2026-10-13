@@ -16,6 +16,7 @@
 
 
 #include <QtGui/QColor>
+#include <QtGui/QEventPoint>
 #include <QtGui/QFont>
 #include <QtGui/QMouseEvent>
 #include <QtGui/QTextLayout>
@@ -30,6 +31,8 @@
 
 // FLT_MAX —— QQuickText 不限宽时用的也是它（qquicktext.cpp:834）。
 #include <cfloat>
+#include <cstdio>
+#include <utility>
 
 #include <algorithm>
 
@@ -119,13 +122,210 @@ QQuickItem* instantiate(
 } // namespace
 
 
-// 一个「谁被点了」的转发器。
+
+// ============================================================
+// 事件监听：名字 → 吃什么 QEvent、送哪一支 Rust 回调
+// ============================================================
 //
-// 没有 Q_OBJECT 宏 —— 我们只重写 QObject::eventFilter 这个虚函数，
+// dioxus 每注册一个监听器就给我们一个名字（已经剥掉 on 前缀），
+// 这个名字决定三件事：
+//   1. 这个 item 要打开哪些输入能力（acceptedMouseButtons / acceptHoverEvents /
+//      acceptTouchEvents / focusPolicy），见 refresh_item_capabilities()；
+//   2. filter 里哪些 QEvent::Type 要理（types 那一列）；
+//   3. 理出来送哪一支回调（payload 那一列，对应 dioxus 的 MouseData /
+//      PointerData / WheelData / KeyboardData / FocusData / TouchData / ResizeData）。
+//
+// 表里没有的名字到不了这里：Rust 侧 create_event_listener 先拦一道并打日志。
+// 「mounted」也不在这里 —— 那一支不需要 Qt 给事实（元素建好就是它），
+// 由 Rust 侧直接补发。
+
+enum class Payload {
+    Mouse,     // dioxus 的 MouseData
+    Pointer,   // PointerData
+    Wheel,     // WheelData
+    Key,       // KeyboardData
+    Focus,     // FocusData
+    Touch,     // TouchData
+    Resize,    // ResizeData：不吃 QEvent，靠尺寸变化信号
+};
+
+struct EventSpec {
+    const char* name;
+    Payload payload;
+    int n_types;
+    QEvent::Type types[4];
+    bool hover;      // 需要 setAcceptHoverEvents(true)
+    bool touch;      // 需要 setAcceptTouchEvents(true)
+    bool key_focus;  // 需要能拿到 active focus（按键/焦点两支的前提）
+};
+
+namespace {
+
+// DOM 的规矩：mousedown / pointerdown 任何键都发，所以鼠标类一律把
+// Left|Right|Middle 开出来（MouseArea 的默认只是 Left，这里跟 DOM，
+// 因为监听器的名字本来就是 DOM 那套）。
+const EventSpec EVENT_SPECS[] = {
+    {"mousedown",    Payload::Mouse,   1, { QEvent::MouseButtonPress   }, false, false, false},
+    {"mouseup",      Payload::Mouse,   1, { QEvent::MouseButtonRelease }, false, false, false},
+    {"click",        Payload::Mouse,   1, { QEvent::MouseButtonRelease }, false, false, false},
+    {"dblclick",     Payload::Mouse,   1, { QEvent::MouseButtonDblClick}, false, false, false},
+    {"doubleclick",  Payload::Mouse,   1, { QEvent::MouseButtonDblClick}, false, false, false},
+    {"mousemove",    Payload::Mouse,   2, { QEvent::HoverMove, QEvent::MouseMove }, true, false, false},
+    {"mouseover",    Payload::Mouse,   1, { QEvent::HoverEnter }, true, false, false},
+    {"mouseout",     Payload::Mouse,   1, { QEvent::HoverLeave }, true, false, false},
+    {"mouseenter",   Payload::Mouse,   1, { QEvent::HoverEnter }, true, false, false},
+    {"mouseleave",   Payload::Mouse,   1, { QEvent::HoverLeave }, true, false, false},
+    {"contextmenu",  Payload::Mouse,   1, { QEvent::ContextMenu }, false, false, false},
+    {"pointerdown",  Payload::Pointer, 1, { QEvent::MouseButtonPress   }, false, false, false},
+    {"pointerup",    Payload::Pointer, 1, { QEvent::MouseButtonRelease }, false, false, false},
+    {"auxclick",     Payload::Pointer, 1, { QEvent::MouseButtonRelease }, false, false, false},
+    {"pointermove",  Payload::Pointer, 2, { QEvent::HoverMove, QEvent::MouseMove }, true, false, false},
+    {"pointerover",  Payload::Pointer, 1, { QEvent::HoverEnter }, true, false, false},
+    {"pointerout",   Payload::Pointer, 1, { QEvent::HoverLeave }, true, false, false},
+    {"pointerenter", Payload::Pointer, 1, { QEvent::HoverEnter }, true, false, false},
+    {"pointerleave", Payload::Pointer, 1, { QEvent::HoverLeave }, true, false, false},
+    {"wheel",        Payload::Wheel,   1, { QEvent::Wheel }, true, false, false},
+    {"keydown",      Payload::Key,     1, { QEvent::KeyPress },   false, false, true},
+    {"keyup",        Payload::Key,     1, { QEvent::KeyRelease }, false, false, true},
+    {"keypress",     Payload::Key,     1, { QEvent::KeyPress },   false, false, true},
+    {"focus",        Payload::Focus,   1, { QEvent::FocusIn  }, false, false, true},
+    {"blur",         Payload::Focus,   1, { QEvent::FocusOut }, false, false, true},
+    {"focusin",      Payload::Focus,   1, { QEvent::FocusIn  }, false, false, true},
+    {"focusout",     Payload::Focus,   1, { QEvent::FocusOut }, false, false, true},
+    {"touchstart",   Payload::Touch,   1, { QEvent::TouchBegin  }, false, true, false},
+    {"touchmove",    Payload::Touch,   1, { QEvent::TouchUpdate }, false, true, false},
+    {"touchend",     Payload::Touch,   1, { QEvent::TouchEnd    }, false, true, false},
+    {"touchcancel",  Payload::Touch,   1, { QEvent::TouchCancel }, false, true, false},
+    {"resize",       Payload::Resize,  0, {}, false, false, false},
+};
+
+
+const EventSpec* spec_for(const std::string& name)
+{
+    for (const EventSpec& spec : EVENT_SPECS) {
+        if (name == spec.name) {
+            return &spec;
+        }
+    }
+
+    return nullptr;
+}
+
+
+bool spec_covers(const EventSpec& spec, QEvent::Type type)
+{
+    for (int i = 0; i < spec.n_types; ++i) {
+        if (spec.types[i] == type) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+bool is_click_name(const std::string& name)
+{
+    return name == "click" || name == "auxclick";
+}
+
+
+bool is_up_name(const std::string& name)
+{
+    return name == "mouseup" || name == "pointerup";
+}
+
+
+// Qt 的 Key 和 web 的 code / key 两套名字都不同源，只能自己对一张表。
+// code = 物理位置（"KeyA"/"Digit1"/"ArrowLeft"…），
+// key  = 这次按键产出的值（"a"/"A"/"Enter"…，web 那边命名键是小写）。
+struct KeyNames {
+    const char* code;
+    const char* key;
+};
+
+
+KeyNames key_names(int qt_key, const QString& text)
+{
+    switch (qt_key) {
+    case Qt::Key_Escape:    return {"Escape",      "escape"};
+    case Qt::Key_Tab:       return {"Tab",         "tab"};
+    case Qt::Key_Backtab:   return {"Tab",         "tab"};
+    case Qt::Key_Backspace: return {"Backspace",   "backspace"};
+    case Qt::Key_Enter:
+    case Qt::Key_Return:    return {"Enter",       "enter"};
+    case Qt::Key_Space:     return {"Space",       " "};
+    case Qt::Key_Insert:    return {"Insert",      "insert"};
+    case Qt::Key_Delete:    return {"Delete",      "delete"};
+    case Qt::Key_Home:      return {"Home",        "home"};
+    case Qt::Key_End:       return {"End",         "end"};
+    case Qt::Key_PageUp:    return {"PageUp",      "pageup"};
+    case Qt::Key_PageDown:  return {"PageDown",    "pagedown"};
+    case Qt::Key_Left:      return {"ArrowLeft",   "arrowleft"};
+    case Qt::Key_Right:     return {"ArrowRight",  "arrowright"};
+    case Qt::Key_Up:        return {"ArrowUp",     "arrowup"};
+    case Qt::Key_Down:      return {"ArrowDown",   "arrowdown"};
+    case Qt::Key_Shift:     return {"ShiftLeft",   "shift"};
+    case Qt::Key_Control:   return {"ControlLeft", "control"};
+    case Qt::Key_Alt:       return {"AltLeft",     "alt"};
+    case Qt::Key_Meta:      return {"MetaLeft",    "meta"};
+    case Qt::Key_CapsLock:  return {"CapsLock",    "capslock"};
+    case Qt::Key_NumLock:   return {"NumLock",     "numlock"};
+    case Qt::Key_ScrollLock:return {"ScrollLock",  "scrolllock"};
+    case Qt::Key_Minus:     return {"Minus",       "-"};
+    case Qt::Key_Equal:     return {"Equal",       "="};
+    case Qt::Key_BracketLeft:  return {"BracketLeft",  "["};
+    case Qt::Key_BracketRight: return {"BracketRight", "]"};
+    case Qt::Key_Semicolon: return {"Semicolon",   ";"};
+    case Qt::Key_Apostrophe:return {"Quote",       "'"};
+    case Qt::Key_Comma:     return {"Comma",       ","};
+    case Qt::Key_Period:    return {"Period",      "."};
+    case Qt::Key_Slash:     return {"Slash",       "/"};
+    case Qt::Key_Backslash: return {"Backslash",   "\\"};
+    case Qt::Key_QuoteLeft: return {"Backquote",   "`"};
+    default:
+        break;
+    }
+
+    if (qt_key >= Qt::Key_A && qt_key <= Qt::Key_Z) {
+        // 字母：code 是 KeyA..KeyZ，key 用 Qt 已经算好的文本（带 shift 就是大写）。
+        static char code_buf[8];
+        snprintf(code_buf, sizeof(code_buf), "Key%c",
+                 char('A' + (qt_key - Qt::Key_A)));
+        return { code_buf, nullptr };
+    }
+
+    if (qt_key >= Qt::Key_0 && qt_key <= Qt::Key_9) {
+        static char code_buf[8];
+        snprintf(code_buf, sizeof(code_buf), "Digit%c",
+                 char('0' + (qt_key - Qt::Key_0)));
+        return { code_buf, nullptr };
+    }
+
+    if (qt_key >= Qt::Key_F1 && qt_key <= Qt::Key_F12) {
+        static char code_buf[8];
+        snprintf(code_buf, sizeof(code_buf), "F%d",
+                 int(qt_key - Qt::Key_F1) + 1);
+        return { code_buf, code_buf };
+    }
+
+    // 剩下的一律报 Unidentified（keyboard_types 的 Code 有这个兜底变体）。
+    if (!text.isEmpty() && text.at(0).isPrint()) {
+        return { "Unidentified", nullptr };
+    }
+
+    return { "Unidentified", "unidentified" };
+}
+
+} // namespace
+
+
+// 一个元素上的一个监听器 = 一个 filter。
+//
+// 没有 Q_OBJECT 宏 —— 只重写 QObject::eventFilter 这个虚函数，
 // 不需要信号/槽，也就不需要 moc（cxx-qt-build 没跑 moc 这一步）。
 //
-// 「点了一下」的判据是照抄 QQuickMouseArea 的（qtdeclarative/src/quick/items/
-// qquickmousearea.cpp）：
+// 「点了一下」的判据照抄 QQuickMouseArea（items/qquickmousearea.cpp）：
 //
 //     setPressed() :1243-1244
 //         bool wasPressed = d->pressed & button;
@@ -135,69 +335,100 @@ QQuickItem* instantiate(
 //     mousePressEvent :629-644   记 pressed 状态，不派发 clicked
 //     mouseReleaseEvent :756-765 松开才走 setPressed(..., false)
 //
-// 所以是「按下记下、松开才算」，两个条件：
-//   1. 松开的是刚才按下的那个键（wasPressed）；
-//   2. 松开那一刻指针还在元素里（hovered —— MouseArea 在 mouseMoveEvent
-//      里用 setHovered(contains(event->position())) 刷新，:660；
-//      我们不等 move 来刷新状态，直接在松开的那一刻算
-//      m_item->contains(mouse->position())：同一个判据，少一份状态。
-//      contains() 拿的是**元素本地坐标**，比的是 0..width/0..height
-//      （items/qquickitem.cpp:8929-8931），而送进这个 filter 的
-//      QMouseEvent 已经被派发器按 item 本地化过了
-//      （util/qquickdeliveryagent.cpp:2553 localizePointerEvent），
-//      所以 mouse->position() 正好是它要的那种坐标。
+// 也就是两个条件：松开的是刚才按下的那个键、而且松开那一刻指针还在元素里。
+// hovered 在 MouseArea 是 mouseMoveEvent 里 setHovered(contains(...))（:660）刷的，
+// 我们不等 move，直接在松开那一刻算 m_item->contains(local)：同一个判据，少一份状态。
 //
-// 三条我们和 MouseArea 不一样的地方，都是有意的：
-//   - dragged / longPress 两支恒为假：本项目没有 drag、也没有
-//     pressAndHold 定时器，所以不必进判据。
-//   - 松手在元素外时，MouseArea 靠 mouseUngrabEvent()（:920）把 pressed
-//     清掉；那个通知是 QQuickDeliveryAgent 直接调虚函数，不是 QEvent，
-//     filter 看不见。我们的 pressed 位会留在身上，但下一对按下/松开会重新
-//     覆盖它，代价只可能是一次多余的判定，不会漏发。
-//   - 双击：Qt 发的是 press/release(DblClick)/release，第二次松开没有配对的
-//     按下，被 1. 挡掉 —— 也就是双击只算一次 click，和 MouseArea 没实现
-//     doubleClicked 时的行为一致（浏览器会算两次，这里不跟）。
-class ClickFilter : public QObject
+// 三处有意的分歧：dragged / longPress 恒为假（本项目没 drag、没定时器）；
+// mouseUngrabEvent()（:920）是派发器直接调虚函数、不是 QEvent，filter 看不见，
+// 所以 pressed 位可能留着，但下一对按下/松开会覆盖它，只会多判一次不会漏发；
+// 双击那一串（press/release/DblClick/release）第二次松开没有配对，被挡掉。
+class InputFilter : public QObject
 {
 public:
-    ClickFilter(
+    InputFilter(
+        std::vector<InputFilter*>* ledger,
         QQuickItem* item,
         const std::string& name,
         std::uint32_t element
     )
         : QObject(item)
+        , m_ledger(ledger)
         , m_item(item)
         , m_name(name)
         , m_element(element)
+        , m_spec(spec_for(name))
     {
         // 所有权挂在 item 上（构造时直接当 parent 传进去）：
-        // item 被 destroy（deleteLater）时 ~QObject 递归删孩子，
-        // 这个 filter 跟着走，不会悬空。
+        // item 被 destroy（deleteLater）时 ~QObject 递归删孩子，filter 跟着走。
+
+        // 死了就从登记簿里把自己摘掉。这一句是登记簿不留野指针的唯一保证：
+        // destroy() 只能清理「被删的那个根」名下的 filter，
+        // 而子树里孩子（比如列表行里那块会点的小方块）是 ~QObject 递归删的，
+        // 没人替它们摘 —— 不摘的话下一次 add/remove 遍历登记簿就是解引用野指针。
+        connect(
+            this,
+            &QObject::destroyed,
+            [this] {
+                if (m_ledger == nullptr) {
+                    return;
+                }
+
+                auto& listeners = *m_ledger;
+
+                listeners.erase(
+                    std::remove(listeners.begin(), listeners.end(), this),
+                    listeners.end()
+                );
+            }
+        );
+
+        // resize 那一支不吃 QEvent：几何只有我们在 set_geometry 时改，
+        // 所以直接盯尺寸信号（Qt 会把两个信号一起发，下面按「一对」去重）。
+        if (m_spec != nullptr && m_spec->payload == Payload::Resize) {
+            connect(
+                m_item,
+                &QQuickItem::widthChanged,
+                this,
+                [this] { emit_resize(); }
+            );
+
+            connect(
+                m_item,
+                &QQuickItem::heightChanged,
+                this,
+                [this] { emit_resize(); }
+            );
+        }
     }
 
     const std::string& name() const { return m_name; }
     QQuickItem* item() const { return m_item; }
+    const EventSpec* spec() const { return m_spec; }
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override
     {
-        switch (event->type())
-        {
-        // 按下：只记账，不派发 —— 一次 click 要等松开（判据见类上面）。
+        Q_UNUSED(watched)
+
+        if (m_spec == nullptr) {
+            return false;
+        }
+
+        // 按下这件事先记账，再看过不过名字那张表。
         //
-        // 但必须把这一事件 accept 掉，因为松开那一发根本不会送到我们手上，
-        // 除非这个 item 拿到了 mouse grab：
-        //   · 派发器在「事件被接受」之后才把按下的 item 立成独占 grabber
-        //     （util/qquickdeliveryagent.cpp:2550 先 accept、:2555 查 isAccepted、
-        //     :2568-2569 `point.state() == Pressed` 才 setExclusiveGrabber）；
-        //   · 而收尾事件只发给持有 grab 的 item
-        //     （:2534-2536「If all points are released and the item is not the
-        //     grabber, it doesn't get the event」—— isEndEvent 且不是
-        //     exclusiveGrabber 就 return）。
-        // 裸 QQuickItem 的 mousePressEvent 是空实现，不会自己 accept，
-        // 所以这一句是「按下+松开」能不能成立的前提。
-        // MouseArea 干的是同一件事：mousePressEvent :644
-        // `event->setAccepted(setPressed(...))`。
+        // 为什么记账要抢在 spec_covers 前面：click / auxclick 这两个名字
+        // 「只吃松开」，可它们的判据是「按下+松开」这一对 ——
+        // MouseArea 也是这个次序：d->pressed 在 mousePressEvent 里就写了（:644），
+        // clicked 要到 setPressed(button, false) 才发（:1282-1287）。
+        // 少了这一步，松开那一刻永远配不上对，click 一次都不会响。
+        //
+        // accept 也在这里：派发器只有在「事件被接受」之后才把按下的 item
+        // 立成独占 grabber（util/qquickdeliveryagent.cpp:2550 accept、:2555 查
+        // isAccepted、:2568-2569 setExclusiveGrabber），而收尾事件（松开）
+        // 只发给持有 grab 的 item（:2534-2536）。裸 QQuickItem 的
+        // mousePressEvent 是空实现不会自己 accept，所以这一句是前提。
+        // MouseArea 干的同一件事在 :644 `event->setAccepted(setPressed(...))`。
         //
         // 一条实测边界，别当耳边风：用**没有 device 的合成 QMouseEvent**
         // 走窗口路由（离屏探针就是这么发的）时，press 能到 filter，
@@ -205,24 +436,32 @@ protected:
         // 所以验证这套判据时 release 只能直送 item（绕过命中测试，
         // 只驱动状态机），命中测试那一半另外用 press 验；
         // 完整的一条链要真鼠标才有，离屏替不了。
-        case QEvent::MouseButtonPress:
-        {
+        if (event->type() == QEvent::MouseButtonPress) {
             auto *mouse = static_cast<QMouseEvent *>(event);
 
             m_pressed |= mouse->button();
 
             mouse->accept();
+        }
 
-            qDebug()
-                << "[Qt] press on" << watched
-                << "button" << int(mouse->button())
-                << "记下了，element" << m_element
-                << "（按下不派发）";
+        // 名字不吃这一类事件，直接放行（false = 不吃，Qt 继续按自己的规矩走）。
+        if (!spec_covers(*m_spec, event->type())) {
+            return false;
+        }
+
+        switch (event->type())
+        {
+        // 按下：mousedown / pointerdown —— 按下当场就发（DOM 也是这个规矩），
+        // 但一次 click 要等松开（判据见类上面）。
+        case QEvent::MouseButtonPress:
+        {
+            auto *mouse = static_cast<QMouseEvent *>(event);
+
+            emit_point(mouse, mouse->button(), mouse->buttons());
 
             return false;
         }
 
-        // 松开：两个条件都过了才算一次 click。
         case QEvent::MouseButtonRelease:
         {
             auto *mouse = static_cast<QMouseEvent *>(event);
@@ -233,54 +472,125 @@ protected:
 
             m_pressed &= ~button;
 
-            if (!was_pressed) {
-                // 没有配对的按下（比如 grab 被抢走之后迟到的松开、
-                // 或者双击的第二次松开），丢掉。
-                return false;
-            }
-
-            const QPointF local = mouse->position();
-
-            if (!m_item->contains(local)) {
-                qDebug()
-                    << "[Qt] release at" << local
-                    << "在" << watched << "外面，不算 click";
+            // mouseup / pointerup：松开就发，不看位置 ——
+            // 这一发能到我们手上本来就靠 press 拿到的 grab。
+            if (is_up_name(m_name)) {
+                emit_point(mouse, button, mouse->buttons());
 
                 return false;
             }
 
-            rust::Str str(m_name.c_str(), m_name.size());
+            if (is_click_name(m_name)) {
+                const QPointF local = mouse->position();
 
-            qDebug()
-                << "[Qt] click on" << watched
-                << "at" << local
-                << "button" << int(button)
-                << "-> dispatch" << m_name.c_str()
-                << "element" << m_element;
+                if (!was_pressed || !m_item->contains(local)) {
+                    return false;
+                }
 
-            // buttons（按着不放的那一串）松开时通常是空的，
-            // 交过去让 Rust 侧原样解码成 held_buttons。
-            qt_handle_event(
-                str,
-                m_element,
-                static_cast<double>(local.x()),
-                static_cast<double>(local.y()),
-                int(button),
-                int(mouse->buttons())
-            );
+                // click 只认主键，auxclick 只认非主键（DOM 的分工）。
+                if (m_name == "click" && button != Qt::LeftButton) {
+                    return false;
+                }
 
-            // 这一对已经当作一次 click 用掉了，accept 掉免得祖先元素
-            // 又把它当成自己的一次点击（祖先那份由 dioxus 的冒泡去管：
-            // runtime.rs:430-446 会沿着 vdom 路径把父上的同名 listener 收进来）。
-            mouse->accept();
+                if (m_name == "auxclick" && button == Qt::LeftButton) {
+                    return false;
+                }
+
+                emit_point(mouse, button, mouse->buttons());
+
+                // 这一对用掉了，accept 掉免得祖先元素再把它当自己的一次点击
+                // （祖先那份由 dioxus 的冒泡管：runtime.rs:430-446）。
+                mouse->accept();
+
+                return false;
+            }
 
             return false;
         }
 
-        // 双击的中间那一下：我们不实现 doubleClicked，
-        // 也不让它把 pressed 记成一次新的按下（否则第二次松开会补出一个 click）。
         case QEvent::MouseButtonDblClick:
+        {
+            auto *mouse = static_cast<QMouseEvent *>(event);
+
+            // 双击不走 click 那条配对，直接发。
+            emit_point(mouse, mouse->button(), mouse->buttons());
+
             return false;
+        }
+
+        case QEvent::MouseMove:
+        case QEvent::HoverMove:
+        case QEvent::HoverEnter:
+        case QEvent::HoverLeave:
+        {
+            auto *single = static_cast<QSinglePointEvent *>(event);
+
+            // hover 系类没有按键信息，button 报 NoButton、buttons 带当前按住的一串。
+            emit_point(single, Qt::NoButton, single->buttons());
+
+            return false;
+        }
+
+        case QEvent::Wheel:
+        {
+            auto *wheel = static_cast<QWheelEvent *>(event);
+
+            emit_wheel(wheel);
+
+            return false;
+        }
+
+        case QEvent::KeyPress:
+        case QEvent::KeyRelease:
+        {
+            auto *key = static_cast<QKeyEvent *>(event);
+
+            emit_key(key);
+
+            return false;
+        }
+
+        case QEvent::FocusIn:
+        case QEvent::FocusOut:
+        {
+            qt_focus_event(rust_name(), m_element);
+
+            return false;
+        }
+
+        case QEvent::TouchBegin:
+        case QEvent::TouchUpdate:
+        case QEvent::TouchEnd:
+        case QEvent::TouchCancel:
+        {
+            emit_touch(static_cast<QTouchEvent *>(event));
+
+            return false;
+        }
+
+        case QEvent::ContextMenu:
+        {
+            auto *menu = static_cast<QContextMenuEvent *>(event);
+
+            // QContextMenuEvent 不是 QSinglePointEvent：只有 pos/globalPos（整型）。
+            // pos() 是窗口坐标，正好当 scene；元素本地坐标自己 map 一下。
+            const QPointF scene(qreal(menu->pos().x()), qreal(menu->pos().y()));
+            const QPointF global(qreal(menu->globalPos().x()), qreal(menu->globalPos().y()));
+            const QPointF local = m_item->mapFromScene(scene);
+
+            qt_mouse_event(
+                rust_name(),
+                m_element,
+                local.x(), local.y(),
+                scene.x(), scene.y(),
+                global.x(), global.y(),
+                int(Qt::RightButton),
+                int(Qt::NoButton),
+                int(menu->modifiers())
+            );
+
+            return false;
+        }
 
         default:
             return false;
@@ -288,29 +598,255 @@ protected:
     }
 
 private:
+    rust::Str rust_name() const
+    {
+        return rust::Str(m_name.c_str(), m_name.size());
+    }
+
+    // MouseData / PointerData 两支同源：都是「一个点 + 按键 + 修饰键 + 三套坐标」。
+    void emit_point(
+        QSinglePointEvent *e,
+        Qt::MouseButton button,
+        Qt::MouseButtons buttons
+    )
+    {
+        const QPointF local = e->position();
+        const QPointF scene = e->scenePosition();
+        const QPointF global = e->globalPosition();
+
+        if (m_spec->payload == Payload::Pointer) {
+            // Qt 的位掩码和浏览器 MouseEvent.buttons 的那几位同序，
+            // 所以 button/buttons 原样交过去，Rust 侧直接 decode。
+            // pressure/is_primary 这些 Qt 给不出的：鼠标按 web 的规矩报 0.5/1。
+            qt_pointer_event(
+                rust_name(),
+                m_element,
+                local.x(), local.y(),
+                scene.x(), scene.y(),
+                global.x(), global.y(),
+                int(button),
+                int(buttons),
+                int(e->modifiers()),
+                int(e->points().first().id()),
+                "mouse",
+                true,
+                buttons == Qt::NoButton ? 0.0 : 0.5,
+                1.0,
+                1.0
+            );
+
+            return;
+        }
+
+        qt_mouse_event(
+            rust_name(),
+            m_element,
+            local.x(), local.y(),
+            scene.x(), scene.y(),
+            global.x(), global.y(),
+            int(button),
+            int(buttons),
+            int(e->modifiers())
+        );
+    }
+
+    void emit_wheel(QWheelEvent *e)
+    {
+        const QPointF local = e->position();
+        const QPointF scene = e->scenePosition();
+        const QPointF global = e->globalPosition();
+
+        qt_wheel_event(
+            rust_name(),
+            m_element,
+            local.x(), local.y(),
+            scene.x(), scene.y(),
+            global.x(), global.y(),
+            e->angleDelta().x(),
+            e->angleDelta().y(),
+            e->pixelDelta().x(),
+            e->pixelDelta().y(),
+            int(e->buttons()),
+            int(e->modifiers())
+        );
+    }
+
+    void emit_key(QKeyEvent *e)
+    {
+        const KeyNames names = key_names(e->key(), e->text());
+
+        QString key_text = e->text();
+
+        if (names.key != nullptr) {
+            key_text = QString::fromUtf8(names.key);
+        }
+
+        const QByteArray key_utf8 = key_text.toUtf8();
+        const QByteArray code_utf8 = QByteArray(names.code);
+
+        qt_key_event(
+            rust_name(),
+            m_element,
+            // location：Qt 不区分左右（Key_Shift 就是一个键），只能一律报 0（Standard）。
+            rust::Str(key_utf8.constData(), key_utf8.size()),
+            rust::Str(code_utf8.constData(), code_utf8.size()),
+            0,
+            e->isAutoRepeat(),
+            int(e->modifiers())
+        );
+    }
+
+    void emit_touch(QTouchEvent *e)
+    {
+        // 点数不定，所以打包成三个平行数组交过去：
+        // points 的步长是 6（元素本地 x/y、scene x/y、screen x/y）。
+        rust::Vec<rust::i32> ids;
+        rust::Vec<rust::f64> points;
+        rust::Vec<rust::f64> forces;
+        rust::Vec<rust::i32> changed;
+
+        const QList<QEventPoint> event_points = e->points();
+
+        int index = 0;
+
+        for (const QEventPoint &p : event_points) {
+            ids.push_back(int(p.id()));
+
+            points.push_back(p.position().x());
+            points.push_back(p.position().y());
+            points.push_back(p.scenePosition().x());
+            points.push_back(p.scenePosition().y());
+            points.push_back(p.globalPosition().x());
+            points.push_back(p.globalPosition().y());
+
+            forces.push_back(p.pressure());
+
+            // 「本次变化的那几个点」：Qt 的状态是 Pressed/Updated/Released/...
+            if (p.state() == QEventPoint::State::Pressed
+                    || p.state() == QEventPoint::State::Released) {
+                changed.push_back(int(index));
+            }
+
+            ++index;
+        }
+
+        qt_touch_event(
+            rust_name(),
+            m_element,
+            std::move(ids),
+            std::move(points),
+            std::move(forces),
+            std::move(changed),
+            int(e->modifiers())
+        );
+    }
+
+    void emit_resize()
+    {
+        const qreal width = m_item->width();
+        const qreal height = m_item->height();
+
+        // width/height 两个信号一起来，按「一对」去重，只发一次。
+        if (qFuzzyCompare(width, m_last_width) && qFuzzyCompare(height, m_last_height)) {
+            return;
+        }
+
+        m_last_width = width;
+        m_last_height = height;
+
+        qt_resize_event(rust_name(), m_element, width, height);
+    }
+
+private:
+    std::vector<InputFilter*>* m_ledger = nullptr;
     QQuickItem* m_item;
     std::string m_name;
     std::uint32_t m_element;
+    const EventSpec* m_spec = nullptr;
 
-    // 照 MouseArea 的 d->pressed（qquickmousearea.cpp:1245 那套位运算）：
-    // 记的是「这个元素身上现在还按着哪些键」。
+    // 照 MouseArea 的 d->pressed（:1245 那套位运算）：这个元素身上现在还按着哪些键。
     Qt::MouseButtons m_pressed = Qt::NoButton;
+
+    qreal m_last_width = -1.0;
+    qreal m_last_height = -1.0;
 };
 
 
+// 按登记簿上还活着的监听器，重算这个 item 该开哪些输入能力。
+//
+// 全部重算、不做增量开关：撤掉最后一个 hover 监听器要能把 hover 关回去，
+// 增量的写法很容易留脏。
+void refresh_item_capabilities(
+    QQuickItem* item,
+    const std::vector<InputFilter*>& listeners
+)
+{
+    if (item == nullptr) {
+        return;
+    }
+
+    Qt::MouseButtons buttons = Qt::NoButton;
+
+    bool hover = false;
+    bool touch = false;
+    bool key_focus = false;
+
+    for (InputFilter* filter : listeners) {
+        if (filter->item() != item) {
+            continue;
+        }
+
+        const EventSpec* spec = filter->spec();
+
+        if (spec == nullptr) {
+            continue;
+        }
+
+        switch (spec->payload) {
+        case Payload::Mouse:
+        case Payload::Pointer:
+            buttons |= Qt::LeftButton | Qt::RightButton | Qt::MiddleButton;
+            break;
+        case Payload::Wheel:
+            // 滚轮那一发也跟着「命中测试 + hover 目标」那条路走。
+            buttons |= Qt::LeftButton;
+            break;
+        default:
+            break;
+        }
+
+        hover = hover || spec->hover;
+        touch = touch || spec->touch;
+        key_focus = key_focus || spec->key_focus;
+    }
+
+    // 命中测试把 NoButton 的项当不存在（qquickdeliveryagent.cpp:2258），
+    // 裸 QQuickItem / Rectangle 的默认就是 NoButton（qquickitem_p.h:1092-1096）
+    // —— 所以这一句是「点得到 / 点不到」的分水岭。
+    item->setAcceptedMouseButtons(buttons);
+    item->setAcceptHoverEvents(hover);
+    item->setAcceptTouchEvents(touch);
+
+    // 按键只发给持有 active focus 的那个 item（:971-999 deliverKeyEvent，
+    // 沿父链往上走到接受为止），所以要能拿焦点才可能收到 keydown。
+    // ClickFocus：点一下就聚焦，和 DOM 里点按钮能收键盘的感觉一致。
+    item->setFocusPolicy(key_focus ? Qt::ClickFocus : Qt::NoFocus);
+}
+
+
 struct QtHost::Impl {
-    // engine 先声明，
+    // 登记簿必须**最先声明**：声明越靠后析构越早，
+    // 而 filter 死的时候（随 item 递归删、或被 remove 显式删）要回来把自己摘掉，
+    // 所以这个 vector 得比 window（以及挂在 item 树上的那些 filter）活得久。
+    //
+    // 只是「按 (item, name) 找得到、好撤、能重算能力」的登记簿，不管所有权 ——
+    // 所有权在 QObject 父子树上（filter 的 parent 就是那个 item）。
+    std::vector<InputFilter*> listeners;
+
+    // engine 晚一点声明，
     // 这样析构时 window 会先于 engine 销毁。
     QQmlEngine engine;
     QQuickWindow window;
-
-    // 我们装出去的 event filter。
-    //
-    // 只是「按 (item, name) 找得到、好撤」的登记簿，不管所有权 ——
-    // 所有权在 QObject 父子树上（filter 的 parent 就是那个 item）。
-    // item 被 destroy 时 filter 一起没了，这里的裸指针就变陈旧，
-    // 所以 destroy 路径要顺手把它们剔掉（见 QtHost::destroy）。
-    std::vector<ClickFilter*> listeners;
 
     // 这里不再存 id -> 对象的表：指针本身就是句柄，
     // Rust 侧拿着它直接调下面的方法。
@@ -536,20 +1072,10 @@ QtHost::destroy(
     item->setParent(nullptr);
 
 
-    // 这个 item 名下的 event filter 是它的 QObject 孩子，
-    // 会跟着它一起被 ~QObject 递归删掉。
-    // 这里不用主动删它们，但登记簿里那些裸指针必须剔干净 ——
-    // 留着的话下一次 remove_click_listener 就会解引用野指针。
-    for (auto it = impl_->listeners.begin();
-         it != impl_->listeners.end(); )
-    {
-        if ((*it)->item() == item) {
-            it = impl_->listeners.erase(it);
-            continue;
-        }
-
-        ++it;
-    }
+    // 这里不再手动清理登记簿：filter 是 item 的 QObject 孩子，会跟着 ~QObject
+    // 递归删掉，而每个 InputFilter 在自己的 destroyed 信号里把登记簿那一格摘掉
+    // （见 InputFilter 构造函数）。手写循环只能清「被删的这个根」名下的，
+    // 子树里孩子名下的照样留野指针 —— 那正是它当初的洞。
 
 
     // 内存的释放推给事件循环，理由（QObject::deleteLater 的文档同款）：
@@ -585,8 +1111,12 @@ QtHost::stack_before(
 }
 
 
+// 装一个监听器。名字决定这一支吃什么事件、送哪支回调（表在 EVENT_SPECS）。
+//
+// 名字必须是 Rust 那边查过表交下来的：它对着同一张表拦一道，
+// 表里没有的事件名（onkeydown 之外的键盘类、drag、scroll……）根本不会到这里。
 void
-QtHost::add_click_listener(
+QtHost::add_event_listener(
     QQuickItem* item,
     rust::Str name,
     std::uint32_t element
@@ -599,39 +1129,48 @@ QtHost::add_click_listener(
     const std::string key(name.data(), name.size());
 
     // 同一个 (item, name) 只留一个 filter：先撤旧的。
-    // 不然重渲染把同一个监听器再挂一遍，一次点击就会派发到 Rust 两次。
-    remove_click_listener(item, name);
+    // 不然重渲染把同一个监听器再挂一遍，一次操作就派发到 Rust 两次。
+    remove_event_listener(item, name);
 
-    auto *filter = new ClickFilter(item, key, element);
+    if (spec_for(key) == nullptr) {
+        qWarning()
+            << "[Qt] 事件名不在表里，不装 filter：" << key.c_str();
+
+        return;
+    }
+
+    auto *filter = new InputFilter(&impl_->listeners, item, key, element);
 
     item->installEventFilter(filter);
 
-    // 这一步才是「点得到 / 点不到」的分水岭，光装 filter 没用：
-    // 真鼠标的派发要先过命中测试，而命中测试把
-    // acceptedMouseButtons() == Qt::NoButton 的项**直接当不存在**
-    // （qquickdeliveryagent.cpp:2258，pointerTargets 的谓词）。
-    // 裸 QQuickItem / Rectangle 的默认值就是 NoButton
-    // （qquickitem_p.h:1092-1096：extra 没分配、LeftMouseButtonAccepted 没置 → 空集），
-    // 所以事件在到不了这个 item 之前就被丢了，filter 自然一次都没被调到。
-    //
-    // 之前离屏自检能通，是因为 QCoreApplication::sendEvent(item, ...) 是直接
-    // 把这个对象当事件接收者，绕过了整条命中测试（QQuickItem::event()
-    // 里没有任何 acceptedMouseButtons 检查，qquickitem.cpp:9326/9353）。
-    item->setAcceptedMouseButtons(Qt::LeftButton);
-
     impl_->listeners.push_back(filter);
 
+    // 「点得到 / 点不到」的分水岭不在 filter 这一步，而在 item 的能力开关上：
+    // 命中测试把 acceptedMouseButtons() == Qt::NoButton 的项**直接当不存在**
+    // （qquickdeliveryagent.cpp:2258，pointerTargets 的谓词），
+    // 裸 QQuickItem / Rectangle 的默认值就是 NoButton
+    // （qquickitem_p.h:1092-1096）。hover / touch / focus 同理，
+    // 各有一套开关，全看注册了哪些名字 —— 所以统一交给下面这个函数重算。
+    //
+    // 之前离屏自检能通，是因为 QCoreApplication::sendEvent(item, ...) 直接
+    // 把这个对象当事件接收者，绕过了整条命中测试（QQuickItem::event()
+    // 里没有任何 acceptedMouseButtons 检查，qquickitem.cpp:9326/9353）。
+    refresh_item_capabilities(item, impl_->listeners);
+
     qDebug()
-        << "[Qt] click listener installed on" << item
+        << "[Qt] listener installed on" << item
         << "name" << key.c_str()
         << "element" << element
-        << "acceptedMouseButtons"
-        << int(item->acceptedMouseButtons());
+        << "acceptedMouseButtons" << int(item->acceptedMouseButtons())
+        << "hover" << item->acceptHoverEvents()
+        << "touch" << item->acceptTouchEvents()
+        << "focusPolicy" << int(item->focusPolicy());
 }
 
 
+// 撤掉 (item, name) 那一格。
 void
-QtHost::remove_click_listener(
+QtHost::remove_event_listener(
     QQuickItem* item,
     rust::Str name
 )
@@ -642,39 +1181,35 @@ QtHost::remove_click_listener(
 
     const std::string key(name.data(), name.size());
 
-    for (auto it = impl_->listeners.begin();
-         it != impl_->listeners.end(); )
-    {
-        ClickFilter *filter = *it;
+    // 找一格删一格，删完从头再找：delete filter 会触发它的 destroyed，
+    // 而那个槽就地把自己从 vector 里摘掉 —— 手上的迭代器当场失效，
+    // 所以这里不能边遍历边 erase。
+    for (;;) {
+        InputFilter *match = nullptr;
 
-        if (filter->item() == item && filter->name() == key) {
-            item->removeEventFilter(filter);
+        for (InputFilter* filter : impl_->listeners) {
+            if (filter->item() == item && filter->name() == key) {
+                match = filter;
 
-            it = impl_->listeners.erase(it);
-
-            // filter 的 parent 是 item，这里显式删也安全：
-            // ~QObject 会把它从父亲的 children 里摘掉。
-            delete filter;
-
-            continue;
+                break;
+            }
         }
 
-        ++it;
+        if (match == nullptr) {
+            break;
+        }
+
+        item->removeEventFilter(match);
+
+        // filter 的 parent 是 item，这里显式删也安全：
+        // ~QObject 会把它从父亲的 children 里摘掉。
+        delete match;   // ← 登记簿由 destroyed 槽负责清理
     }
 
-    // 这个 item 上一个 filter 都不剩了，就把命中测试的入场券也一起收回来 ——
-    // 不然它留着 Qt::LeftButton，会当成点击目标白占一格，
+    // 能力开关跟着重算：这个 item 的监听器都撤光的话，
+    // acceptedMouseButtons 要回到 NoButton —— 不然它白占一个命中测试的目标，
     // 把后面的（比如它父亲上的）监听器挤掉。
-    const bool still_watched = std::any_of(
-        impl_->listeners.begin(),
-        impl_->listeners.end(),
-        [item](const ClickFilter *filter) {
-            return filter->item() == item;
-        });
-
-    if (!still_watched) {
-        item->setAcceptedMouseButtons(Qt::NoButton);
-    }
+    refresh_item_capabilities(item, impl_->listeners);
 }
 
 

@@ -58,7 +58,7 @@
 //!
 //! 1. `app()` —— counter demo 那一屏，加三个按钮
 //! 2. `mod ffi` —— Rust ↔ C++ 的双向接口：20 个正向（1 个造 QtHost + 19 个方法）
-//!    + 1 个 C++ 自由函数 + 2 个 C++ 回调 Rust
+//!    + 1 个 C++ 自由函数 + 9 个 C++ 回调 Rust（1 个回路 poll + 8 支事件）
 //! 3. `struct QtRenderer` 的字段注释 —— 树账（nodes/stack）、
 //!    id 账（element_to_node/instance_paths）、布局账（tree/root_taffy）各记什么
 //! 4. `impl WriteMutations` —— 指令如何变成 Qt 调用（核心）
@@ -76,29 +76,41 @@
 //! - 回路是自己转的：Rust 的 `QtWaker` → `schedule_pump_poll`
 //!   → `qt_pump_poll` 把 `wait_for_work` poll 到 Pending 为止，空闲时零轮询；
 //! - 输入侧走真事件，而且是**唯一的**纸条来源：
-//!   `create_event_listener` 在 QQuickItem 上装 `ClickFilter`，
-//!   按下 → 在同一个元素里松开 → `qt_handle_event`
-//!   → `runtime().handle_event("click", ...)` → listener 写 signal
-//!   → wake → 渲染。「按下+松开才算一次 click」这套判据是照抄
-//!   `QQuickMouseArea::setPressed()` 的，对照写在 cpp/qt_host.cpp 里
-//!   ClickFilter 的上方。
-//!   以前那个每 200ms 推一格的假事件源（QTimer + DIFF_SCRIPT + send_click_to）
-//!   整条删掉了，`app()` 现在就是个 counter，不点不动。
+//!   `create_event_listener` 按名字在 QQuickItem 上装 `InputFilter`，
+//!   filter 认出 Qt 的那一套 QEvent → 对应那支 `qt_*_event` 回调
+//!   → `runtime().handle_event(name, ...)` → listener 写 signal
+//!   → wake → 渲染。以前那个每 200ms 推一格的假事件源
+//!   （QTimer + DIFF_SCRIPT + send_click_to）整条删掉了，
+//!   `app()` 现在就是个 counter，不点不动。
+//!   「按下+在同一个元素里松开才算一次 click」这套判据照抄
+//!   `QQuickMouseArea::setPressed()`，对照写在 cpp/qt_host.cpp 里
+//!   InputFilter 的上方；名字→事件类型→回调那三者的对应关系是
+//!   cpp 的 `EVENT_SPECS` 和 Rust 的 `SUPPORTED_EVENTS` 两张表，同一口径。
+//! - 支持的八支（Qt 真给得出事实的）：鼠标全家
+//!   （mousedown/mouseup/click/dblclick/mousemove/mouseover/mouseenter/
+//!   mouseout/mouseleave/contextmenu）、指针全家（pointerdown/up/move/
+//!   over/out/enter/leave/auxclick）、wheel、keydown/keyup/keypress、
+//!   focus/blur/focusin/focusout、touchstart/move/end/cancel、
+//!   resize（盯 QQuickItem 的尺寸信号）、mounted（渲染批次结束后补发）。
+//!   负载是三套坐标（元素本地 / 窗口 / 屏幕）+ Qt 的按键位掩码 + 修饰键位，
+//!   冒泡那个布尔查 dioxus-core-types 的 `event_bubbles()`，不自己拍。
 //!
 //! 还缺的：
 //!
-//! - 事件类型只有 click 这一支：别的事件名（`onmouseover` / `onkeydown` …）
-//!   在 `create_event_listener` 门口就被拒绝并打日志，不装 filter ——
-//!   以前是照装，于是「鼠标按下的那一刻跑 mouseover」这种错会静默发生。
-//!   真要做别的输入，得先让 `ClickFilter` 分清事件类型，再放开那道拒绝。
-//! - 负载还是残缺的：修饰键永远交 `Modifiers::empty()`，
-//!   坐标系只有一套（client/screen/page/element 全填 item 本地坐标）。
-//!   按键身份（button / buttons）现在带上路了。
-//! - 窗口 resize 没有触发重排；字体还是 Qt 自己的默认值，
+//! - 其余 13 支事件类（drag/drop、scroll、键盘之外的 form/input、
+//!   clipboard、composition、media、animation/transition、visible、
+//!   selection、toggle…）在 `create_event_listener` 门口被拒绝并打出理由，
+//!   转换器里对应那几支保留 panic —— 缺的是 Qt 侧的事实来源或本项目的设施，
+//!   静默造一份假数据比当场炸难查。理由表在下面 `unsupported_reason`。
+//! - keydown 那三支要 item 能拿 active focus（注册时把 focusPolicy
+//!   开成 ClickFocus），但按键的 left/right 位置 Qt 给不出，一律报 Standard；
+//!   `is_composing` 要 QInputMethod 才有，报 false。
+//! - 窗口 resize 没有触发重排（元素自己的尺寸变化有 resize，
+//!   窗口变了却没人重算布局，这是队列里的第一条）；字体还是 Qt 自己的默认值，
 //!   没和 `measure_item` 用同一个来源（现在两边都是「item 上那个默认字体」，
 //!   所以量出来刚好对得上；一旦 font 变成 Rust 下发的样式，两处要一起改）；
 //!   `AttributeValue::{Int, Float, Bool, None}` 在属性过滤那步被丢掉。
-//! - 因为事件源只剩鼠标（而且要松开才算），offscreen 跑起来之后日志里
+//! - 因为事件源只剩鼠标/键盘这些真输入，offscreen 跑起来之后日志里
 //!   不会再有渲染 —— 回路醒着但没人叫醒它。click→handle_event→渲染那一段
 //!   的回归测试搬到了 `mod tests` 里（不碰 Qt，直接在 VirtualDom 上派发事件）。
 
@@ -430,17 +442,19 @@ mod ffi {
             parent: *mut QQuickItem,
         ) -> Vec<u64>;
 
-        // 给一个 item 装「谁点了我」的 event filter：
-        // 按下记在账上，在同一个元素里松开才回调
-        // Rust 的 qt_handle_event(name, element, x, y, button, buttons)。
-        unsafe fn add_click_listener(
+        // 给一个 item 装一个事件监听器。
+        //
+        // name 是我们查过表、确认支持的那个事件名（已剥掉 on，比如 "click"），
+        // C++ 侧的 EVENT_SPECS 按这个名字决定：吃什么 QEvent、送回来哪一支回调、
+        // 以及这个 item 要打开哪些输入能力（命中测试的入场券 / hover / touch / 焦点）。
+        unsafe fn add_event_listener(
             self: Pin<&mut QtHost>,
             item: *mut QQuickItem,
             name: &str,
             element: u32,
         );
 
-        unsafe fn remove_click_listener(
+        unsafe fn remove_event_listener(
             self: Pin<&mut QtHost>,
             item: *mut QQuickItem,
             name: &str,
@@ -466,18 +480,97 @@ mod ffi {
         // 回路本身：poll 一次 wait_for_work，醒了才渲染。
         fn qt_pump_poll();
 
-        // Qt 的 event filter 认出了「在这个 item 上按下、并且在同一个元素里松开」，
-        // 把谁被点了 + 在哪 + 哪个键交回 Rust。
-        // element 是 add_click_listener 当初登记的那个 ElementId。
-        // button / buttons 是 Qt 的位掩码（Qt::LeftButton == 0x1 …），
-        // 正好和浏览器 MouseEvent.buttons 的那几位同序，见 QtMouseData。
-        fn qt_handle_event(
+        // 八支事件回调，一支一类负载（对应 dioxus-html 的 MouseData/
+        // PointerData/WheelData/KeyboardData/FocusData/TouchData/ResizeData）。
+        //
+        // 前三支的坐标都是三套：元素本地、窗口内（scene）、屏幕（global）。
+        // button/buttons/modifiers 一律交 Qt 的位掩码，Rust 侧 decode ——
+        // Qt 那几位和浏览器 MouseEvent.buttons 同序。
+        fn qt_mouse_event(
             name: &str,
             element: u32,
-            x: f64,
-            y: f64,
+            local_x: f64,
+            local_y: f64,
+            window_x: f64,
+            window_y: f64,
+            screen_x: f64,
+            screen_y: f64,
             button: i32,
             buttons: i32,
+            modifiers: i32,
+        );
+
+        #[allow(clippy::too_many_arguments)]
+        fn qt_pointer_event(
+            name: &str,
+            element: u32,
+            local_x: f64,
+            local_y: f64,
+            window_x: f64,
+            window_y: f64,
+            screen_x: f64,
+            screen_y: f64,
+            button: i32,
+            buttons: i32,
+            modifiers: i32,
+            pointer_id: i32,
+            pointer_type: &str,
+            is_primary: bool,
+            pressure: f64,
+            width: f64,
+            height: f64,
+        );
+
+        #[allow(clippy::too_many_arguments)]
+        fn qt_wheel_event(
+            name: &str,
+            element: u32,
+            local_x: f64,
+            local_y: f64,
+            window_x: f64,
+            window_y: f64,
+            screen_x: f64,
+            screen_y: f64,
+            angle_x: i32,
+            angle_y: i32,
+            pixel_x: i32,
+            pixel_y: i32,
+            buttons: i32,
+            modifiers: i32,
+        );
+
+        fn qt_key_event(
+            name: &str,
+            element: u32,
+            key: &str,
+            code: &str,
+            location: i32,
+            repeat: bool,
+            modifiers: i32,
+        );
+
+        fn qt_focus_event(
+            name: &str,
+            element: u32,
+        );
+
+        // points 是步长 6 的扁平数组（local x/y、window x/y、screen x/y），
+        // ids/forces 和它平行；changed 是「这一次变化的点」的下标。
+        fn qt_touch_event(
+            name: &str,
+            element: u32,
+            ids: Vec<i32>,
+            points: Vec<f64>,
+            forces: Vec<f64>,
+            changed: Vec<i32>,
+            modifiers: i32,
+        );
+
+        fn qt_resize_event(
+            name: &str,
+            element: u32,
+            width: f64,
+            height: f64,
         );
     }
 }
@@ -3024,26 +3117,41 @@ impl WriteMutations for QtRenderer {
 
     // Dioxus 说：这个 ElementId 身上挂了一个事件监听器（rsx 里的 onclick）。
     //
-    // 我们把它翻译成「在对应的那个 QQuickItem 上装一个 event filter」，
-    // filter 认出「按下并且在同一个元素里松开」就回调 qt_handle_event(name, element)。
-    //
     // name 是 Dioxus 把 rsx 属性名剥掉 `on` 之后交过来的（diff/node.rs:533），
-    // 所以 onclick 到这里已经是 "click"。我们只把它当字符串原样存着，
-    // 回调时再交回给 Rust，由 Rust 决定往 runtime 里送什么。
+    // 所以 onclick 到这里已经是 "click"。
+    //
+    // 这一道是**唯一**的准入检查：C++ 那边按名字决定吃什么 QEvent、
+    // 送回来哪一支回调（EVENT_SPECS），两边同一份口径。
+    // 不支持的名字必须在这里拒绝，不能照装 ——
+    // 照装的后果不是「没反应」而是「反应错」：dioxus 派发时只比名字
+    // （runtime.rs:435 `attr.name.get(2..) == Some(name)`），
+    // 名字对得上 handler 就真跑起来，时机却是错的，而且一声不响。
     fn create_event_listener(
         &mut self,
         name: &'static str,
         id: ElementId,
     ) {
-        // 只认 click 这一种。不做这道判断的后果不是「没反应」，是「反应错」：
-        // filter 只吃鼠标事件（cpp 里 ClickFilter 那台状态机），
-        // 而 dioxus 派发时只比名字（runtime.rs:435 `attr.name.get(2..) == Some(name)`），
-        // 所以一个 onmouseover 会被装成「按下就响」的监听器 —— 名字对得上，
-        // handler 就真跑起来了，静默地跑错时机。
-        if name != "click" {
+        if name == "mounted" {
+            // 这一支不需要 Qt 给事实：元素建出来就是「挂上了」。
+            // 但**不能在这里直接派发** —— 我们此刻正在 render_immediate 里面，
+            // PUMP 的 borrow_mut 还握着，而 handle_event 会 wake，
+            // wake 又要回来 poll。所以记到批处理结束后由回路补发
+            // （见 drain_pending_mounted）。
+            queue_mounted(id.0 as u32);
+
+            println!(
+                "[Dioxus] CreateEventListener mounted id={} \
+                 排进「本轮渲染结束后补发」",
+                id.0
+            );
+
+            return;
+        }
+
+        if let Some(reason) = unsupported_reason(name) {
             println!(
                 "[Dioxus] CreateEventListener {name} id={} \
-                 只实现了 click，不装 filter（这个监听器不会响）",
+                 不装 filter：{reason}（这个监听器不会响）",
                 id.0
             );
 
@@ -3073,7 +3181,7 @@ impl WriteMutations for QtRenderer {
         // SAFETY: object 来自 object_of_node，也就是某个还活在树上的节点的指针；
         //            filter 的所有权交给 Qt（parent 就是那个 item）。
         unsafe {
-            self.host.pin_mut().add_click_listener(
+            self.host.pin_mut().add_event_listener(
                 object,
                 name,
                 id.0 as u32,
@@ -3092,6 +3200,16 @@ impl WriteMutations for QtRenderer {
         name: &'static str,
         id: ElementId,
     ) {
+        if name == "mounted" {
+            // 挂上这件事已经发生过了，撤无可撤。
+            return;
+        }
+
+        if unsupported_reason(name).is_some() {
+            // 当初就没装，这里也没有东西要撤。
+            return;
+        }
+
         let Some(node) = self.lookup(id) else {
             return;
         };
@@ -3104,7 +3222,7 @@ impl WriteMutations for QtRenderer {
         unsafe {
             self.host
                 .pin_mut()
-                .remove_click_listener(object, name);
+                .remove_event_listener(object, name);
         }
 
         println!(
@@ -3191,9 +3309,8 @@ impl WriteMutations for QtRenderer {
 // 我们的 waker 只做一件事：让 Qt 把「再 poll 一次」排进事件队列
 // （C++ 的 schedule_pump_poll）。于是空闲时一次 poll 都不会发生 ——
 // 连那个每 200ms 推一格的假事件源 QTimer 也已经删了：
-// 现在纸条只有一个来源，就是窗口里的一次点击
-// （按下、并且在同一个元素里松开 → ClickFilter → qt_handle_event
-//  → runtime().handle_event）。
+// 现在纸条只有一个来源，就是窗口里送进来的输入事件
+// （QEvent → InputFilter → 对应那支 qt_*_event → runtime().handle_event）。
 
 /// 纸条到了该干什么：把「再 poll 一次」排队交给 Qt 的事件循环。
 ///
@@ -3254,7 +3371,7 @@ fn install_pump(
 
     println!(
         "[pump] 回路装好了（wake 驱动、零轮询）：\
-         纸条的唯一来源是窗口里的一次点击（按下再松开）"
+         纸条的唯一来源是窗口里的输入事件"
     );
 
     // 先把 waker 交出去。
@@ -3330,92 +3447,151 @@ fn qt_pump_poll() {
             renderer.dump_tree();
         }
     });
+
+    // 出了 PUMP 的 borrow 才轮到补发 mounted：
+    // 派发会 wake，而 wake 的那条路要回来 poll 这个 slot，
+    // 在 borrow 里派发就是当场 panic（RefCell already borrowed）。
+    drain_pending_mounted();
 }
 
 
 // ============================================================
-// 事件：Qt 的一次点击（按下再松开）→ dioxus 的 listener
+// 事件：Qt 送来的输入 → dioxus 的 listener
 // ============================================================
 //
-// 这条链上有三个名字要对齐，都是从源码里读出来的，别改错：
+// 这一节有四块：负载结构体（每一支一类）、转换器、派发出口、
+// 以及 C++ 那一侧每个回调进来的入口。
 //
-// 1. rsx 里写 `onclick`，模板里存的是 `"onclick"`；
-//    dioxus-core 发 CreateEventListener 时**剥掉前两个字**：
-//    `to.create_event_listener(&attribute.name[2..], id)`（diff/node.rs:533），
-//    所以我们收到的是 `"click"`。
-//    Runtime 匹配 listener 时也是同一个剥法：
-//    `attr.name.get(2..) == Some(name)`（runtime.rs:435）——
-//    于是「原样把 C++ 送回的名字交给 handle_event」正好对得上。
+// 三条从源码里读出来的契约，决定了下面的形状：
 //
-// 2. 负载类型不是 MouseData，而是 `PlatformEventData`：
-//    rsx 那个 onclick 的 listener 真正的签名是
-//    `|e: Event<PlatformEventData>|`，进去以后才 `e.map(|d| d.into())`
-//    转成 MouseData（dioxus-html events/mod.rs:29-33），
-//    而 `Event::data()` 那边是 `downcast::<T>().unwrap()`（core/events.rs:647）。
-//    所以 Rc<dyn Any> 里装的**必须**是 Rc<PlatformEventData>，
-//    我们自己的鼠标数据放在它的 Box<dyn Any> 内核里。
+// 1. 名字交给 `handle_event` 时必须**已经剥掉 `on`**：
+//    runtime.rs:435 是拿 `attr.name.get(2..) == Some(name)` 来比的，
+//    比中的才是我们这个 listener（去程 diff/node.rs:533 也剥了一次）。
 //
-// 3. `From<&PlatformEventData> for MouseData` 走的是全局 converter
-//    （generated.rs:353-364 → with_event_converter，mod.rs:76-82），
-//    而那个全局值 `.unwrap()` 一个 Option ——
-//    不调 `set_event_converter` 装上转换器，第一次点就是 panic。
-//    转换器有 21 支（每种事件一支），这里只把 mouse 那支做成真的。
+// 2. 负载一律 `Rc<PlatformEventData>`，它的内核是 `Box<dyn Any>`
+//    （events/mod.rs:85-95）—— 所以每一支事件有自己的 Rust 结构体，
+//    handler 里 `Event<MouseData>` 那种写法走的是全局转换器 downcast。
+//
+// 3. 转换器那个槽没装就 unwrap 炸（events/mod.rs:76-82），
+//    trait 的 21 支又**没有默认实现**（events/generated.rs:353-357），
+//    所以本项目把 Qt 真能送来的 8 支做成真的，剩下 13 支留着 panic ——
+//    静默造一份假数据比当场炸难查。
+//
+// 冒泡那个布尔不归我们拍脑袋：dioxus-core-types 里有一份
+// `event_bubbles()`（bubbles.rs:11-105，兜底是 `=> true`），
+// runtime.rs:374-378 就是按它决定走 bubbling 还是 non-bubbling，
+// 所以我们交同一个函数查同一张表。
 
-/// 我们的鼠标负载。
+use dioxus::html::geometry::{
+    PixelsSize,
+    WheelDelta,
+};
+
+use dioxus::html::{
+    HasFocusData,
+    HasKeyboardData,
+    HasPointerData,
+    HasResizeData,
+    HasTouchData,
+    HasTouchPointData,
+    HasWheelData,
+    RenderedElementBacking,
+    ResizeResult,
+    TouchPoint,
+};
+
+use dioxus_core_types::bubbles::event_bubbles;
+
+use std::str::FromStr;
+
+/// 三套坐标 + 修饰键 + 按键 —— 鼠标/指针/滚轮三支都要这几样，
+/// 所以抽出来一份，各支自己再委托一遍（Rust 没有继承，只能转发）。
 ///
-/// 只要满足 `HasMouseData: PointerInteraction: InteractionElementOffset
-/// + ModifiersInteraction`（point_interaction.rs:37）这一串 supertrait 就行，
-/// 每个 getter 交一个数出去。
+/// 坐标的来源和浏览器的对应关系：
+///   local  = QSinglePointEvent::position()（元素本地，且派发器已按 item 本地化过，
+///            util/qquickdeliveryagent.cpp:2553）→ element_coordinates()
+///   window = scenePosition()（窗口内）                → client_/page_coordinates()
+///   screen = globalPosition()（屏幕）                 → screen_coordinates()
+/// 浏览器那三套（client/page/screen）在 Qt 这边没有对等物：
+/// page 和 client 我们都拿窗口坐标顶上（本项目没有滚动容器，两者本来就重合），
+/// 这不是偷懒，是「没有那个概念」的老实交代。
 #[derive(Clone, Debug)]
-struct QtMouseData {
-    /// item 本地坐标（QMouseEvent::position()）
-    x: f64,
-    y: f64,
-    /// 这一次换了状态的那个键，Qt 的位掩码（QMouseEvent::button()）：
-    /// Left 0x1 / Right 0x2 / Middle 0x4 / Back 0x8 / Forward 0x10。
+struct QtCoords {
+    local_x: f64,
+    local_y: f64,
+    window_x: f64,
+    window_y: f64,
+    screen_x: f64,
+    screen_y: f64,
+    /// Qt::KeyboardModifier 的位掩码（qnamespace.h:1071-1079）
+    modifiers: u32,
+    /// 换了状态的那个键，Qt 位掩码（QMouseEvent::button()）
     button: i32,
-    /// 事件那一刻还按着的键串，同样是位掩码（QMouseEvent::buttons()）。
-    /// click 是从松开派发的，所以这里一般是 0 —— 和浏览器的
-    /// MouseEvent.buttons 在 release 上为空是一致的。
+    /// 这一刻按着的一串，Qt 位掩码（QMouseEvent::buttons()）
     buttons: i32,
 }
 
-impl InteractionLocation for QtMouseData {
-    // Qt 这边没有「视口 / 页面 / 屏幕」这三套坐标系，
-    // 本项目里全用同一个本地坐标顶上 —— 数值上不等价于浏览器，
-    // 但类型和通路是真的。
+/// Qt 的修饰键位 → keyboard_types 的 Modifiers（三支柱都要，所以做成自由函数）。
+///
+/// 位值来自 qnamespace.h:1071-1079：Shift 0x02000000 / Control 0x04000000 /
+/// Alt 0x08000000 / Meta 0x10000000。Qt 独有的 Keypad/GroupSwitch 直接丢，
+/// 不硬凑一个 web 没有的位。
+fn qt_modifiers(
+    bits: u32,
+) -> Modifiers {
+    let mut out = Modifiers::empty();
+
+    if bits & 0x0200_0000 != 0 {
+        out |= Modifiers::SHIFT;
+    }
+
+    if bits & 0x0400_0000 != 0 {
+        out |= Modifiers::CONTROL;
+    }
+
+    if bits & 0x0800_0000 != 0 {
+        out |= Modifiers::ALT;
+    }
+
+    if bits & 0x1000_0000 != 0 {
+        out |= Modifiers::META;
+    }
+
+    out
+}
+
+impl InteractionLocation for QtCoords {
     fn client_coordinates(&self) -> ClientPoint {
-        ClientPoint::new(self.x, self.y)
+        ClientPoint::new(self.window_x, self.window_y)
     }
 
     fn screen_coordinates(&self) -> ScreenPoint {
-        ScreenPoint::new(self.x, self.y)
+        ScreenPoint::new(self.screen_x, self.screen_y)
     }
 
     fn page_coordinates(&self) -> PagePoint {
-        PagePoint::new(self.x, self.y)
+        PagePoint::new(self.window_x, self.window_y)
     }
 }
 
-impl InteractionElementOffset for QtMouseData {
+impl InteractionElementOffset for QtCoords {
     fn element_coordinates(&self) -> ElementPoint {
-        ElementPoint::new(self.x, self.y)
+        ElementPoint::new(self.local_x, self.local_y)
     }
 }
 
-impl ModifiersInteraction for QtMouseData {
+impl ModifiersInteraction for QtCoords {
     fn modifiers(&self) -> Modifiers {
-        Modifiers::empty()
+        qt_modifiers(self.modifiers)
     }
 }
 
-impl PointerInteraction for QtMouseData {
-    // 不用换算：Qt 那几位和浏览器 MouseEvent.buttons 的位是同一套
-    // （Qt::LeftButton 0x1 / Right 0x2 / Middle 0x4 / Back 0x8 / Forward 0x10，
-    // 对照 dioxus-html input_data.rs:68-92 的 decode_mouse_button_set，
-    // 那边是 0b1 primary / 0b10 secondary / 0b100 auxiliary / 0b1000 / 0b10000）。
+impl PointerInteraction for QtCoords {
+    // Qt 那几位和浏览器 MouseEvent.buttons 的位是同一套
+    // （Left 0x1 / Right 0x2 / Middle 0x4 / Back 0x8 / Forward 0x10，
+    // 对照 dioxus-html input_data.rs:68-92），所以直接 decode，不换算。
     // 注意 dioxus 的 from_web_code 走的是另一套（button 序号 0/1/2，
-    // 而且 1 是 auxiliary、2 是 secondary），我们交的是位掩码，不是序号。
+    // 而且 1 是 auxiliary、2 是 secondary），我们交的是位掩码不是序号。
     fn trigger_button(&self) -> Option<MouseButton> {
         decode_mouse_button_set(self.button as u16)
             .iter()
@@ -3427,18 +3603,364 @@ impl PointerInteraction for QtMouseData {
     }
 }
 
+/// MouseData 的负载。
+#[derive(Clone, Debug)]
+struct QtMouseData {
+    coords: QtCoords,
+}
+
 impl HasMouseData for QtMouseData {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 }
 
-/// 平台事件 → dioxus-html 通用事件的转换器。
+// 坐标/按键那几支是纯转发，写一遍宏免得七处抄来抄去。
+macro_rules! delegate_coords {
+    ($ty:ty) => {
+        impl InteractionLocation for $ty {
+            fn client_coordinates(&self) -> ClientPoint {
+                self.coords.client_coordinates()
+            }
+
+            fn screen_coordinates(&self) -> ScreenPoint {
+                self.coords.screen_coordinates()
+            }
+
+            fn page_coordinates(&self) -> PagePoint {
+                self.coords.page_coordinates()
+            }
+        }
+
+        impl InteractionElementOffset for $ty {
+            fn element_coordinates(&self) -> ElementPoint {
+                self.coords.element_coordinates()
+            }
+        }
+
+        impl ModifiersInteraction for $ty {
+            fn modifiers(&self) -> Modifiers {
+                self.coords.modifiers()
+            }
+        }
+
+        impl PointerInteraction for $ty {
+            fn trigger_button(&self) -> Option<MouseButton> {
+                self.coords.trigger_button()
+            }
+
+            fn held_buttons(&self) -> MouseButtonSet {
+                self.coords.held_buttons()
+            }
+        }
+    };
+}
+
+delegate_coords!(QtMouseData);
+
+/// PointerData 的负载。
 ///
-/// 只实现 mouse 那一支；其余 20 支保留（trait 要求全实现，没有默认实现），
-/// 但一被调到就当场 panic —— 本项目根本没有那些事件，
-/// 静默返回一个假数据比 panic 更糟。
-struct QtEventConverter;
+/// Qt 给不出的字段按 web 的规矩补：鼠标 contact 尺寸报 1px、
+/// 有键按住时 pressure 0.5（W3C Pointer Events 就是这么定义鼠标的）、
+/// tangential/tilt/twist 只有笔才有意义，这里一律给中性值。
+#[derive(Clone, Debug)]
+struct QtPointerData {
+    coords: QtCoords,
+    pointer_id: i32,
+    pointer_type: String,
+    is_primary: bool,
+    pressure: f32,
+    width: f64,
+    height: f64,
+}
+
+delegate_coords!(QtPointerData);
+
+impl HasPointerData for QtPointerData {
+    fn pointer_id(&self) -> i32 {
+        self.pointer_id
+    }
+
+    fn width(&self) -> f64 {
+        self.width
+    }
+
+    fn height(&self) -> f64 {
+        self.height
+    }
+
+    fn pressure(&self) -> f32 {
+        self.pressure
+    }
+
+    fn tangential_pressure(&self) -> f32 {
+        -1.0
+    }
+
+    fn tilt_x(&self) -> i32 {
+        0
+    }
+
+    fn tilt_y(&self) -> i32 {
+        0
+    }
+
+    fn twist(&self) -> i32 {
+        0
+    }
+
+    fn pointer_type(&self) -> String {
+        self.pointer_type.clone()
+    }
+
+    fn is_primary(&self) -> bool {
+        self.is_primary
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// WheelData 的负载。HasWheelData 的 supertrait 是 HasMouseData，
+/// 所以这一支同样要坐标/按键那一整套。
+#[derive(Clone, Debug)]
+struct QtWheelData {
+    coords: QtCoords,
+    angle_x: i32,
+    angle_y: i32,
+    pixel_x: i32,
+    pixel_y: i32,
+}
+
+delegate_coords!(QtWheelData);
+
+impl HasMouseData for QtWheelData {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl HasWheelData for QtWheelData {
+    fn delta(&self) -> WheelDelta {
+        // 触控板给 pixelDelta（像素），滚轮给 angleDelta（一格 120）。
+        // 符号两边相反：Qt 正 = 向上，web 正 = 向下，所以取负。
+        if self.pixel_x != 0 || self.pixel_y != 0 {
+            WheelDelta::pixels(
+                -f64::from(self.pixel_x),
+                -f64::from(self.pixel_y),
+                0.0,
+            )
+        } else {
+            WheelDelta::pixels(
+                -f64::from(self.angle_x),
+                -f64::from(self.angle_y),
+                0.0,
+            )
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// KeyboardData 的负载。`key`/`code` 的字符串在 C++ 那张表里就对好了
+/// （qt_host.cpp 的 key_names()），这里只负责解析成 keyboard_types 的类型。
+#[derive(Clone, Debug)]
+struct QtKeyData {
+    key: String,
+    code: String,
+    /// Qt 不区分同一键的左右位置（Key_Shift 就是一个键），只能一律 Standard。
+    location: u32,
+    repeat: bool,
+    modifiers: u32,
+}
+
+impl ModifiersInteraction for QtKeyData {
+    fn modifiers(&self) -> Modifiers {
+        qt_modifiers(self.modifiers)
+    }
+}
+
+impl HasKeyboardData for QtKeyData {
+    fn key(&self) -> Key {
+        // Key::from_str 认 web 那套名字（"enter"/"arrowleft"）和单个字符；
+        // 认不出来的当字符原样交出去，空文本就是 Unidentified。
+        if self.key.is_empty() {
+            Key::Unidentified
+        } else {
+            Key::from_str(&self.key).unwrap_or_else(|_| Key::Character(self.key.clone().into()))
+        }
+    }
+
+    fn code(&self) -> Code {
+        Code::from_str(&self.code).unwrap_or(Code::Unidentified)
+    }
+
+    fn location(&self) -> Location {
+        match self.location {
+            1 => Location::Left,
+            2 => Location::Right,
+            3 => Location::Numpad,
+            _ => Location::Standard,
+        }
+    }
+
+    fn is_auto_repeating(&self) -> bool {
+        self.repeat
+    }
+
+    fn is_composing(&self) -> bool {
+        // 输入法合成态 Qt 要 QInputMethod 那套才给，本项目没接，如实报 false。
+        false
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// FocusData 的负载 —— trait 只要 as_any()，没有别的字段要填。
+#[derive(Clone, Debug)]
+struct QtFocusData;
+
+impl HasFocusData for QtFocusData {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// TouchData 里的一个点。坐标那一套和元素本地/窗口/屏幕对齐，
+/// 但注意语义差别：触摸点的 local 是「相对这个元素」，
+/// Qt 给的 position() 已经按 receiver 本地化过了。
+#[derive(Clone, Debug)]
+struct QtTouchPoint {
+    id: i32,
+    coords: QtCoords,
+    force: f64,
+}
+
+impl InteractionLocation for QtTouchPoint {
+    fn client_coordinates(&self) -> ClientPoint {
+        self.coords.client_coordinates()
+    }
+
+    fn screen_coordinates(&self) -> ScreenPoint {
+        self.coords.screen_coordinates()
+    }
+
+    fn page_coordinates(&self) -> PagePoint {
+        self.coords.page_coordinates()
+    }
+}
+
+impl HasTouchPointData for QtTouchPoint {
+    fn identifier(&self) -> i32 {
+        self.id
+    }
+
+    fn force(&self) -> f64 {
+        self.force
+    }
+
+    fn radius(&self) -> ScreenPoint {
+        // Qt 的 QEventPoint 不给接触半径（只有 ellipseSize 在私有接口里），
+        // 按 web 的规矩给 1.0 而不是 0（0 在很多 handler 里等于「没有这个点」）。
+        ScreenPoint::new(1.0, 1.0)
+    }
+
+    fn rotation(&self) -> f64 {
+        0.0
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// TouchData 的负载。
+///
+/// web 那边 touches / targetTouches / changedTouches 三个列表的差别是
+/// 「当前所有点」/「和这个元素同在的点」/「这一次变化的点」。
+/// Qt 的 QTouchEvent::points() 给的是当前所有点，state 标出哪些在变，
+/// 所以 changed 有真数据；target 那一层要「同元素」的判定，我们只有一个
+/// item 的点集，就按「整份点集」交（本项目里一屏一个监听元素，等价）。
+#[derive(Clone, Debug)]
+struct QtTouchData {
+    points: Vec<QtTouchPoint>,
+    changed: Vec<usize>,
+    modifiers: u32,
+}
+
+impl ModifiersInteraction for QtTouchData {
+    fn modifiers(&self) -> Modifiers {
+        qt_modifiers(self.modifiers)
+    }
+}
+
+impl HasTouchData for QtTouchData {
+    fn touches(&self) -> Vec<TouchPoint> {
+        self.points.iter().map(point_of).collect()
+    }
+
+    fn touches_changed(&self) -> Vec<TouchPoint> {
+        self.changed
+            .iter()
+            .filter_map(|i| self.points.get(*i))
+            .map(point_of)
+            .collect()
+    }
+
+    fn target_touches(&self) -> Vec<TouchPoint> {
+        self.touches()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn point_of(p: &QtTouchPoint) -> TouchPoint {
+    TouchPoint::new(p.clone())
+}
+
+/// ResizeData 的负载。0.7.10 这个类型除了 as_any() 之外全是默认
+/// 「不支持」，能填的两个尺寸我们正好知道 —— 几何是我们自己写的。
+#[derive(Clone, Debug)]
+struct QtResizeData {
+    width: f64,
+    height: f64,
+}
+
+impl HasResizeData for QtResizeData {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn get_border_box_size(&self) -> ResizeResult<PixelsSize> {
+        Ok(PixelsSize::new(self.width, self.height))
+    }
+
+    fn get_content_box_size(&self) -> ResizeResult<PixelsSize> {
+        // 我们没有 padding/border 那套盒模型，内容盒 = 边框盒。
+        Ok(PixelsSize::new(self.width, self.height))
+    }
+}
+
+/// MountedData 的负载：trait 只强制 as_any()，
+/// 其余（get_client_rect / scroll_to 那一串）默认 NotSupported。
+/// 想要真的实现就得把 QQuickItem 指针塞进来并跨 await 保活，那是另一件事。
+/// 元素 id 不在负载里（dioxus 那边事件对象本来就知道自己派给了谁），
+/// 只在日志里报一声。
+#[derive(Clone, Debug)]
+struct QtMountedData;
+
+impl RenderedElementBacking for QtMountedData {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
 /// 剩下那些事件：统一生成「不许走」的实现。
 macro_rules! unhandled_events {
@@ -3449,7 +3971,7 @@ macro_rules! unhandled_events {
                 _event: &PlatformEventData,
             ) -> $data {
                 panic!(
-                    "本项目只派发点击（按下再松开），{} 没有实现",
+                    "本项目不产生这类事件，{} 没有实现",
                     stringify!($method)
                 )
             }
@@ -3457,18 +3979,80 @@ macro_rules! unhandled_events {
     };
 }
 
+/// 平台事件 → dioxus-html 通用事件的转换器。
+struct QtEventConverter;
+
 impl HtmlEventConverter for QtEventConverter {
     fn convert_mouse_data(
         &self,
         event: &PlatformEventData,
     ) -> MouseData {
-        // 这个 downcast 的目标类型就是我们自己塞进 PlatformEventData 的那个，
-        // 两边是同一份代码在管，所以失败就是真出错，直接 panic。
-        let data = event
-            .downcast::<QtMouseData>()
-            .expect("PlatformEventData 里装的应该是 QtMouseData");
+        MouseData::new(
+            downcast::<QtMouseData>(event),
+        )
+    }
 
-        MouseData::new(data.clone())
+    fn convert_pointer_data(
+        &self,
+        event: &PlatformEventData,
+    ) -> PointerData {
+        PointerData::new(
+            downcast::<QtPointerData>(event),
+        )
+    }
+
+    fn convert_wheel_data(
+        &self,
+        event: &PlatformEventData,
+    ) -> WheelData {
+        WheelData::new(
+            downcast::<QtWheelData>(event),
+        )
+    }
+
+    fn convert_keyboard_data(
+        &self,
+        event: &PlatformEventData,
+    ) -> KeyboardData {
+        KeyboardData::new(
+            downcast::<QtKeyData>(event),
+        )
+    }
+
+    fn convert_focus_data(
+        &self,
+        event: &PlatformEventData,
+    ) -> FocusData {
+        FocusData::new(
+            downcast::<QtFocusData>(event),
+        )
+    }
+
+    fn convert_touch_data(
+        &self,
+        event: &PlatformEventData,
+    ) -> TouchData {
+        TouchData::new(
+            downcast::<QtTouchData>(event),
+        )
+    }
+
+    fn convert_resize_data(
+        &self,
+        event: &PlatformEventData,
+    ) -> ResizeData {
+        ResizeData::new(
+            downcast::<QtResizeData>(event),
+        )
+    }
+
+    fn convert_mounted_data(
+        &self,
+        event: &PlatformEventData,
+    ) -> MountedData {
+        MountedData::new(
+            downcast::<QtMountedData>(event),
+        )
     }
 
     unhandled_events! {
@@ -3477,49 +4061,42 @@ impl HtmlEventConverter for QtEventConverter {
         convert_clipboard_data => ClipboardData,
         convert_composition_data => CompositionData,
         convert_drag_data => DragData,
-        convert_focus_data => FocusData,
         convert_form_data => FormData,
         convert_image_data => ImageData,
-        convert_keyboard_data => KeyboardData,
         convert_media_data => MediaData,
-        convert_mounted_data => MountedData,
-        convert_pointer_data => PointerData,
-        convert_resize_data => ResizeData,
         convert_scroll_data => ScrollData,
         convert_selection_data => SelectionData,
         convert_toggle_data => ToggleData,
-        convert_touch_data => TouchData,
         convert_transition_data => TransitionData,
         convert_visible_data => VisibleData,
-        convert_wheel_data => WheelData,
     }
 }
 
-/// 把转换器装进那个全局槽。必须在任何点击进来之前调一次。
-fn install_event_converter() {
-    set_event_converter(
-        std::boxed::Box::new(QtEventConverter),
-    );
-
-    println!("[event] HtmlEventConverter 装好了（只认 mouse 那一支）");
+/// downcast 的目标类型就是我们自己塞进 PlatformEventData 的那个，
+/// 两边是同一份代码在管，所以失败就是真出错，直接 panic。
+fn downcast<T: Clone + 'static>(
+    event: &PlatformEventData,
+) -> T {
+    event
+        .downcast::<T>()
+        .expect("PlatformEventData 里装的类型和这一支不匹配")
+        .clone()
 }
 
-
-/// Qt 的 event filter 认出一整次点击之后送上来的（按下 + 在同一个元素里松开）。
+/// 把事件送进 runtime。
 ///
-/// 名字是 C++ 那边原样带回来的（CreateEventListener 当初收到什么，
-/// filter 就存什么），所以这里的 `name` 已经是剥掉 `on` 的形式。
+/// 每一支 Qt 回调最后都汇到这里：RuntimeGuard（不带就 panic
+/// 「Must be called from inside a Dioxus runtime」，runtime.rs:100）、
+/// 冒泡布尔查 event_bubbles、然后 handle_event。
 ///
-/// 这条链跑完会发生：listener 里写了 signal → dioxus 发纸条 →
-/// 我们的 waker 被调 → Qt 排一个事件 → 下一次 poll Ready → 渲染。
-/// 全程没有一行代码是「手动把 scope 标脏」。
-fn qt_handle_event(
+/// 顺带：handle_event 里 listener 写 signal → needs_update → wake，
+/// 而 wake 只能排队（schedule_pump_poll），不能当场 poll ——
+/// 这条线上 PUMP 的 borrow_mut 还在我们手上。
+fn dispatch_event(
     name: &str,
     element: u32,
-    x: f64,
-    y: f64,
-    button: i32,
-    buttons: i32,
+    data: impl std::any::Any + 'static,
+    detail: String,
 ) {
     PUMP.with(|slot| {
         let mut guard = slot.borrow_mut();
@@ -3532,18 +4109,6 @@ fn qt_handle_event(
             return;
         };
 
-        // 先把 runtime 推进这条线程的栈里，再派发。
-        // 不是形式主义：listener 里那句 `count += 1` 走的是
-        // needs_update（runtime.rs:542）→ ScopeState::needs_update
-        // → `self.sender()`，而 sender() 的实现是
-        // `Runtime::current().sender.clone()`（scope_context.rs:97-99）——
-        // 它问的是「当前线程正在跑的那个 runtime」，不是我们手里的这个。
-        // 没加 guard 的 versions 当场 panic
-        // 「Must be called from inside a Dioxus runtime」（runtime.rs:100）。
-        //
-        // 顺带：needs_update 是**真·纸条路径**（unbounded_send(SchedulerMsg::Immediate)
-        // → recv_task.wake()），mark_all_dirty 那种直接写脏表的写法醒都不醒就 Ready，
-        // wait_for_work 里那条 await（virtual_dom.rs:460）根本没被走过。
         let runtime = pump.vdom.runtime();
 
         let _guard = RuntimeGuard::new(
@@ -3551,29 +4116,408 @@ fn qt_handle_event(
         );
 
         let payload: std::rc::Rc<dyn std::any::Any> = std::rc::Rc::new(
-            PlatformEventData::new(std::boxed::Box::new(QtMouseData {
-                x,
-                y,
-                button,
-                buttons,
-            })),
+            PlatformEventData::new(std::boxed::Box::new(data)),
         );
 
-        // propagates = true：click 在 dioxus-html 里是会冒泡的事件
-        // （runtime.rs:374 就靠这个布尔决定走 bubbling 还是 non-bubbling）。
-        let event = Event::new(payload, true);
+        let bubbles = event_bubbles(name);
 
         println!(
             "[event] handle_event({name:?}, ElementId({element})) \
-             坐标 ({x:.1}, {y:.1}) button 0x{button:x}"
+             冒泡 {bubbles}{detail}"
         );
 
         runtime.handle_event(
             name,
-            event,
+            Event::new(payload, bubbles),
             ElementId(element as usize),
         );
     });
+}
+
+// ============================================================
+// C++ 那一侧进来的八支回调（extern "Rust"）
+// ============================================================
+
+/// 坐标三套 + 按键 + 修饰键，每支回调的日志里都拼这一串。
+#[allow(clippy::too_many_arguments)]
+fn coords_log(
+    local_x: f64,
+    local_y: f64,
+    window_x: f64,
+    window_y: f64,
+    screen_x: f64,
+    screen_y: f64,
+) -> String {
+    format!(
+        " 本地 ({local_x:.1}, {local_y:.1}) 窗口 ({window_x:.1}, {window_y:.1}) \
+         屏幕 ({screen_x:.1}, {screen_y:.1})"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qt_mouse_event(
+    name: &str,
+    element: u32,
+    local_x: f64,
+    local_y: f64,
+    window_x: f64,
+    window_y: f64,
+    screen_x: f64,
+    screen_y: f64,
+    button: i32,
+    buttons: i32,
+    modifiers: i32,
+) {
+    dispatch_event(
+        name,
+        element,
+        QtMouseData {
+            coords: QtCoords {
+                local_x,
+                local_y,
+                window_x,
+                window_y,
+                screen_x,
+                screen_y,
+                modifiers: modifiers as u32,
+                button,
+                buttons,
+            },
+        },
+        format!(
+            "{} button 0x{button:x}",
+            coords_log(local_x, local_y, window_x, window_y, screen_x, screen_y)
+        ),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qt_pointer_event(
+    name: &str,
+    element: u32,
+    local_x: f64,
+    local_y: f64,
+    window_x: f64,
+    window_y: f64,
+    screen_x: f64,
+    screen_y: f64,
+    button: i32,
+    buttons: i32,
+    modifiers: i32,
+    pointer_id: i32,
+    pointer_type: &str,
+    is_primary: bool,
+    pressure: f64,
+    width: f64,
+    height: f64,
+) {
+    dispatch_event(
+        name,
+        element,
+        QtPointerData {
+            coords: QtCoords {
+                local_x,
+                local_y,
+                window_x,
+                window_y,
+                screen_x,
+                screen_y,
+                modifiers: modifiers as u32,
+                button,
+                buttons,
+            },
+            pointer_id,
+            pointer_type: pointer_type.to_string(),
+            is_primary,
+            pressure: pressure as f32,
+            width,
+            height,
+        },
+        format!(
+            " pointer {pointer_id}/{pointer_type} 压力 {pressure:.2}"
+        ),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qt_wheel_event(
+    name: &str,
+    element: u32,
+    local_x: f64,
+    local_y: f64,
+    window_x: f64,
+    window_y: f64,
+    screen_x: f64,
+    screen_y: f64,
+    angle_x: i32,
+    angle_y: i32,
+    pixel_x: i32,
+    pixel_y: i32,
+    buttons: i32,
+    modifiers: i32,
+) {
+    dispatch_event(
+        name,
+        element,
+        QtWheelData {
+            coords: QtCoords {
+                local_x,
+                local_y,
+                window_x,
+                window_y,
+                screen_x,
+                screen_y,
+                modifiers: modifiers as u32,
+                button: 0,
+                buttons,
+            },
+            angle_x,
+            angle_y,
+            pixel_x,
+            pixel_y,
+        },
+        format!(
+            " 滚量 angle ({angle_x}, {angle_y}) pixel ({pixel_x}, {pixel_y})"
+        ),
+    );
+}
+
+fn qt_key_event(
+    name: &str,
+    element: u32,
+    key: &str,
+    code: &str,
+    location: i32,
+    repeat: bool,
+    modifiers: i32,
+) {
+    dispatch_event(
+        name,
+        element,
+        QtKeyData {
+            key: key.to_string(),
+            code: code.to_string(),
+            location: location as u32,
+            repeat,
+            modifiers: modifiers as u32,
+        },
+        format!(" 键 {key:?} code {code:?}"),
+    );
+}
+
+fn qt_focus_event(
+    name: &str,
+    element: u32,
+) {
+    dispatch_event(
+        name,
+        element,
+        QtFocusData,
+        String::new(),
+    );
+}
+
+/// points 是步长 6 的扁平数组：local x/y、window x/y、screen x/y。
+fn qt_touch_event(
+    name: &str,
+    element: u32,
+    ids: Vec<i32>,
+    points: Vec<f64>,
+    forces: Vec<f64>,
+    changed: Vec<i32>,
+    modifiers: i32,
+) {
+    let mut list = Vec::with_capacity(ids.len());
+
+    for (i, id) in ids.iter().enumerate() {
+        let base = i * 6;
+
+        let get = |k: usize| points.get(base + k).copied().unwrap_or(0.0);
+
+        list.push(QtTouchPoint {
+            id: *id,
+            coords: QtCoords {
+                local_x: get(0),
+                local_y: get(1),
+                window_x: get(2),
+                window_y: get(3),
+                screen_x: get(4),
+                screen_y: get(5),
+                modifiers: modifiers as u32,
+                button: 0,
+                buttons: 0,
+            },
+            force: forces.get(i).copied().unwrap_or(0.0),
+        });
+    }
+
+    let changed: Vec<usize> = changed
+        .iter()
+        .filter_map(|i| usize::try_from(*i).ok())
+        .collect();
+
+    let count = list.len();
+
+    dispatch_event(
+        name,
+        element,
+        QtTouchData {
+            points: list,
+            changed,
+            modifiers: modifiers as u32,
+        },
+        format!(" 点数 {count}"),
+    );
+}
+
+fn qt_resize_event(
+    name: &str,
+    element: u32,
+    width: f64,
+    height: f64,
+) {
+    dispatch_event(
+        name,
+        element,
+        QtResizeData { width, height },
+        format!(" 尺寸 {width:.1}x{height:.1}"),
+    );
+}
+
+// ============================================================
+// 名字表：哪一支支持、不支持的理由
+// ============================================================
+//
+// C++ 的 EVENT_SPECS 是同一份口径的另一半（那边管「吃什么 QEvent、
+// 送回来哪一支」，这里管「要不要装、不装的话为什么」）。
+// 加一支事件要两边各改一处 —— 漏了 C++ 那一侧的话，
+// add_event_listener 会打「事件名不在表里」并且不装任何东西。
+
+/// 本项目不支持的事件名 → 缺的是什么东西。
+///
+/// 返回 None = 支持（交给 C++ 装 filter）；Some(理由) = 拒绝并打日志。
+/// 兜底那条给的是「没有事实来源」，比让人以为漏了个分支好。
+fn unsupported_reason(
+    name: &str,
+) -> Option<&'static str> {
+    let reason = match name {
+        // Qt 有这套事实，但本项目还没有对应的设施。
+        "scroll" | "scrollend" =>
+            "没有可滚动容器（Flickable/ScrollView），滚不动也就没有滚动量",
+        "drag" | "dragstart" | "dragend" | "dragenter" | "dragleave"
+        | "dragover" | "drop" =>
+            "要一套 Qt 拖放（QDrag + QMimeData），本项目没有拖放源也没有放置目标",
+
+        // Qt/web 语义对不上，硬接就是假数据。
+        "animationstart" | "animationiteration" | "animationend"
+        | "transitionend" =>
+            "属性动画不在我们的渲染路径上（几何是 taffy 一次性写死的）",
+        "load" | "error" =>
+            "没有需要异步加载的子资源（图片/媒体都不在这个项目里）",
+        "abort" | "canplay" | "canplaythrough" | "durationchange"
+        | "emptied" | "encrypted" | "ended" | "loadeddata"
+        | "loadedmetadata" | "loadstart" | "pause" | "play"
+        | "playing" | "progress" | "ratechange" | "seeked"
+        | "seeking" | "stalled" | "suspend" | "timeupdate"
+        | "volumechange" | "waiting" =>
+            "没有媒体元素",
+        "change" | "input" | "invalid" | "reset" | "submit" =>
+            "没有表单元素（值都在 Rust 侧的 signal 里）",
+        "copy" | "cut" | "paste" =>
+            "没接剪贴板 QClipboard",
+        "compositionstart" | "compositionend" | "compositionupdate" =>
+            "没接输入法 QInputMethod（is_composing 因此也只能报 false）",
+        "select" | "selectstart" | "selectionchange" =>
+            "没接文本选择（QQuickText 的选区是另一整套）",
+        "toggle" | "beforetoggle" =>
+            "Qt 没有 details/summary 这类会自己折叠的元素",
+        "visible" =>
+            "没接可见性观察：QQuickItem::isVisible 只说「在树上」，不说「在视口里」",
+        "cancel" =>
+            "没有可取消的异步元素（那是 closable dialog 那一类）",
+        "pointerlockchange" | "pointerlockerror" =>
+            "没接指针捕获 QQuickWindow::setPointerCaptureBehaviours",
+
+        _ => "本项目没有这一类事实来源",
+    };
+
+    // 支持的都在这张表里；不在的就当成「上面那一段没列到的名字」也拒绝。
+    if SUPPORTED_EVENTS.contains(&name) || name == "mounted" {
+        return None;
+    }
+
+    Some(reason)
+}
+
+
+/// 支持的支（和 cpp/qt_host.cpp 的 EVENT_SPECS 一一对应）。
+const SUPPORTED_EVENTS: &[&str] = &[
+    "mousedown", "mouseup", "click", "dblclick", "doubleclick",
+    "mousemove", "mouseover", "mouseout", "mouseenter", "mouseleave",
+    "contextmenu",
+    "pointerdown", "pointerup", "auxclick", "pointermove",
+    "pointerover", "pointerout", "pointerenter", "pointerleave",
+    "wheel",
+    "keydown", "keyup", "keypress",
+    "focus", "blur", "focusin", "focusout",
+    "touchstart", "touchmove", "touchend", "touchcancel",
+    "resize",
+];
+
+// ============================================================
+// mounted：本轮渲染结束后补发
+// ============================================================
+//
+// 队列放在 PUMP 之外的一个 thread_local 里，为的是能躲开重入：
+// create_event_listener 是在 render_immediate 里面被调的，
+// 那一刻 PUMP 的 borrow_mut 还握着，而派发要再借一次 → 当场 panic。
+// 所以「记下来」放这里，回路在 borrow 之外掏空它。
+thread_local! {
+    static PENDING_MOUNTED: std::cell::RefCell<Vec<u32>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+
+fn queue_mounted(
+    element: u32,
+) {
+    PENDING_MOUNTED.with(|slot| {
+        slot.borrow_mut().push(element);
+    });
+}
+
+
+/// 把攒下的 mounted 发出去。回路在每轮 poll 结束后调一次。
+fn drain_pending_mounted() {
+    let pending: Vec<u32> = PENDING_MOUNTED.with(|slot| {
+        let mut borrowed = slot.borrow_mut();
+
+        std::mem::take(&mut *borrowed)
+    });
+
+    for element in pending {
+        dispatch_event(
+            "mounted",
+            element,
+            QtMountedData,
+            format!(" 元素 {element} 挂上了"),
+        );
+    }
+}
+
+/// 把转换器装进那个全局槽。必须在任何事件进来之前调一次。
+///
+/// 这是个进程级的 `static RwLock<Option<Box<dyn HtmlEventConverter>>>`
+/// （events/mod.rs:68），装一次就够了，不用每个窗口装一次。
+fn install_event_converter() {
+    set_event_converter(
+        std::boxed::Box::new(QtEventConverter),
+    );
+
+    println!(
+        "[event] HtmlEventConverter 装好了（8 支是真的：mouse/pointer/wheel/\
+         key/focus/touch/resize/mounted，其余 13 支一被调到就 panic）"
+    );
 }
 
 
@@ -3704,7 +4648,7 @@ fn main() {
     // （store → mark_all_dirty → render_immediate → relayout → dump_tree），
     // 再后来是 QTimer 每 200ms 推一格 —— 那些现在都没有了。剩下的形状是：
     //
-    //     窗口里的一次点击 → ClickFilter → qt_handle_event
+    //     窗口里的输入事件 → InputFilter → 对应那支 qt_*_event
     //     → runtime().handle_event(...)（runtime.rs:369）
     //     → listener 写 signal → 纸条 → 我们的 waker
     //     → C++ schedule_pump_poll() → 排一个 Qt 事件
@@ -3852,12 +4796,19 @@ mod tests {
 
         let payload: std::rc::Rc<dyn std::any::Any> = std::rc::Rc::new(
             PlatformEventData::new(std::boxed::Box::new(QtMouseData {
-                x: 0.0,
-                y: 0.0,
-                // 和真左键松开来的一样：0x1 == Qt::LeftButton，
-                // buttons 在松开这一刻是空的。
-                button: 0x1,
-                buttons: 0,
+                coords: QtCoords {
+                    local_x: 55.0,
+                    local_y: 24.0,
+                    window_x: 177.0,
+                    window_y: 51.0,
+                    screen_x: 177.0,
+                    screen_y: 51.0,
+                    modifiers: 0,
+                    // 和真左键松开来的一样：0x1 == Qt::LeftButton，
+                    // buttons 在松开这一刻是空的。
+                    button: 0x1,
+                    buttons: 0,
+                },
             })),
         );
 

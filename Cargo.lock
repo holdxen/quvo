@@ -1085,6 +1085,7 @@ dependencies = [
  "cxx-qt-build",
  "cxx-qt-lib",
  "dioxus",
+ "dioxus-core-types",
  "dioxus-signals",
  "taffy",
 ]

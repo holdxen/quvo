@@ -112,35 +112,33 @@ public:
     // 输入事件
     // -----------------------------
     //
-    // 为什么用 event filter 而不是 MouseArea：
+    // 为什么用 event filter 而不是 MouseArea / PointerHandler：
     // 我们的节点是从内联 QML 实例化出来的裸 QQuickItem，
     // 它本身没有 clicked 这种信号可以 connect；
     // 而 MouseArea 得塞进 QML 里，就成了「谁的几何说话」的第二个作者，
     // 还会往 childItems 里多插一个我们账本上没有的节点
     // （child_order 的交叉检查立刻会 ✗）。
     // filter 装在 item 上：不占 visual tree，不吃事件（返回 false），
-    // 只负责「按下、并且在同一个元素里松开」这一对组合转告 Rust ——
-    // 判据照抄 QQuickMouseArea 的 clicked（见 cpp 里 ClickFilter 上方的对照）。
+    // 只负责把 Qt 的那一套 QEvent 翻译成 dioxus 的事件送过去。
     //
-    // name 现在只可能是 "click"：Rust 侧的 create_event_listener
-    // 只把 click 交到这里，别的事件名它当场拒绝、不装 filter。
+    // 一个 (item, name) 一个 filter。名字决定这一支吃什么 QEvent、
+    // 送哪一支 Rust 回调、以及这个 item 要打开哪些输入能力
+    // （acceptedMouseButtons / acceptHoverEvents / acceptTouchEvents /
+    //  focusPolicy）—— 全在 cpp 里的 EVENT_SPECS 那张表上。
     //
-    // 但光装 filter 点不到：真鼠标要先过命中测试，那里把
-    // acceptedMouseButtons() == Qt::NoButton 的项当不存在跳过
-    // （qquickdeliveryagent.cpp:2258），而裸 QQuickItem / Rectangle 的默认
-    // 就是 NoButton（qquickitem_p.h:1092-1096）。所以这里同时把
-    // Qt::LeftButton 打开，remove 时如果这个 item 没别的监听器了就关回去。
-    void add_click_listener(
+    // 「click」的判据照抄 QQuickMouseArea：按下记下、在同一个元素里松开才算
+    // （对照见 ClickFilter/InputFilter 的注释）。
+    void add_event_listener(
         QQuickItem* item,
         rust::Str name,
         std::uint32_t element
     );
 
-    // 撤掉 add_click_listener 装的那个 filter（removeEventFilter + delete）。
-    // 不做的话：节点被 destroy 之后 filter 还挂在事件线上 ——
-    // filter 本身是 item 的 QObject 孩子（构造时把 item 当 parent 传进去了），
-    // 会跟着一起析构，但「同一格重挂两次」得靠这个先撤掉旧的。
-    void remove_click_listener(
+    // 撤掉 add_event_listener 装的那个 filter（removeEventFilter + delete）。
+    // filter 的 parent 是 item，所以节点被删时它自己跟着走；
+    // 登记簿那一格由 filter 自己的 destroyed 槽摘掉（destroy 只清得到的了根，
+    // 子树里孩子的得靠这个）。撤完还要重算一次这个 item 的能力开关。
+    void remove_event_listener(
         QQuickItem* item,
         rust::Str name
     );

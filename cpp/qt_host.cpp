@@ -207,10 +207,6 @@ QtHost::create_text(rust::Str text)
 import QtQuick
 
 Text {
-    color: "#17343b"
-
-    font.pixelSize: 32
-    font.weight: Font.DemiBold
 }
 )QML",
         "Text"

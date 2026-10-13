@@ -88,7 +88,8 @@
 //!   回调时原样交回去，所以 `onkeydown` 这种也会装上一个「鼠标按下才响」的
 //!   filter —— 真要做别的输入，得让 `ClickFilter` 分清事件类型。
 //! - 窗口 resize 没有触发重排；字体还是 Qt 自己的默认值，
-//!   没和 `measure_text` 用同一个来源；
+//!   没和 `measure_item` 用同一个来源（现在两边都是「item 上那个默认字体」，
+//!   所以量出来刚好对得上；一旦 font 变成 Rust 下发的样式，两处要一起改）；
 //!   `AttributeValue::{Int, Float, Bool, None}` 在属性过滤那步被丢掉。
 //! - 因为事件源只剩鼠标，offscreen 跑起来之后日志里不会再有渲染 ——
 //!   回路醒着但没人叫醒它。click→handle_event→渲染那一段的回归测试
@@ -214,7 +215,9 @@ use taffy::compute_leaf_layout;
 //     stack_before()         调同一 parent 下的叠放顺序
 //     destroy()              diff 之后把这棵子树从 Qt 里拿掉
 //
-//     measure_text()         布局时问 Qt「这段字要多大」
+//     measure_item()         布局时问 Qt「这个 item 要多大」
+//                            （文本从 item 自己身上读，Rust 不另存一份）
+//     is_text_item()         只有对照诊断用：这个 item 有没有可量的文字
 //     implicit_width/height  只用于对照：读 Qt 对象自己算的尺寸
 //     window_width/height    视口尺寸
 //
@@ -377,17 +380,28 @@ mod ffi {
             self: &QtHost,
         ) -> f64;
 
-        // 量一段文本要多大 —— 走的是 QQuickText 同一套算法
-        // （QTextLayout + design metrics），见 cpp/qt_host.cpp。
+        // 量一个 item 要多大 —— 文本从 item 自己身上取（QQuickText::text()），
+        // 算法和 QQuickText 同一套（QTextLayout + design metrics），
+        // 见 cpp/qt_host.cpp 的 measure_layout。
+        //
+        // 不是文本项、或者文本是空的，返回 0x0：
+        // 那种节点的尺寸本来就该由 style 里的 width / height 决定。
         //
         // max_width <= 0：不限宽，折一行，宽度 = Qt 的 implicitWidth 口径。
         // max_width >  0：按这个宽度折行，返回的是「用到的宽度」
         //                （最宽那一行，且不超过 max_width）和总高度。
-        fn measure_text(
+        unsafe fn measure_item(
             self: &QtHost,
-            text: &str,
+            item: *mut QQuickItem,
             max_width: f64,
         ) -> TextMeasure;
+
+        // 这个 item 是不是「有内容可量的文本项」。
+        // 布局不需要它（量不出来自然 0x0），只有对照诊断需要。
+        unsafe fn is_text_item(
+            self: &QtHost,
+            item: *mut QQuickItem,
+        ) -> bool;
 
         // 下面两个只用于对照：读 Qt 对象自己报的 implicit size。
         // 读它会触发 QQuickText 同步算一次尺寸，所以没 polish 也准。
@@ -744,14 +758,6 @@ struct Node {
     // （动态属性是 SetAttribute，静态属性在模板里），
     // 真正的输入时刻是 relayout()。
     style: Vec<(&'static str, String)>,
-
-    // 这个节点上显示的文本（只有文本类节点会有）。
-    //
-    // 两个用处：
-    //     1. relayout() 把它塞进 taffy 节点的 context，
-    //        测量回调拿到的就是它（见 compute_layout_with_measure）；
-    //     2. verify_text_measurement() 用它做「我们量的」vs「Qt 自己算的」对照。
-    content: String,
 }
 
 
@@ -854,9 +860,11 @@ struct QtRenderer {
     // 父子关系由 sync_taffy_children 在 Node 的孩子变化时同步过来，
     // 占位节点不进这棵树。
     //
-    // 泛型参数是 taffy 的「节点 context」：这里放这段文本的内容，
-    // 测量回调会原样拿到它（没有文本的节点不设 context，量出来就是 0）。
-    tree: TaffyTree<String>,
+    // 泛型参数是 taffy 的「节点 context」：这里放的是这个节点的 Qt 对象指针。
+    // 测量回调只认它自己存的这份 context（不认识我们的 Node，也拿不到 node id），
+    // 所以要让 C++ 拿着指针去量 —— 文本、以及「这是不是一行字」这两件事
+    // 都由 item 自己回答（qobject_cast<QQuickText*>），Rust 这边不再存副本。
+    tree: TaffyTree<Option<QQuickItemId>>,
 
     // 布局根 = node 0（窗口内容区）。
     // node 0 的 object 是 contentItem 那个真实指针，
@@ -888,7 +896,9 @@ impl QtRenderer {
 
 
         // 布局树建根。
-        let mut tree = TaffyTree::<String>::new();
+        let mut tree = TaffyTree::<
+            Option<QQuickItemId>,
+        >::new();
 
         let root_taffy = tree
             .new_leaf(Style::default())
@@ -916,7 +926,6 @@ impl QtRenderer {
                         "column".to_string(),
                     ),
                 ],
-                content: String::new(),
             },
         );
 
@@ -983,7 +992,6 @@ impl QtRenderer {
                 children: Vec::new(),
                 taffy,
                 style: Vec::new(),
-                content: String::new(),
             },
         );
 
@@ -1179,12 +1187,6 @@ impl QtRenderer {
                             value,
                         );
 
-                        self.record_content(
-                            element_node,
-                            name,
-                            value,
-                        );
-
                         let value = cxx_qt_lib::QString::from(*value);
                         let value = cxx_qt_lib::QVariant::from(&value);
 
@@ -1369,30 +1371,6 @@ impl QtRenderer {
     }
 
 
-    // 记下这个节点显示的文本。
-    //
-    // 这份账是布局的输入，不只是诊断用的：relayout() 会把它
-    // 交给 taffy 的节点 context，测量回调量的就是它。
-    fn record_content(
-        &mut self,
-        node: u64,
-        name: &str,
-        value: &str,
-    ) {
-        if name != "text" {
-            return;
-        }
-
-
-        self.nodes
-            .get_mut(&node)
-            .unwrap_or_else(|| {
-                panic!("unknown node id {node}")
-            })
-            .content = value.to_string();
-    }
-
-
     // 父节点的孩子列表变了，就把布局树的 children 整体重设一遍。
     //
     // 刻意不做增量：这里的调用点是「树结构真的变了」的时刻
@@ -1451,23 +1429,18 @@ impl QtRenderer {
                 .set_style(taffy, style)
                 .expect("taffy: set_style 失败");
 
-            // 文本内容送进 taffy 的节点 context。
+            // 把节点的 Qt 对象指针交给 taffy 的 context。
             //
-            // 测量是 taffy 反过来调我们的：它回调时只递给自己存的
-            // context 和 style，不认识我们的 Node，
-            // 所以「这段字是什么」必须在算之前就先放进去。
-            // 空文本（Rectangle / Item）不设 context ——
-            // 那些叶子的尺寸本来就该来自 style 里的 width / height。
-            let content = self.node(id).content.clone();
+            // 测量是 taffy 反过来调我们的：回调手里只有自己存的 context 和
+            // style，既不认识我们的 Node，也拿不到 node id —— 所以「去哪儿读
+            // 这段字」必须在算之前就放好。放指针而不是放字符串是有意的：
+            // 文本的唯一存储就成了那个 item 本身，Rust 不再有一份会陈旧的副本。
+            let object = self.node(id).object;
 
             self.tree
                 .set_node_context(
                     taffy,
-                    if content.is_empty() {
-                        None
-                    } else {
-                        Some(content)
-                    },
+                    Some(object),
                 )
                 .expect("taffy: set_node_context 失败");
         }
@@ -1493,7 +1466,7 @@ impl QtRenderer {
         //    compute_layout 其实就是「测量函数永远返 0」的特例。
         //
         //    借用要拆成字段级：tree 需要 &mut（它在写布局结果），
-        //    host 只需要 &（measure_text 是 const 的），
+        //    host 只需要 &（measure_item 是 const 的），
         //    两者都在 self 上，整块借会互相撞上。
         let QtRenderer {
             tree,
@@ -1517,10 +1490,10 @@ impl QtRenderer {
                         // calc 表达式本项目没用到，原样返回。
                         |_calc_ptr, value| value,
                         |known_dimensions, available_space| {
-                            // 没有文本的叶子问不出尺寸。
-                            // 它的宽高写在 style 里，
-                            // compute_leaf_layout 会用 style 覆盖这里的结果。
-                            let Some(content) = context else {
+                            // 两层都要有：taffy 那层没存 context，
+                            // 或者这个节点压根没有 Qt 对象 —— 都量不出东西，
+                            // 尺寸就退回 style。
+                            let Some(Some(object)) = context else {
                                 return Size::ZERO;
                             };
 
@@ -1537,10 +1510,19 @@ impl QtRenderer {
                                 _ => -1.0,
                             };
 
-                            let measured = host.measure_text(
-                                content.as_str(),
-                                max_width,
-                            );
+                            // 不是文本项 / 文本为空，C++ 那边返回 0x0，
+                            // 于是 style 里的 width / height 就是答案。
+                            //
+                            // SAFETY: 这个指针是从 Node.object 抄进 context 的，
+                            //         对象由 Qt 的 parent tree 持有；
+                            //         算布局这段时间里没有任何东西会删节点
+                            //         （删节点发生在 mutation 应用阶段，早于这里）。
+                            let measured = unsafe {
+                                host.measure_item(
+                                    *object,
+                                    max_width,
+                                )
+                            };
 
                             // 已经知道的轴就用知道的，别拿测量值去盖。
                             Size {
@@ -1645,15 +1627,26 @@ impl QtRenderer {
                 continue;
             };
 
-            let content = self.node(id).content.as_str();
+            // 只有文本项值得比 —— 判据在 C++（qobject_cast<QQuickText*> 且
+            // 文本非空），这里不再自己留一份「这是不是文本」的账。
+            //
+            // SAFETY: object 来自 Node.object，也就是 create_* / root_item()
+            //         交回来的指针；对象由 Qt 的 parent tree 持有，此刻还活着。
+            //         这两个调用都只读，不改所有权。
+            let is_text = unsafe {
+                self.host.is_text_item(object)
+            };
 
-            // 只有文本节点值得比：Rectangle / Item 的 implicit 是 0。
-            if content.is_empty() {
+            if !is_text {
                 continue;
             }
 
-            let free = self.host.measure_text(content, -1.0);
-            let wrapped = self.host.measure_text(content, 100.0);
+            let free = unsafe {
+                self.host.measure_item(object, -1.0)
+            };
+            let wrapped = unsafe {
+                self.host.measure_item(object, 100.0)
+            };
 
             // SAFETY: 同一个对象指针，来自 create_*；
             // 读 implicit size 不改对象所有权，也不管它挂没挂。
@@ -1665,8 +1658,7 @@ impl QtRenderer {
             };
 
             println!(
-                "[measure] node {id} obj {object:p} \
-                 text={content:?}"
+                "[measure] node {id} obj {object:p}"
             );
             println!(
                 "   不限宽  我们 {:.1}x{:.1}   \
@@ -2222,7 +2214,8 @@ impl QtRenderer {
 //   - 字体：两边现在都用 QGuiApplication::font()（C++ 那边是默认构造的
 //     QFont，QML 里那个 Text 没写 font）。所以「量的」和「画的」恰好是
 //     同一个字体，Δ 才是 0。一旦 font 变成 Rust 下发的样式属性，
-//     measure_text 必须收同一个 QFont，不能各拿各的。
+//     measure_layout 必须收同一个 QFont，不能各拿各的 ——
+//     改成从 item 量之后这条更要做，因为量的时候就该用那个 item 的字体。
 //   - 窗口 resize：视口尺寸只在 relayout 那一刻读一次，
 //     拖动窗口不会重算（连重算的触发点都还没接）。
 
@@ -2956,12 +2949,6 @@ impl WriteMutations for QtRenderer {
 
             return;
         };
-
-
-        // 记下内容，测量对照要用（布局属性和普通属性都可能有文本）。
-        if let Some(node) = self.lookup(id) {
-            self.record_content(node, name, text);
-        }
 
 
         // 布局属性在这里只记账，不写给 Qt：

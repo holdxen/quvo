@@ -12,6 +12,7 @@
 #include <QtCore/QObject>
 #include <QtCore/QString>
 #include <QtCore/QUrl>
+#include <QtCore/QVariant>
 
 
 #include <QtGui/QColor>
@@ -617,11 +618,48 @@ QtHost::set_property(
     }
 }
 
-TextMeasure
-QtHost::measure_text(
-    rust::Str text,
+namespace {
+
+// 「这是不是一个会显示文字的项」的判据 —— 它有没有一个读得出 QString 的
+// `text` 属性。
+//
+// 为什么不是 qobject_cast<QQuickText*>：brew 的 QtQuick.framework 压根不发
+// QQuickText 的头文件（Headers 里只有 qquickitem.h 那批，私有头也不在包里），
+// 为一个 cast 去引私有 API 不值当。走 meta-object 反而更宽：
+// 以后换成自定义的、带 text 属性的文本项，这条判据照样成立。
+//
+// 这样读没有副作用：property("text") 调的就是 QQuickText::text()，
+// 而那个 getter 是 `return d->text;`（qquicktext.cpp:1837-1841）。
+QString text_of_item(
+    QQuickItem *item
+)
+{
+    if (item == nullptr) {
+        return {};
+    }
+
+    const QVariant value = item->property("text");
+
+    // 没这个属性 → 无效 QVariant（Rectangle / Item 走这里）；
+    // 有但不是字符串 → 也不算文本项。
+    if (!value.canConvert<QString>()) {
+        return {};
+    }
+
+    return value.toString();
+}
+
+
+// 「量一段文本要占多大」的唯一一份实现。
+//
+// 只有 QQuickText 的量得出来，而且**不去读 item 的 implicitWidth/Height** ——
+// 那两个值折行时用的是 item 当前的 width（qquicktext.cpp:834），
+// 而那个 width 正是布局这一步要决定的东西，会绕成环。
+// 折行的约束只能从参数进来（taffy 递的 available_space）。
+TextMeasure measure_layout(
+    const QString &text,
     double max_width
-) const
+)
 {
     // 字体：默认构造的 QFont 就是 QGuiApplication::font()，
     // 和 C++ 那段裸 Text {} 用的是同一个来源。
@@ -630,7 +668,7 @@ QtHost::measure_text(
     QFont font;
 
     QTextLayout layout(
-        to_qstring(text),
+        text,
         font
     );
 
@@ -686,13 +724,9 @@ QtHost::measure_text(
 
     layout.endLayout();
 
-    // 空串也会走出一行：QTextLayout 对 "" 照样给一个行高，
-    // 所以量出来是 0 x lineHeight，而不是 0 x 0。
-    // （负向检查时踩过这个坑：拿空串当「测不到尺寸」的探针是探不出来的。）
-
     // 不限宽：宽度就是 QQuickText implicitWidth 的那个口径
     // （qquicktext.cpp:1044 用的 maximumWidth()），
-    // 这样 verify_text_measurement 的 Δ 才有意义。
+    // 这样和 implicit 的对照才有意义。
     //
     // 限宽：换成折行后的实际宽度 —— maximumWidth() 量的始终是
     // 「最长那条逻辑行」，折了行它也还是 254.9，
@@ -703,6 +737,39 @@ QtHost::measure_text(
         : layout.maximumWidth();
 
     return { width, height };
+}
+
+} // namespace
+
+
+bool
+QtHost::is_text_item(
+    QQuickItem *item
+) const
+{
+    // 判据是「这个 item 自己有没有一段要显示的文字」，不是 Rust 记的账、
+    // 也不是名字。空文本一并算 false：QTextLayout 对 "" 照样吐一行高
+    // （0 x lineHeight），少了这层判断，一个空标签会白占一行。
+    return !text_of_item(item).isEmpty();
+}
+
+
+TextMeasure
+QtHost::measure_item(
+    QQuickItem *item,
+    double max_width
+) const
+{
+    const QString text = text_of_item(item);
+
+    // 不是文本项（Rectangle / Item）、或者没有内容 → 0x0：
+    // 这种节点的尺寸本来就该由 style 里的 width / height 决定，
+    // compute_leaf_layout 会把 style 盖回来。
+    if (text.isEmpty()) {
+        return { 0.0, 0.0 };
+    }
+
+    return measure_layout(text, max_width);
 }
 
 

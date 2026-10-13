@@ -150,13 +150,31 @@ public:
         const QVariant &value
     );
 
-    // 量一段文本需要多大。
+    // 量一个 item 需要多大 —— 文本的**唯一来源就是这个 item**，
+    // Rust 那边不再另存一份字符串。
+    //
+    // 判据是「它自己有没有一段要显示的文字」：有没有一个能读成 QString 的
+    // text 属性（走 meta-object，因为 brew 不发 QQuickText 的头，
+    // qobject_cast 用不了）。不上手就返回 {0, 0}
+    // （Rectangle / Item 的尺寸本该由 style 决定），
+    // 文本为空也返回 {0, 0} —— QTextLayout 对 "" 照样吐一行高，
+    // 少了这层判断，一个空标签会白占一行。
     //
     // max_width <= 0 表示不限宽（对应 QQuickText 里 widthValid() == false
     // 时把 lineWidth 设成 FLT_MAX 那条分支）。
-    TextMeasure measure_text(
-        rust::Str text,
+    //
+    // 注意这里**不读** implicitWidth/Height：那两个值折行用的是 item 当前的
+    // width（qquicktext.cpp:834），而那个 width 正是布局要决定的东西。
+    TextMeasure measure_item(
+        QQuickItem *item,
         double max_width
+    ) const;
+
+    // 这个 item 是不是「有内容可量的文本项」。
+    // 布局本身不需要它（量不出来自然返回 0x0），
+    // 只有 verify_text_measurement 的对照需要，免得把 Rectangle 也拿去比。
+    bool is_text_item(
+        QQuickItem *item
     ) const;
 
     // 读一个已存在对象的 implicit size —— 只为了做对照。

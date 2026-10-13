@@ -126,6 +126,11 @@ use taffy::prelude::{
 #[cxx::bridge]
 mod ffi {
     unsafe extern "C++" {
+        include!("cxx-qt-lib/qvariant.h");
+        /// QString from cxx_qt_lib
+        type QVariant = cxx_qt_lib::QVariant;
+    }
+    unsafe extern "C++" {
         include!(
             "test_dioxus_qt/cpp/qt_host.h"
         );

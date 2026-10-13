@@ -6,6 +6,7 @@
 #include <memory>
 
 class QObject;
+class QVariant;
 
 class QtHost {
 public:
@@ -63,7 +64,7 @@ public:
     void set_property(
         std::uint64_t id,
         rust::Str name,
-        rust::Str value
+        const QVariant &value
     );
 
 private:

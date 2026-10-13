@@ -383,7 +383,7 @@ void
 QtHost::set_property(
     std::uint64_t id,
     rust::Str name,
-    rust::Str value
+    const QVariant &value
 )
 {
     QObject* object =
@@ -409,13 +409,13 @@ QtHost::set_property(
     if (
         !object->setProperty(
             property.constData(),
-            to_qstring(value)
+            value
         )
     ) {
         qWarning()
             << "[Qt] cannot set property"
             << property
             << "="
-            << to_qstring(value);
+            << value;
     }
 }

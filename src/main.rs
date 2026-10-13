@@ -77,23 +77,30 @@
 //!   → `qt_pump_poll` 把 `wait_for_work` poll 到 Pending 为止，空闲时零轮询；
 //! - 输入侧走真事件，而且是**唯一的**纸条来源：
 //!   `create_event_listener` 在 QQuickItem 上装 `ClickFilter`，
-//!   鼠标按下 → `qt_handle_event` → `runtime().handle_event("click", ...)`
-//!   → listener 写 signal → wake → 渲染。
+//!   按下 → 在同一个元素里松开 → `qt_handle_event`
+//!   → `runtime().handle_event("click", ...)` → listener 写 signal
+//!   → wake → 渲染。「按下+松开才算一次 click」这套判据是照抄
+//!   `QQuickMouseArea::setPressed()` 的，对照写在 cpp/qt_host.cpp 里
+//!   ClickFilter 的上方。
 //!   以前那个每 200ms 推一格的假事件源（QTimer + DIFF_SCRIPT + send_click_to）
 //!   整条删掉了，`app()` 现在就是个 counter，不点不动。
 //!
 //! 还缺的：
 //!
-//! - 监听器只认 `QEvent::MouseButtonPress`：名字是 Dioxus 给什么就存什么、
-//!   回调时原样交回去，所以 `onkeydown` 这种也会装上一个「鼠标按下才响」的
-//!   filter —— 真要做别的输入，得让 `ClickFilter` 分清事件类型。
+//! - 事件类型只有 click 这一支：别的事件名（`onmouseover` / `onkeydown` …）
+//!   在 `create_event_listener` 门口就被拒绝并打日志，不装 filter ——
+//!   以前是照装，于是「鼠标按下的那一刻跑 mouseover」这种错会静默发生。
+//!   真要做别的输入，得先让 `ClickFilter` 分清事件类型，再放开那道拒绝。
+//! - 负载还是残缺的：修饰键永远交 `Modifiers::empty()`，
+//!   坐标系只有一套（client/screen/page/element 全填 item 本地坐标）。
+//!   按键身份（button / buttons）现在带上路了。
 //! - 窗口 resize 没有触发重排；字体还是 Qt 自己的默认值，
 //!   没和 `measure_item` 用同一个来源（现在两边都是「item 上那个默认字体」，
 //!   所以量出来刚好对得上；一旦 font 变成 Rust 下发的样式，两处要一起改）；
 //!   `AttributeValue::{Int, Float, Bool, None}` 在属性过滤那步被丢掉。
-//! - 因为事件源只剩鼠标，offscreen 跑起来之后日志里不会再有渲染 ——
-//!   回路醒着但没人叫醒它。click→handle_event→渲染那一段的回归测试
-//!   搬到了 `mod tests` 里（不碰 Qt，直接在 VirtualDom 上派发事件）。
+//! - 因为事件源只剩鼠标（而且要松开才算），offscreen 跑起来之后日志里
+//!   不会再有渲染 —— 回路醒着但没人叫醒它。click→handle_event→渲染那一段
+//!   的回归测试搬到了 `mod tests` 里（不碰 Qt，直接在 VirtualDom 上派发事件）。
 
 use cxx::UniquePtr;
 
@@ -166,6 +173,7 @@ use dioxus::html::geometry::{
 use dioxus::html::input_data::{
     MouseButton,
     MouseButtonSet,
+    decode_mouse_button_set,
 };
 
 use std::cell::RefCell;
@@ -422,8 +430,9 @@ mod ffi {
             parent: *mut QQuickItem,
         ) -> Vec<u64>;
 
-        // 给一个 item 装「谁按了我」的 event filter，
-        // 按下去就回调 Rust 的 qt_handle_event(name, element)。
+        // 给一个 item 装「谁点了我」的 event filter：
+        // 按下记在账上，在同一个元素里松开才回调
+        // Rust 的 qt_handle_event(name, element, x, y, button, buttons)。
         unsafe fn add_click_listener(
             self: Pin<&mut QtHost>,
             item: *mut QQuickItem,
@@ -457,13 +466,18 @@ mod ffi {
         // 回路本身：poll 一次 wait_for_work，醒了才渲染。
         fn qt_pump_poll();
 
-        // Qt 的 event filter 检测到了按下，把「谁被按了 + 在哪」交回 Rust。
+        // Qt 的 event filter 认出了「在这个 item 上按下、并且在同一个元素里松开」，
+        // 把谁被点了 + 在哪 + 哪个键交回 Rust。
         // element 是 add_click_listener 当初登记的那个 ElementId。
+        // button / buttons 是 Qt 的位掩码（Qt::LeftButton == 0x1 …），
+        // 正好和浏览器 MouseEvent.buttons 的那几位同序，见 QtMouseData。
         fn qt_handle_event(
             name: &str,
             element: u32,
             x: f64,
             y: f64,
+            button: i32,
+            buttons: i32,
         );
     }
 }
@@ -3011,16 +3025,31 @@ impl WriteMutations for QtRenderer {
     // Dioxus 说：这个 ElementId 身上挂了一个事件监听器（rsx 里的 onclick）。
     //
     // 我们把它翻译成「在对应的那个 QQuickItem 上装一个 event filter」，
-    // filter 认出按下就回调 qt_handle_event(name, element)。
+    // filter 认出「按下并且在同一个元素里松开」就回调 qt_handle_event(name, element)。
     //
-    // name 是 rsx 属性名（onclick 的话 dioxus 那边给的是什么，见
-    // qt_handle_event 上方的说明）—— 我们只把它当字符串原样存着，
+    // name 是 Dioxus 把 rsx 属性名剥掉 `on` 之后交过来的（diff/node.rs:533），
+    // 所以 onclick 到这里已经是 "click"。我们只把它当字符串原样存着，
     // 回调时再交回给 Rust，由 Rust 决定往 runtime 里送什么。
     fn create_event_listener(
         &mut self,
         name: &'static str,
         id: ElementId,
     ) {
+        // 只认 click 这一种。不做这道判断的后果不是「没反应」，是「反应错」：
+        // filter 只吃鼠标事件（cpp 里 ClickFilter 那台状态机），
+        // 而 dioxus 派发时只比名字（runtime.rs:435 `attr.name.get(2..) == Some(name)`），
+        // 所以一个 onmouseover 会被装成「按下就响」的监听器 —— 名字对得上，
+        // handler 就真跑起来了，静默地跑错时机。
+        if name != "click" {
+            println!(
+                "[Dioxus] CreateEventListener {name} id={} \
+                 只实现了 click，不装 filter（这个监听器不会响）",
+                id.0
+            );
+
+            return;
+        }
+
         let Some(node) = self.lookup(id) else {
             println!(
                 "[Dioxus] CreateEventListener {name} id={} \
@@ -3162,8 +3191,9 @@ impl WriteMutations for QtRenderer {
 // 我们的 waker 只做一件事：让 Qt 把「再 poll 一次」排进事件队列
 // （C++ 的 schedule_pump_poll）。于是空闲时一次 poll 都不会发生 ——
 // 连那个每 200ms 推一格的假事件源 QTimer 也已经删了：
-// 现在纸条只有一个来源，就是窗口里的鼠标按下
-// （ClickFilter → qt_handle_event → runtime().handle_event）。
+// 现在纸条只有一个来源，就是窗口里的一次点击
+// （按下、并且在同一个元素里松开 → ClickFilter → qt_handle_event
+//  → runtime().handle_event）。
 
 /// 纸条到了该干什么：把「再 poll 一次」排队交给 Qt 的事件循环。
 ///
@@ -3224,7 +3254,7 @@ fn install_pump(
 
     println!(
         "[pump] 回路装好了（wake 驱动、零轮询）：\
-         纸条的唯一来源是窗口里的鼠标按下"
+         纸条的唯一来源是窗口里的一次点击（按下再松开）"
     );
 
     // 先把 waker 交出去。
@@ -3304,7 +3334,7 @@ fn qt_pump_poll() {
 
 
 // ============================================================
-// 事件：Qt 的鼠标按下 → dioxus 的 listener
+// 事件：Qt 的一次点击（按下再松开）→ dioxus 的 listener
 // ============================================================
 //
 // 这条链上有三个名字要对齐，都是从源码里读出来的，别改错：
@@ -3341,6 +3371,13 @@ struct QtMouseData {
     /// item 本地坐标（QMouseEvent::position()）
     x: f64,
     y: f64,
+    /// 这一次换了状态的那个键，Qt 的位掩码（QMouseEvent::button()）：
+    /// Left 0x1 / Right 0x2 / Middle 0x4 / Back 0x8 / Forward 0x10。
+    button: i32,
+    /// 事件那一刻还按着的键串，同样是位掩码（QMouseEvent::buttons()）。
+    /// click 是从松开派发的，所以这里一般是 0 —— 和浏览器的
+    /// MouseEvent.buttons 在 release 上为空是一致的。
+    buttons: i32,
 }
 
 impl InteractionLocation for QtMouseData {
@@ -3373,15 +3410,20 @@ impl ModifiersInteraction for QtMouseData {
 }
 
 impl PointerInteraction for QtMouseData {
-    // filter 只认 MouseButtonPress，而且我们只把主键当「点了」；
-    // 中键/右键也在这个类型里报成 Primary —— 要分就得让 ClickFilter
-    // 把 mouse->button 一起带过来（现在只带了坐标）。
+    // 不用换算：Qt 那几位和浏览器 MouseEvent.buttons 的位是同一套
+    // （Qt::LeftButton 0x1 / Right 0x2 / Middle 0x4 / Back 0x8 / Forward 0x10，
+    // 对照 dioxus-html input_data.rs:68-92 的 decode_mouse_button_set，
+    // 那边是 0b1 primary / 0b10 secondary / 0b100 auxiliary / 0b1000 / 0b10000）。
+    // 注意 dioxus 的 from_web_code 走的是另一套（button 序号 0/1/2，
+    // 而且 1 是 auxiliary、2 是 secondary），我们交的是位掩码，不是序号。
     fn trigger_button(&self) -> Option<MouseButton> {
-        Some(MouseButton::Primary)
+        decode_mouse_button_set(self.button as u16)
+            .iter()
+            .next()
     }
 
     fn held_buttons(&self) -> MouseButtonSet {
-        [MouseButton::Primary].into()
+        decode_mouse_button_set(self.buttons as u16)
     }
 }
 
@@ -3407,7 +3449,7 @@ macro_rules! unhandled_events {
                 _event: &PlatformEventData,
             ) -> $data {
                 panic!(
-                    "本项目只派发鼠标按下，{} 没有实现",
+                    "本项目只派发点击（按下再松开），{} 没有实现",
                     stringify!($method)
                 )
             }
@@ -3463,7 +3505,7 @@ fn install_event_converter() {
 }
 
 
-/// Qt 的 event filter 送上来的按下。
+/// Qt 的 event filter 认出一整次点击之后送上来的（按下 + 在同一个元素里松开）。
 ///
 /// 名字是 C++ 那边原样带回来的（CreateEventListener 当初收到什么，
 /// filter 就存什么），所以这里的 `name` 已经是剥掉 `on` 的形式。
@@ -3476,6 +3518,8 @@ fn qt_handle_event(
     element: u32,
     x: f64,
     y: f64,
+    button: i32,
+    buttons: i32,
 ) {
     PUMP.with(|slot| {
         let mut guard = slot.borrow_mut();
@@ -3507,7 +3551,12 @@ fn qt_handle_event(
         );
 
         let payload: std::rc::Rc<dyn std::any::Any> = std::rc::Rc::new(
-            PlatformEventData::new(std::boxed::Box::new(QtMouseData { x, y })),
+            PlatformEventData::new(std::boxed::Box::new(QtMouseData {
+                x,
+                y,
+                button,
+                buttons,
+            })),
         );
 
         // propagates = true：click 在 dioxus-html 里是会冒泡的事件
@@ -3516,7 +3565,7 @@ fn qt_handle_event(
 
         println!(
             "[event] handle_event({name:?}, ElementId({element})) \
-             坐标 ({x:.1}, {y:.1})"
+             坐标 ({x:.1}, {y:.1}) button 0x{button:x}"
         );
 
         runtime.handle_event(
@@ -3655,7 +3704,7 @@ fn main() {
     // （store → mark_all_dirty → render_immediate → relayout → dump_tree），
     // 再后来是 QTimer 每 200ms 推一格 —— 那些现在都没有了。剩下的形状是：
     //
-    //     窗口里的鼠标按下 → ClickFilter → qt_handle_event
+    //     窗口里的一次点击 → ClickFilter → qt_handle_event
     //     → runtime().handle_event(...)（runtime.rs:369）
     //     → listener 写 signal → 纸条 → 我们的 waker
     //     → C++ schedule_pump_poll() → 排一个 Qt 事件
@@ -3805,6 +3854,10 @@ mod tests {
             PlatformEventData::new(std::boxed::Box::new(QtMouseData {
                 x: 0.0,
                 y: 0.0,
+                // 和真左键松开来的一样：0x1 == Qt::LeftButton，
+                // buttons 在松开这一刻是空的。
+                button: 0x1,
+                buttons: 0,
             })),
         );
 

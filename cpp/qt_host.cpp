@@ -119,10 +119,44 @@ QQuickItem* instantiate(
 } // namespace
 
 
-// 一个「谁被按了」的转发器。
+// 一个「谁被点了」的转发器。
 //
 // 没有 Q_OBJECT 宏 —— 我们只重写 QObject::eventFilter 这个虚函数，
 // 不需要信号/槽，也就不需要 moc（cxx-qt-build 没跑 moc 这一步）。
+//
+// 「点了一下」的判据是照抄 QQuickMouseArea 的（qtdeclarative/src/quick/items/
+// qquickmousearea.cpp）：
+//
+//     setPressed() :1243-1244
+//         bool wasPressed = d->pressed & button;
+//         bool isclick = wasPressed && p == false && dragged == false
+//                        && d->hovered == true;
+//     :1282-1287  只有 isclick 才 emit clicked
+//     mousePressEvent :629-644   记 pressed 状态，不派发 clicked
+//     mouseReleaseEvent :756-765 松开才走 setPressed(..., false)
+//
+// 所以是「按下记下、松开才算」，两个条件：
+//   1. 松开的是刚才按下的那个键（wasPressed）；
+//   2. 松开那一刻指针还在元素里（hovered —— MouseArea 在 mouseMoveEvent
+//      里用 setHovered(contains(event->position())) 刷新，:660；
+//      我们不等 move 来刷新状态，直接在松开的那一刻算
+//      m_item->contains(mouse->position())：同一个判据，少一份状态。
+//      contains() 拿的是**元素本地坐标**，比的是 0..width/0..height
+//      （items/qquickitem.cpp:8929-8931），而送进这个 filter 的
+//      QMouseEvent 已经被派发器按 item 本地化过了
+//      （util/qquickdeliveryagent.cpp:2553 localizePointerEvent），
+//      所以 mouse->position() 正好是它要的那种坐标。
+//
+// 三条我们和 MouseArea 不一样的地方，都是有意的：
+//   - dragged / longPress 两支恒为假：本项目没有 drag、也没有
+//     pressAndHold 定时器，所以不必进判据。
+//   - 松手在元素外时，MouseArea 靠 mouseUngrabEvent()（:920）把 pressed
+//     清掉；那个通知是 QQuickDeliveryAgent 直接调虚函数，不是 QEvent，
+//     filter 看不见。我们的 pressed 位会留在身上，但下一对按下/松开会重新
+//     覆盖它，代价只可能是一次多余的判定，不会漏发。
+//   - 双击：Qt 发的是 press/release(DblClick)/release，第二次松开没有配对的
+//     按下，被 1. 挡掉 —— 也就是双击只算一次 click，和 MouseArea 没实现
+//     doubleClicked 时的行为一致（浏览器会算两次，这里不跟）。
 class ClickFilter : public QObject
 {
 public:
@@ -131,13 +165,14 @@ public:
         const std::string& name,
         std::uint32_t element
     )
-        : m_item(item)
+        : QObject(item)
+        , m_item(item)
         , m_name(name)
         , m_element(element)
     {
-        // 所有权挂在 item 上：item 被 destroy（deleteLater）时
-        // ~QObject 递归删孩子，这个 filter 跟着走，不会悬空。
-        setParent(item);
+        // 所有权挂在 item 上（构造时直接当 parent 传进去）：
+        // item 被 destroy（deleteLater）时 ~QObject 递归删孩子，
+        // 这个 filter 跟着走，不会悬空。
     }
 
     const std::string& name() const { return m_name; }
@@ -146,39 +181,120 @@ public:
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override
     {
-        if (event->type() != QEvent::MouseButtonPress) {
+        switch (event->type())
+        {
+        // 按下：只记账，不派发 —— 一次 click 要等松开（判据见类上面）。
+        //
+        // 但必须把这一事件 accept 掉，因为松开那一发根本不会送到我们手上，
+        // 除非这个 item 拿到了 mouse grab：
+        //   · 派发器在「事件被接受」之后才把按下的 item 立成独占 grabber
+        //     （util/qquickdeliveryagent.cpp:2550 先 accept、:2555 查 isAccepted、
+        //     :2568-2569 `point.state() == Pressed` 才 setExclusiveGrabber）；
+        //   · 而收尾事件只发给持有 grab 的 item
+        //     （:2534-2536「If all points are released and the item is not the
+        //     grabber, it doesn't get the event」—— isEndEvent 且不是
+        //     exclusiveGrabber 就 return）。
+        // 裸 QQuickItem 的 mousePressEvent 是空实现，不会自己 accept，
+        // 所以这一句是「按下+松开」能不能成立的前提。
+        // MouseArea 干的是同一件事：mousePressEvent :644
+        // `event->setAccepted(setPressed(...))`。
+        //
+        // 一条实测边界，别当耳边风：用**没有 device 的合成 QMouseEvent**
+        // 走窗口路由（离屏探针就是这么发的）时，press 能到 filter，
+        // release 到不了（grab 那一步还看 point 状态，合成事件给不出真 device）。
+        // 所以验证这套判据时 release 只能直送 item（绕过命中测试，
+        // 只驱动状态机），命中测试那一半另外用 press 验；
+        // 完整的一条链要真鼠标才有，离屏替不了。
+        case QEvent::MouseButtonPress:
+        {
+            auto *mouse = static_cast<QMouseEvent *>(event);
+
+            m_pressed |= mouse->button();
+
+            mouse->accept();
+
+            qDebug()
+                << "[Qt] press on" << watched
+                << "button" << int(mouse->button())
+                << "记下了，element" << m_element
+                << "（按下不派发）";
+
             return false;
         }
 
-        auto *mouse = static_cast<QMouseEvent *>(event);
+        // 松开：两个条件都过了才算一次 click。
+        case QEvent::MouseButtonRelease:
+        {
+            auto *mouse = static_cast<QMouseEvent *>(event);
 
-        // 坐标一并带上：dioxus 那边的 MouseData 要读 element/client 坐标，
-        // 只传「谁被按了」是个残缺的负载。
-        const QPointF local = mouse->position();
+            const Qt::MouseButton button = mouse->button();
 
-        rust::Str str(m_name.c_str(), m_name.size());
+            const bool was_pressed = (m_pressed & button) != Qt::NoButton;
 
-        qDebug()
-            << "[Qt] click on" << watched
-            << "at" << local
-            << "-> dispatch" << m_name.c_str()
-            << "element" << m_element;
+            m_pressed &= ~button;
 
-        qt_handle_event(
-            str,
-            m_element,
-            static_cast<double>(local.x()),
-            static_cast<double>(local.y())
-        );
+            if (!was_pressed) {
+                // 没有配对的按下（比如 grab 被抢走之后迟到的松开、
+                // 或者双击的第二次松开），丢掉。
+                return false;
+            }
 
-        // false = 不吃这个事件，Qt 继续按它自己的规矩处理。
-        return false;
+            const QPointF local = mouse->position();
+
+            if (!m_item->contains(local)) {
+                qDebug()
+                    << "[Qt] release at" << local
+                    << "在" << watched << "外面，不算 click";
+
+                return false;
+            }
+
+            rust::Str str(m_name.c_str(), m_name.size());
+
+            qDebug()
+                << "[Qt] click on" << watched
+                << "at" << local
+                << "button" << int(button)
+                << "-> dispatch" << m_name.c_str()
+                << "element" << m_element;
+
+            // buttons（按着不放的那一串）松开时通常是空的，
+            // 交过去让 Rust 侧原样解码成 held_buttons。
+            qt_handle_event(
+                str,
+                m_element,
+                static_cast<double>(local.x()),
+                static_cast<double>(local.y()),
+                int(button),
+                int(mouse->buttons())
+            );
+
+            // 这一对已经当作一次 click 用掉了，accept 掉免得祖先元素
+            // 又把它当成自己的一次点击（祖先那份由 dioxus 的冒泡去管：
+            // runtime.rs:430-446 会沿着 vdom 路径把父上的同名 listener 收进来）。
+            mouse->accept();
+
+            return false;
+        }
+
+        // 双击的中间那一下：我们不实现 doubleClicked，
+        // 也不让它把 pressed 记成一次新的按下（否则第二次松开会补出一个 click）。
+        case QEvent::MouseButtonDblClick:
+            return false;
+
+        default:
+            return false;
+        }
     }
 
 private:
     QQuickItem* m_item;
     std::string m_name;
     std::uint32_t m_element;
+
+    // 照 MouseArea 的 d->pressed（qquickmousearea.cpp:1245 那套位运算）：
+    // 记的是「这个元素身上现在还按着哪些键」。
+    Qt::MouseButtons m_pressed = Qt::NoButton;
 };
 
 

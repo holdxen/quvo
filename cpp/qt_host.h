@@ -119,7 +119,11 @@ public:
     // 还会往 childItems 里多插一个我们账本上没有的节点
     // （child_order 的交叉检查立刻会 ✗）。
     // filter 装在 item 上：不占 visual tree，不吃事件（返回 false），
-    // 只负责「有人按在这上面了」这件事转告 Rust。
+    // 只负责「按下、并且在同一个元素里松开」这一对组合转告 Rust ——
+    // 判据照抄 QQuickMouseArea 的 clicked（见 cpp 里 ClickFilter 上方的对照）。
+    //
+    // name 现在只可能是 "click"：Rust 侧的 create_event_listener
+    // 只把 click 交到这里，别的事件名它当场拒绝、不装 filter。
     //
     // 但光装 filter 点不到：真鼠标要先过命中测试，那里把
     // acceptedMouseButtons() == Qt::NoButton 的项当不存在跳过
@@ -134,7 +138,7 @@ public:
 
     // 撤掉 add_click_listener 装的那个 filter（removeEventFilter + delete）。
     // 不做的话：节点被 destroy 之后 filter 还挂在事件线上 ——
-    // filter 本身是 item 的 QObject 孩子（构造时 setParent 过），
+    // filter 本身是 item 的 QObject 孩子（构造时把 item 当 parent 传进去了），
     // 会跟着一起析构，但「同一格重挂两次」得靠这个先撤掉旧的。
     void remove_click_listener(
         QQuickItem* item,

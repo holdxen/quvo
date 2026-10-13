@@ -85,6 +85,24 @@ QQuickItem* instantiate(
         << "at" << item
         << "but NOT mounted yet";
 
+    // 每个建出来的对象都报一声「我死了」。
+    //
+    // 这不是装饰：Rust 侧现在握的是裸指针，「destroy 到底有没有真的
+    // 把对象释放掉」在外面是看不见的。~QObject 会先对本对象发
+    // destroyed，再递归删 QObject 孩子们（qobject.cpp），
+    // 所以父先子后的三行日志同时证明了「删了」和「子树跟着没了」。
+    QObject::connect(
+        item,
+        &QObject::destroyed,
+        [label](QObject *object)
+        {
+            qDebug()
+                << "[Qt] object destroyed"
+                << label
+                << object;
+        }
+    );
+
     return item;
 }
 
@@ -100,9 +118,11 @@ struct QtHost::Impl {
     // 这里不再存 id -> 对象的表：指针本身就是句柄，
     // Rust 侧拿着它直接调下面的方法。
     //
-    // 代价是「没 mount 出去的对象」从此没人负责释放了。
-    // 现在这条路上每个建出来的节点都会被挂上，所以没有泄漏；
-    // 真要不泄漏得等 C++ 侧有 destroy（remove_node 那一版）。
+    // 于是对象的生命周期只有两个去处：
+    //     mount 过 → Qt 的 parent tree 负责，随窗口析构；
+    //     被 destroy → deleteLater，随事件循环释放。
+    // 唯一还漏的情况是「建出来但从没挂、也没被 destroy」——
+    // 现在这条路径不存在（每个建出来的节点最后都会挂出去）。
     ~Impl() = default;
 };
 
@@ -233,6 +253,37 @@ QtHost::mount(
     qDebug()
         << "[Qt] mount" << child
         << "into parent" << parent;
+}
+
+
+void
+QtHost::destroy(
+    QQuickItem* item
+)
+{
+    if (item == nullptr) {
+        return;
+    }
+
+
+    // 先立刻脱离两棵树：视觉上它当场就没了，
+    // 父节点的 childItems 也不再含着它 —— 这两步不等事件循环。
+    item->setParentItem(nullptr);
+    item->setParent(nullptr);
+
+
+    // 内存的释放推给事件循环，理由（QObject::deleteLater 的文档同款）：
+    // 以后这套 mutation 是在 Qt 的事件处理里跑下来的，
+    // 「点了某个节点 → 重渲染正好把它删掉」这条路上当场 delete，
+    // 事件还在往它身上派，就是 use-after-free。
+    //
+    // 于是日志里会先看到「destroy scheduled」，
+    // 等 exec() 转起来才有对应的「object destroyed」。
+    item->deleteLater();
+
+
+    qDebug()
+        << "[Qt] destroy scheduled" << item;
 }
 
 

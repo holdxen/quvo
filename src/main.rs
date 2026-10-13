@@ -57,7 +57,7 @@
 //! ## 阅读顺序建议
 //!
 //! 1. `app()` —— 用户写的 UI 就三行
-//! 2. `mod ffi` —— Rust 能让 C++ 做的全部六件事
+//! 2. `mod ffi` —— Rust 能让 C++ 做的全部十六件事
 //! 3. `QtRenderer` 的三个字段 —— renderer 记了哪三本账
 //! 4. `impl WriteMutations` —— 指令如何变成 Qt 调用（核心）
 //! 5. `main()` —— 拼起来的顺序
@@ -65,14 +65,18 @@
 //!
 //! ## 当前边界（重要）
 //!
-//! 只跑通了 mount（首次渲染）这一条路，diff（更新）那条路是断的：
+//! mount（首次渲染）整条路是通的；diff 只通了一条分支：
 //!
-//! - 更新路径要用的 `replace_node_with` / `remove_node` /
-//!   `insert_nodes_after` / `insert_nodes_before` 在本文件里还是 panic；
-//! - `main()` 里没有把 Dioxus 的异步 runtime 接到 Qt 的事件循环上，
-//!   signal 变了没人去唤醒 VirtualDom。
+//! - `remove_node` 实现了，配套的 C++ `destroy` 也在 ——
+//!   `main()` 第 4.7 步会手动驱动一次「列表变短」来看它真的删了对象；
+//! - `replace_node_with` / `insert_nodes_after` / `insert_nodes_before`
+//!   在本文件里还是 panic；
+//! - `assign_node_id` 是空的，所以模板深处的静态元素没有 ElementId，
+//!   给它们的更新会被静丢掉；
+//! - 输入侧还是 0：事件监听是空实现，`main()` 里也没有东西去 poll
+//!   VirtualDom —— 第 4.7 步那次 diff 是手动推的，不是自己变的。
 //!
-//! 所以现在是「渲染一次就定住」。详见 `main()` 上方的注释。
+//! 详见 `main()` 的注释。
 
 use cxx::UniquePtr;
 
@@ -91,6 +95,11 @@ use dioxus::dioxus_core::{
 use dioxus::prelude::*;
 
 use std::collections::HashMap;
+use std::sync::atomic::{
+    AtomicUsize,
+    Ordering,
+};
+
 
 use taffy::prelude::{
     AvailableSpace,
@@ -113,19 +122,25 @@ use taffy::compute_leaf_layout;
 // Rust <-> C++ Qt bridge
 // ============================================================
 //
-// 这六个函数就是 renderer 能对 Qt 做的全部事情。
+// 这十六个函数就是 renderer 能对 Qt 做的全部事情。
 // 一次完整的首次渲染，调用顺序是：
 //
 //     new_qt_host()          建 QtHost：内部有 QQuickWindow + QQmlEngine
 //     show()                 窗口先显示，之后边建边能看见
+//     root_item()            问窗口根（contentItem）要指针，node 0 用它
 //
 //     create_text /
 //     create_rectangle       每碰到一个元素就实例化一个 Qt 对象；
-//                            此刻它还没有 parent，等于屏幕上不存在
+//     / create_column        此刻它还没有 parent，等于屏幕上不存在
 //     set_property()         写属性。静态属性在建对象时就写，
 //                            动态属性由 Dioxus 稍后补发
 //     mount()                挂进 visual tree —— 到这一步才真的可见
 //     stack_before()         调同一 parent 下的叠放顺序
+//     destroy()              diff 之后把这棵子树从 Qt 里拿掉
+//
+//     measure_text()         布局时问 Qt「这段字要多大」
+//     implicit_width/height  只用于对照：读 Qt 对象自己算的尺寸
+//     window_width/height    视口尺寸
 //
 // 注意「建对象」和「挂到树上」被刻意拆成两步：
 // Dioxus 会先把一棵子树整个 LoadTemplate 出来（还没 parent），
@@ -211,6 +226,17 @@ mod ffi {
             self: Pin<&mut QtHost>,
             parent: *mut QQuickItem,
             child: *mut QQuickItem,
+        );
+
+        // 把这个对象从两棵树上摘掉并安排释放。
+        //
+        // 一次调用管一整棵子树：mount 时 setParent 过，
+        // 孩子是 QObject 树里的人，~QObject 递归删。
+        // 所以 Rust 这边是「remove 那个节点」调一次，
+        // 子树里剩下的节点只清自己的账，不再碰 Qt。
+        unsafe fn destroy(
+            self: Pin<&mut QtHost>,
+            item: *mut QQuickItem,
         );
 
         // 让 child 在叠放顺序上排到 sibling 前面。
@@ -377,15 +403,34 @@ fn Rectangle(
 //    在 set_attribute 里记账。
 //
 // 3. <qt-column> 的模板里现在有「两个洞」
-//    （Text 和 Rectangle 都是组件调用 → 各是一个 Dynamic 节点）：
+//    （Text 是一个组件调用；for 循环整块是另一个 Dynamic 节点）：
 //
 //        node_paths = [ [0,0], [0,1] ]
 //
 //    所以 ReplacePlaceholder 会被调用两次，而且 Dioxus 是
 //    倒着发的（先 [0,1] 再 [0,0]）—— 正好是那条不变式的活教材。
+//    第二个洞一次顶上来 m 个节点（m = 当前矩形个数）。
+
+// 矩形个数 —— 这是给「手动 diff」用的旋钮，不是 UI 状态的正道。
+//
+// 正道是 signal + 事件回路：signal 变了 → 有人 poll VirtualDom →
+// render_immediate 出 diff。那条回路还没接（下一步），
+// 所以这里用个静态开关，让 main() 能确定地推动一次「列表变短」，
+// 好验证 Remove → destroy 这半条链路。
+//
+// 为什么非得是「列表变短」：非 keyed 的孩子数量减少时，
+// dioxus-core 发的是单独的 Remove（diff/iterator.rs:57
+// → diff/mod.rs:87 传的 replace_with = None），
+// 而不是 ReplaceWith —— 正好是我们要走的那条分支。
+static RECTANGLE_COUNT: AtomicUsize = AtomicUsize::new(2);
 
 fn app() -> Element {
     // 没有 main.qml，也没有 QML 的 Layout / anchors。
+    let count = RECTANGLE_COUNT
+        .load(Ordering::Relaxed);
+
+    println!("[app] 被渲染，矩形数 = {count}");
+
     rsx! {
         qt-column {
             width: "600",
@@ -397,9 +442,23 @@ fn app() -> Element {
                 text: "Hello from Dioxus -> Qt Quick (taffy layout)",
             }
 
-            Rectangle {
-                width: 200.0,
-                height: 40.0,
+            for _ in 0..count {
+                // 每个条目刻意做成「一个容器 + 一个孩子」，也就是 2 个节点的一棵小子树。
+                // 这样 Remove 一次带走 2 个节点，而 destroy 只调用一次 ——
+                // 日志里应该出现 1 行 destroy scheduled + 2 行 object destroyed，
+                // 那就同时证明了三件事：
+                //     孩子确实是 QObject 的孩子（跟着父亲递归析构）、
+                //     我们的账本整棵子树都清干净了、
+                //     没有「每个节点各调一次 destroy」造成双重释放。
+                qt-column {
+                    width: "200",
+                    height: "40",
+
+                    Rectangle {
+                        width: 200.0,
+                        height: 40.0,
+                    }
+                }
             }
         }
     }
@@ -421,6 +480,11 @@ fn app() -> Element {
 // children 的顺序就是 Dioxus 模板里的顺序，占位节点也占一格 ——
 // resolve_slot 拿 path 的下标直接索引它，顺序错一个就全错。
 //
+// parent 是 children 的反向账。为什么非记不可：
+// Dioxus 的 `Remove` 只给一个 ElementId（mutations.rs:112），
+// 「它是谁的孩子」这件事 Qt 知道（parentItem）但我们不知道，
+// 不记就只能在所有节点里线性找一个 —— 而 remove 是热路径。
+//
 // 根节点的 object 是 window.contentItem()（由 root_item() 拿到的真实指针）。
 // 以前这里是约定的 id 0，C++ 那边再翻译回 contentItem；
 // 现在两层是同一个东西，没有那层翻译了。
@@ -428,6 +492,9 @@ fn app() -> Element {
 #[derive(Default)]
 struct Node {
     object: Option<QQuickItemId>,
+
+    // 父节点的 node id；根节点和「还没挂上去的模板根」是 None
+    parent: Option<u64>,
 
     // 子节点的 node id，按模板顺序
     children: Vec<u64>,
@@ -588,6 +655,7 @@ impl QtRenderer {
             0,
             Node {
                 object: Some(root_item),
+                parent: None,
                 children: Vec::new(),
                 taffy: Some(root_taffy),
                 style: vec![
@@ -658,6 +726,7 @@ impl QtRenderer {
             id,
             Node {
                 object,
+                parent: None,
                 children: Vec::new(),
                 taffy,
                 style: Vec::new(),
@@ -1364,6 +1433,13 @@ impl QtRenderer {
             .children
             .push(child);
 
+        // 反向账跟上。Remove 只能拿到 ElementId，
+        // 「这个孩子从哪个 vec 里摘」全靠这一行。
+        self.nodes
+            .get_mut(&child)
+            .expect("unknown child node")
+            .parent = Some(parent);
+
 
         // Qt 侧：把 child 的对象挂到 parent 的对象下。
         //
@@ -2037,6 +2113,16 @@ impl WriteMutations for QtRenderer {
         };
 
 
+        // 顶上来的这些孩子现在有父亲了 —— 反向账补上。
+        // （借用得等上面那个块结束：children 和 nodes.get_mut 撞车。）
+        for new in new_nodes.iter() {
+            self.nodes
+                .get_mut(new)
+                .expect("unknown node")
+                .parent = Some(parent);
+        }
+
+
         // 坑位节点本身作废：从账本里删掉，
         // 并把指向它的 ElementId 映射清空
         // （不删的话 object_of 之类会命中一个不在树里的节点）。
@@ -2209,12 +2295,104 @@ impl WriteMutations for QtRenderer {
     }
 
 
+    // Dioxus 说：把这个节点连同它整棵子树从 UI 里拿掉。
+    //
+    // 两条从源码里抠出来的契约，决定了下面为什么这么写：
+    //
+    // 1. 子树里嵌套的动态节点**不会**再各发一条 Remove
+    //    （diff/node.rs:285-288「We don't generate mutations for these,
+    //    as they will be removed by the parent」）。
+    //    所以 Qt 那边只要删掉根就够（~QObject 递归删孩子），
+    //    但我们自己的账必须整棵子树一起清干净 ——
+    //    不然那些 Node 还挂在 nodes 里、taffy 树里也还有它们的布局节点。
+    //
+    // 2. 发完 Remove，Dioxus 立刻 `dom.reclaim(id)`（diff/node.rs:330）：
+    //    这个 ElementId 会被重新发出去给别的节点用，
+    //    所以映射必须清掉，否则 lookup 会把新 mutation 派给一个死节点。
+    //
+    // 顺带澄清一个容易搞错的地方：这里的 Remove 是「诀别」，不是 DOM 那种
+    // 「先摘下来留着待会儿插回去」。列表重排（移动）走的是另一条路：
+    // push_all_root_nodes + insert_nodes_*（diff/iterator.rs:343-375），
+    // 全程不发 Remove。
     fn remove_node(
         &mut self,
-        _id: ElementId,
+        id: ElementId,
     ) {
-        panic!(
-            "remove_node not implemented"
+        let Some(node) = self.lookup(id) else {
+            println!(
+                "[Dioxus] Remove id={} 找不到节点，跳过",
+                id.0
+            );
+
+            return;
+        };
+
+
+        // 1. 整棵子树拉平（占位节点也在里面：它没对象，
+        //    但它的账和布局位置都得跟着清）。
+        let mut subtree = Vec::new();
+        let mut walk = vec![node];
+
+        while let Some(current) = walk.pop() {
+            subtree.push(current);
+
+            walk.extend(
+                self.node(current).children.iter().copied()
+            );
+        }
+
+
+        // 2. 从父亲的孩子列表里摘掉这一格。
+        let parent = self.node(node).parent;
+
+        if let Some(parent) = parent {
+            if let Some(parent_node) =
+                self.nodes.get_mut(&parent)
+            {
+                parent_node
+                    .children
+                    .retain(|child| *child != node);
+            }
+
+            // 布局树的 children 以 Node.children 为准，整体重设一遍。
+            self.sync_taffy_children(parent);
+        }
+
+
+        // 3. Qt：只有子树的根需要说一声，孩子跟着它一起没。
+        if let Some(object) = self.node(node).object {
+            // SAFETY: 这是 create_* 给出来的指针，这一刻还没被删；
+            //            调用完 C++ 就把它从两棵树上摘掉了，
+            //            而下面我们连自己的账都不留 —— 没有别人会再碰它。
+            unsafe {
+                self.host
+                    .pin_mut()
+                    .destroy(object);
+            }
+        }
+
+
+        // 4. 每个节点：布局节点删掉、ElementId 清掉、Node 删掉。
+        //    taffy 的 remove 只管自己（taffy_tree.rs:672-686 会把孩子
+        //    的 parent 置空但不删孩子），所以子树里每个都要单独删，
+        //    先父后子也没关系：孩子那一刻仍是合法 id。
+        for current in subtree.iter() {
+            if let Some(taffy) = self.node(*current).taffy {
+                self.tree
+                    .remove(taffy)
+                    .expect("taffy: remove 失败");
+            }
+
+            self.forget_element_ids(*current);
+            self.nodes.remove(current);
+        }
+
+
+        println!(
+            "[Dioxus] Remove id={} → node {node}，\
+             连带子树 {} 个节点",
+            id.0,
+            subtree.len(),
         );
     }
 }
@@ -2224,8 +2402,9 @@ impl WriteMutations for QtRenderer {
 // Main
 // ============================================================
 //
-// 现在这个 main 只做了一次 mount，之后就交给 Qt 了。
-// 想让它「活」起来，缺的是第 5 步和第 6 步之间那条回路。
+// 现在这个 main 做了两轮渲染：第 4 步 mount，第 4.7 步手动驱动一次 diff
+// （只为了验证 Remove → destroy 那条链路，不是 UI 自己会变）。
+// 之后就交给 Qt 了。想让它真的「活」起来，缺的是第 5 步那条回路。
 //
 // 顺便说明为什么 Qt 和 Dioxus 谁当主循环：
 // 这里让 Qt 当（app.exec()），因为 QQuickWindow 的渲染、
@@ -2341,16 +2520,72 @@ fn main() {
 
 
     // --------------------------------------------------------
+    // 4.7 手动驱动一次 diff：把矩形从 2 个减到 1 个
+    //
+    // 为什么要「手动」：事件回路还没接（下一步），没有东西会去 poll
+    // VirtualDom，所以 UI 不会自己变。但 diff 的输出侧得先能跑起来
+    // 才谈得上回路，于是这里用三个公开 API 把它推过一遍：
+    //
+    //     RECTANGLE_COUNT.store(1)   让下一次渲染的树真的短一格
+    //     vdom.mark_all_dirty()      把所有 scope 标脏
+    //     vdom.render_immediate(...) 走 diff，吐出 Mutation::Remove
+    //
+    // 为什么是 mark_all_dirty 而不是 mark_dirty(ScopeId::ROOT)：
+    // VirtualDom::new_with_component（virtual_dom.rs:296）先把应用包了一层
+    // RootScopeWrapper，所以 scope 0 只是个壳，app 组件是它的**子 scope**。
+    // 只标壳的那个 scope，重跑时 diff 看到的是「同一个组件、props 没变」，
+    // 就不会再跑子 scope —— 一条 mutation 都不会发。
+    // （实测过：mark_dirty(ROOT) 之后 app() 根本没被再渲染第二次。）
+    //
+    // 为什么挑「非 keyed 列表变短」这个形状：它发出来的是单独的 Remove
+    // （diff/iterator.rs:57 → diff/mod.rs:87 那里 replace_with 是 None），
+    // 而不是 ReplaceWith —— 正是要验证的那条分支。
+    //
+    // 期待看到的顺序（前三行都在 exec() 之前）：
+    //     [app] 被渲染，矩形数 = 1
+    //     [Qt] destroy scheduled …        ← 已从两棵树摘掉，内存还没放
+    //     [Dioxus] Remove id=… → node …，连带子树 1 个节点
+    //     …（exec 转起来之后）
+    //     [Qt] object destroyed …          ← deleteLater 真跑了，同一地址
+    // --------------------------------------------------------
+
+    println!(
+        "\n===== 手动 diff：矩形 {} → 1 =====",
+        RECTANGLE_COUNT.load(Ordering::Relaxed)
+    );
+
+    RECTANGLE_COUNT.store(1, Ordering::Relaxed);
+
+    vdom.mark_all_dirty();
+
+    vdom.render_immediate(
+        &mut renderer
+    );
+
+    // 批量边界：diff 吐完了，重算一次布局。
+    // 被删掉的那些节点已经不在 nodes / taffy 里，
+    // 所以这一步不会再碰它们任何指针。
+    renderer.relayout();
+
+    println!(
+        "[driver] renderer 里还剩 {} 个节点\n",
+        renderer.nodes.len()
+    );
+
+
+    // --------------------------------------------------------
     // 5. Qt 接管主循环
     // --------------------------------------------------------
     //
-    // ⚠️ 到这里就结束了：后面没有任何东西再去碰 vdom。
+    // ⚠️ 从这里往后，没有任何东西会再去碰 vdom。
+    //    （第 4.7 步那次 diff 是 main 自己在 exec 之前手动推的，
+    //      不是回路跑起来的。）
     //
-    // 所以现在是「一次性渲染」：
-    //     - app() 里没有 signal，UI 本来也不会变；
+    // 所以现在是「渲染两轮就定住」：
+    //     - app() 里没有 signal，UI 本来也不会自己变；
     //     - 就算加了 signal，也没人 poll VirtualDom；
-    //     - 就算 poll 了，diff 发出的 ReplaceWith / Remove /
-    //       InsertAfter 在本文件里还是 panic。
+    //     - 就算 poll 了，diff 还会用到 ReplaceWith / InsertAfter /
+    //       InsertBefore，那三个在本文件里仍是 panic。
     //
     // 要接上的是这三件事，都在 Qt 的事件循环里做：
     //

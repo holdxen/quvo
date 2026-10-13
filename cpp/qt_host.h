@@ -53,6 +53,18 @@ public:
         QQuickItem* child
     );
 
+    // 把这个对象从两棵树上摘掉，并安排释放。
+    //
+    // 只在「这棵子树整个不要了」时调用一次 —— 不用逐个孩子调用：
+    // mount 时我们 setParent 过，孩子是 QObject 树里的人，
+    // ~QObject 会递归删（而 ~QQuickItem 只把 childItems 摘干净，
+    //  不负责删它们，见 qquickitem.cpp:2409）。
+    //
+    // Rust 侧调用完就把这些节点的账全忘了，所以指针不会被人再碰。
+    void destroy(
+        QQuickItem* item
+    );
+
     // 布局结果写给一个 QQuickItem。
     //
     // 这是几何的唯一入口：不走 set_property 的 QString 强转，

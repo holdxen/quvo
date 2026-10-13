@@ -257,6 +257,55 @@ QtHost::mount(
 
 
 void
+QtHost::place(
+    QQuickItem* parent,
+    QQuickItem* child,
+    QQuickItem* sibling
+)
+{
+    if (parent == nullptr || child == nullptr) {
+        return;
+    }
+
+
+    // 两棵树都要跟上：setParentItem 只管 visual tree，
+    // 它不会碰 QObject 的 parent（上面 setParentItem 的函数体里
+    // 只有 addChild/removeChild，没有 setParent）。
+    if (child->parentItem() != parent) {
+        child->setParent(parent);
+        child->setParentItem(parent);
+    }
+
+
+    if (sibling != nullptr && sibling != child) {
+        child->stackBefore(sibling);
+        return;
+    }
+
+
+    // 目标是「末尾」。已经在末尾就什么都不做 ——
+    // 别去跑下面那对 detach/attach，那是有代价的（removeChild + addChild，
+    // 还会让兄弟们的 siblingOrderChanged 走一遍）。
+    const QList<QQuickItem*> children = parent->childItems();
+
+    if (!children.isEmpty() && children.last() == child) {
+        return;
+    }
+
+
+    // Qt 没有「移到末尾」的公开接口（stackBefore(nullptr) 只是 qWarning），
+    // 所以绕一圈：先从 visual tree 摘下来，再挂回去。
+    // 挂回去走的是 QQuickItemPrivate::addChild，而它是
+    // childItems.append(child)（qquickitem.cpp:3049）—— 落在末尾，正是要的。
+    //
+    // 这里不能碰 setParent(nullptr)：QObject 那一侧的父亲是谁决定了谁来删它，
+    // 移动位置不该把所有权也一起挪走。
+    child->setParentItem(nullptr);
+    child->setParentItem(parent);
+}
+
+
+void
 QtHost::destroy(
     QQuickItem* item
 )
@@ -471,4 +520,28 @@ QtHost::implicit_height(
 ) const
 {
     return item ? item->implicitHeight() : 0.0;
+}
+
+
+rust::Vec<std::uint64_t>
+QtHost::child_order(
+    QQuickItem* parent
+) const
+{
+    rust::Vec<std::uint64_t> out;
+
+    if (parent == nullptr) {
+        return out;
+    }
+
+    // childItems() 就是叠放顺序：下标小的在下面先画。
+    const auto children = parent->childItems();
+
+    for (auto* child : children) {
+        out.push_back(
+            reinterpret_cast<std::uint64_t>(child)
+        );
+    }
+
+    return out;
 }

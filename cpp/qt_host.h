@@ -2,6 +2,7 @@
 
 #include "rust/cxx.h"
 
+#include <cstdint>
 #include <memory>
 
 class QQuickItem;
@@ -51,6 +52,24 @@ public:
     void mount(
         QQuickItem* parent,
         QQuickItem* child
+    );
+
+    // 把这个对象放到 parent 的孩子列表里的指定位置。
+    //
+    // 为什么 mount 不够：mount 里的 setParentItem 只有「追加到末尾」这一种
+    // 落点，而且对**同一个父亲**是直接 return（qquickitem.cpp:2757-2758）。
+    // keyed 列表的「移动」走的正是这种调用 —— 对象本来就在父亲名下，
+    // 只是要换个位置。只调 mount 的话 Qt 那边会原地不动，
+    // 我们账本里的顺序却已经改了，两边就错开了（child_order 能看见）。
+    //
+    // sibling 非空：stackBefore(sibling)，插在它前面。
+    // sibling 为空：放到末尾。这里不能写 stackBefore(nullptr) ——
+    // Qt 对空 sibling 是 qWarning + 什么都不做（qquickitem.cpp:2925-2929），
+    // 只能先摘下来再挂回去（重新 add 就是追加）。
+    void place(
+        QQuickItem* parent,
+        QQuickItem* child,
+        QQuickItem* sibling
     );
 
     // 把这个对象从两棵树上摘掉，并安排释放。
@@ -115,6 +134,16 @@ public:
 
     double implicit_height(
         QQuickItem *item
+    ) const;
+
+    // 诊断用：把 Qt 侧 childItems 的实际顺序（对象地址列表）交出去。
+    //
+    // 为什么要单独读：布局是按我们自己的 children 顺序给坐标的，
+    // 而这里几个矩形互不重叠 —— stack_before 排错了，
+    // 坐标和画面都看不出任何差别。
+    // 想验证「插中间」真的生效，只能把 Qt 的顺序本身读出来对。
+    rust::Vec<std::uint64_t> child_order(
+        QQuickItem* parent
     ) const;
 
 private:

@@ -250,6 +250,22 @@ mod ffi {
             sibling: *mut QQuickItem,
         );
 
+        // 把 child 放到 parent 的孩子列表里的第 index 个位置该长的那样：
+        // sibling 非空就排在它前面，sibling 为空就排到末尾。
+        //
+        // 为什么不是 mount + stack_before：
+        //   - setParentItem 对同一个父亲直接 return
+        //     （qquickitem.cpp:2757-2758），移动不动；
+        //   - stackBefore(nullptr) 只是 qWarning，什么也不做
+        //     （qquickitem.cpp:2925-2929），「插到末尾」也没法表达。
+        // keyed 列表的移动两条都撞上了 —— 见 child_order 的 ✗。
+        unsafe fn place(
+            self: Pin<&mut QtHost>,
+            parent: *mut QQuickItem,
+            child: *mut QQuickItem,
+            sibling: *mut QQuickItem,
+        );
+
         // QObject::setProperty(name, QVariant( QString(value)) )。
         //
         // 属性名直接对上 Qt 的属性名：
@@ -308,6 +324,13 @@ mod ffi {
             self: &QtHost,
             item: *mut QQuickItem,
         ) -> f64;
+
+        // 诊断用：读 Qt 侧 childItems 的实际顺序（对象地址）。
+        // 见 cpp/qt_host.h 的注释 —— 插到中间这件事，从坐标上看不出来。
+        unsafe fn child_order(
+            self: &QtHost,
+            parent: *mut QQuickItem,
+        ) -> Vec<u64>;
     }
 }
 
@@ -411,25 +434,60 @@ fn Rectangle(
 //    倒着发的（先 [0,1] 再 [0,0]）—— 正好是那条不变式的活教材。
 //    第二个洞一次顶上来 m 个节点（m = 当前矩形个数）。
 
-// 矩形个数 —— 这是给「手动 diff」用的旋钮，不是 UI 状态的正道。
+// 手动 diff 的脚本表 —— 这不是 UI 状态的正道。
 //
 // 正道是 signal + 事件回路：signal 变了 → 有人 poll VirtualDom →
 // render_immediate 出 diff。那条回路还没接（下一步），
-// 所以这里用个静态开关，让 main() 能确定地推动一次「列表变短」，
-// 好验证 Remove → destroy 这半条链路。
+// 所以这里写死一张脚本表，让 main() 能确定地把 diff 走过一遍。
 //
-// 为什么非得是「列表变短」：非 keyed 的孩子数量减少时，
-// dioxus-core 发的是单独的 Remove（diff/iterator.rs:57
-// → diff/mod.rs:87 传的 replace_with = None），
-// 而不是 ReplaceWith —— 正好是我们要走的那条分支。
-static RECTANGLE_COUNT: AtomicUsize = AtomicUsize::new(2);
+// 为什么表里放的是「key 列表」而不是个数：只有 keyed 列表才凑得出四种不同的
+// diff 结果，一条 mutation 都不漏 ——
+//
+//     老 key 少了一个      → 单独的 Remove        （diff/iterator.rs:316）
+//     尾部多了新 key       → InsertAfter，新节点    （diff/iterator.rs:452-469）
+//     key 全在、只换顺序   → InsertBefore/After，
+//                           递过来的是**已有**的节点（移动全程不发 Remove，
+//                           见 diff/iterator.rs:343-375）
+//     老 key 一个都不留    → 先 create 新的，再把最后一个老的
+//                           换成 ReplaceWith        （diff/iterator.rs:305-308）
+//
+// 事件回路接上之后，这张表连同 main() 里第 4.7 步都该删掉。
+const DIFF_SCRIPT: &[&[usize]] = &[
+    &[0, 1],       // 第 4 步 mount 就是这个样子
+    &[0],          // Remove
+    &[0, 1, 2],    // InsertAfter，两个都是新建的
+    &[2, 0, 1],    // InsertBefore：移动已有节点（被移的在锚点后面 —— 下标不变）
+    &[1, 2, 0],    // InsertBefore：再往回收一格
+    &[2, 0, 1, 3], // InsertAfter：新建一个 + 移动一个，被移的那个在锚点前面，
+                   // 而且要插到末尾 —— place 的「摘了再挂回去」那支为它而加
+    &[3, 0, 1, 2], // 一步发两条：InsertAfter + InsertBefore
+    &[1, 2, 3, 0], // InsertBefore 一次挪两个
+    &[7, 8],       // 没有共同 key：Remove×3 + ReplaceWith
+];
+
+static DIFF_STEP: AtomicUsize = AtomicUsize::new(0);
+
+fn diff_keys() -> Vec<usize> {
+    let step = DIFF_STEP
+        .load(Ordering::Relaxed)
+        .min(DIFF_SCRIPT.len() - 1);
+
+    DIFF_SCRIPT[step].to_vec()
+}
 
 fn app() -> Element {
     // 没有 main.qml，也没有 QML 的 Layout / anchors。
-    let count = RECTANGLE_COUNT
-        .load(Ordering::Relaxed);
+    let keys = diff_keys();
 
-    println!("[app] 被渲染，矩形数 = {count}");
+    println!("[app] 被渲染，列表 key = {keys:?}");
+
+    // 容器的宽度 = 100 + 50 * key —— 这是给日志用的「身份证」。
+    // dump_tree 打出来的是尺寸，所以每个位置上是哪个 key 一眼就能看出来
+    //（渲染器自己不认识 key，只能把 key 编码进尺寸里）。
+    let items: Vec<(usize, usize)> = keys
+        .iter()
+        .map(|key| (*key, 100 + key * 50))
+        .collect();
 
     rsx! {
         qt-column {
@@ -442,20 +500,18 @@ fn app() -> Element {
                 text: "Hello from Dioxus -> Qt Quick (taffy layout)",
             }
 
-            for _ in 0..count {
-                // 每个条目刻意做成「一个容器 + 一个孩子」，也就是 2 个节点的一棵小子树。
-                // 这样 Remove 一次带走 2 个节点，而 destroy 只调用一次 ——
-                // 日志里应该出现 1 行 destroy scheduled + 2 行 object destroyed，
-                // 那就同时证明了三件事：
-                //     孩子确实是 QObject 的孩子（跟着父亲递归析构）、
-                //     我们的账本整棵子树都清干净了、
-                //     没有「每个节点各调一次 destroy」造成双重释放。
+            // 每个条目刻意做成「一个容器 + 一个孩子」，也就是 2 个节点的一棵小子树。
+            // 这样删一个条目时 destroy 只调用一次、日志里却有 2 行 object destroyed，
+            // 同时证明：孩子是 QObject 的孩子（跟着父亲递归析构）、
+            // 我们的账本整棵清干净了、没有双重释放。
+            for (key, item_width) in items {
                 qt-column {
-                    width: "200",
+                    key: "{key}",
+                    width: "{item_width}",
                     height: "40",
 
                     Rectangle {
-                        width: 200.0,
+                        width: 100.0,
                         height: 40.0,
                     }
                 }
@@ -463,7 +519,6 @@ fn app() -> Element {
         }
     }
 }
-
 
 // ============================================================
 // 最小 Qt renderer
@@ -1474,6 +1529,383 @@ impl QtRenderer {
     }
 
 
+    // child 在 parent.children 里的下标。
+    fn index_in_parent(
+        &self,
+        parent: u64,
+        child: u64,
+    ) -> Option<usize> {
+        self.node(parent)
+            .children
+            .iter()
+            .position(|c| *c == child)
+    }
+
+
+    // 把这些节点从各自现在挂着的那个父亲身上摘下来，
+    // 返回被改动过的父亲列表（调用方要给它们重设布局树）。
+    //
+    // 为什么需要：列表「移动」不走 Remove —— dioxus 直接
+    // push_all_root_nodes + insert_nodes_*（diff/iterator.rs:343-375），
+    // 所以到这里的节点很可能还挂在某个父节点的孩子列表里（常常就是同一个）。
+    // 不先摘就会在两个父亲的名下同时出现，children 的下标也全乱。
+    fn detach_from_old_parents(
+        &mut self,
+        nodes: &[u64],
+    ) -> Vec<u64> {
+        let mut affected = Vec::new();
+
+        for node in nodes {
+            let Some(old_parent) = self.node(*node).parent
+            else {
+                continue;
+            };
+
+            if let Some(parent_node) =
+                self.nodes.get_mut(&old_parent)
+            {
+                parent_node
+                    .children
+                    .retain(|child| *child != *node);
+            }
+
+            self.nodes
+                .get_mut(node)
+                .expect("unknown node")
+                .parent = None;
+
+            if !affected.contains(&old_parent) {
+                affected.push(old_parent);
+            }
+        }
+
+
+        affected
+    }
+
+
+    // 把 nodes 插进 parent.children 的 index 处，Qt 那边跟着对齐。
+    //
+    // Qt 侧为什么不能只 mount：mount 里的 setParentItem 只能往
+    // 父亲的 childItems 末尾追加，插到中间还得靠 stack_before。
+    // 逐个 stackBefore「同一个后邻」得到的正是 [n1, n2, 后邻] ——
+    // 和 replace_placeholder_with_nodes 是同一套路，理由也相同。
+    fn insert_nodes_at(
+        &mut self,
+        parent: u64,
+        index: usize,
+        nodes: &[u64],
+    ) {
+        if nodes.is_empty() {
+            return;
+        }
+
+
+        // 1. 自己的账先动：children 插进 index，parent 字段改过去。
+        {
+            let children = &mut self
+                .nodes
+                .get_mut(&parent)
+                .expect("unknown parent node")
+                .children;
+
+            for (offset, node) in nodes.iter().enumerate() {
+                children.insert(index + offset, *node);
+            }
+        }
+
+        for node in nodes {
+            self.nodes
+                .get_mut(node)
+                .expect("unknown node")
+                .parent = Some(parent);
+        }
+
+
+        // 2. 找一个「后邻」当叠放顺序的锚点：
+        //    插在新一格右边、而且已经有 Qt 对象的那个孩子。
+        //    占位节点当锚点没意义（Qt 那边没有它的位置）。
+        let mut next_sibling = None;
+
+        for child in self
+            .node(parent)
+            .children
+            .iter()
+            .skip(index + nodes.len())
+        {
+            if let Some(object) = self.object_of_node(*child) {
+                next_sibling = Some(object);
+                break;
+            }
+        }
+
+
+        // 3. Qt：把每个对象放到它在 children 里该在的那一格。
+        let parent_object = self.object_of_node(parent);
+
+        if let Some(parent_object) = parent_object {
+            for node in nodes {
+                // 占位节点没有对象，挂不了 —— 记账已经做完了。
+                let Some(child_object) =
+                    self.object_of_node(*node)
+                else {
+                    continue;
+                };
+
+                // SAFETY: 三个指针都来自 create_* / root_item()，
+                //            这一刻对象都还活着（destroy 只会发生在
+                //            destroy_subtree 里，而那里同时会把账删干净）。
+                unsafe {
+                    self.host.pin_mut().place(
+                        parent_object,
+                        child_object,
+                        next_sibling.unwrap_or(std::ptr::null_mut()),
+                    );
+                }
+            }
+        }
+
+
+        // 4. 布局树跟上（父亲的孩子列表刚刚变过）。
+        self.sync_taffy_children(parent);
+    }
+
+
+    // insert_nodes_after / insert_nodes_before 共用的那半边：
+    // 找锚点、算下标、把「移动」过来的节点先从旧父亲身上摘掉。
+    fn insert_relative(
+        &mut self,
+        anchor_id: ElementId,
+        nodes: &[u64],
+        after: bool,
+    ) {
+        if nodes.is_empty() {
+            return;
+        }
+
+
+        let anchor =
+            self.lookup(anchor_id).unwrap_or_else(|| {
+                panic!(
+                    "Insert 的锚点 ElementId({}) 不在树里",
+                    anchor_id.0
+                )
+            });
+
+        let parent =
+            self.node(anchor).parent.unwrap_or_else(|| {
+                panic!(
+                    "Insert 的锚点 node {anchor} 没有父节点"
+                )
+            });
+
+
+        // 先摘、再算下标：移动过来的节点很可能原本就挂在同一个父亲下面，
+        // 用「摘之前」的下标插就会错一格。
+        //
+        // 第 5 步（[1,2,0] → [2,0,1,3]）就踩在这一格上：锚点 node 4 摘之前
+        // 在下标 3、摘之后在下标 2，要插的是 3 这一格而不是 4。
+        // 把 index_in_parent 提到 detach 前面去试过一次，Vec::insert 当场
+        // panic「insertion index (is 4) should be <= len (is 3)」，
+        // 日志见 target/negative_index2.log。
+        let affected = self.detach_from_old_parents(nodes);
+
+        let index =
+            self.index_in_parent(parent, anchor).unwrap_or_else(|| {
+                panic!(
+                    "Insert：锚点 node {anchor} 不在 node {parent} \
+                     的孩子列表里"
+                )
+            });
+
+        let index = if after { index + 1 } else { index };
+
+        self.insert_nodes_at(parent, index, nodes);
+
+        // 被摘掉孩子的旧父亲们也要重设布局树
+        //（新父亲在 insert_nodes_at 里已经同步过了）。
+        for old_parent in
+            affected.iter().filter(|p| **p != parent)
+        {
+            self.sync_taffy_children(*old_parent);
+        }
+    }
+
+
+    // 把这棵子树整个删掉，返回子树大小（只为日志）。
+    //
+    // 两条从源码里抠出来的契约决定了下面的写法：
+    //
+    // 1. 子树里嵌套的动态节点**不会**再各发一条 Remove
+    //    （diff/node.rs:285-288「We don't generate mutations for these,
+    //    as they will be removed by the parent」）。
+    //    所以 Qt 那边只要删掉根就够（孩子是 QObject 的孩子，
+    //    ~QObject 递归删；~QQuickItem 自己只负责把 childItems 摘干净，
+    //    见 qquickitem.cpp:2409），
+    //    但我们自己的账必须整棵子树一起清干净。
+    //
+    // 2. 发完 Remove / ReplaceWith，Dioxus 立刻 `dom.reclaim(id)`
+    //    （diff/node.rs:330）：这个 ElementId 会被重新发出去给别的节点用，
+    //    所以映射必须清掉，否则 lookup 会把新 mutation 派给一个死节点。
+    fn destroy_subtree(
+        &mut self,
+        node: u64,
+    ) -> usize {
+        // 1. 整棵子树拉平（占位节点也在里面：它没对象，
+        //    但它的账和布局位置都得跟着清）。
+        let mut subtree = Vec::new();
+        let mut walk = vec![node];
+
+        while let Some(current) = walk.pop() {
+            subtree.push(current);
+
+            walk.extend(
+                self.node(current).children.iter().copied()
+            );
+        }
+
+
+        // 2. 从父亲的孩子列表里摘掉这一格。
+        let parent = self.node(node).parent;
+
+        if let Some(parent) = parent {
+            if let Some(parent_node) =
+                self.nodes.get_mut(&parent)
+            {
+                parent_node
+                    .children
+                    .retain(|child| *child != node);
+            }
+
+            // 布局树的 children 以 Node.children 为准，整体重设一遍。
+            self.sync_taffy_children(parent);
+        }
+
+
+        // 3. Qt：只有子树的根需要说一声，孩子跟着它一起没。
+        if let Some(object) = self.node(node).object {
+            // SAFETY: 这是 create_* 给出来的指针，这一刻还没被删；
+            //            调用完 C++ 就把它从两棵树上摘掉了，
+            //            而下面我们连自己的账都不留 —— 没有别人会再碰它。
+            unsafe {
+                self.host
+                    .pin_mut()
+                    .destroy(object);
+            }
+        }
+
+
+        // 4. 每个节点：布局节点删掉、ElementId 清掉、Node 删掉。
+        //    taffy 的 remove 只管自己（taffy_tree.rs:672-686 会把孩子
+        //    的 parent 置空但不删孩子），所以子树里每个都要单独删，
+        //    先父后子也没关系：孩子那一刻仍是合法 id。
+        for current in subtree.iter() {
+            if let Some(taffy) = self.node(*current).taffy {
+                self.tree
+                    .remove(taffy)
+                    .expect("taffy: remove 失败");
+            }
+
+            self.forget_element_ids(*current);
+            self.nodes.remove(current);
+        }
+
+
+        subtree.len()
+    }
+
+
+    // 把当前的树打出来 —— 纯诊断，不参与任何逻辑。
+    //
+    // diff 的每一步之后都调一次：children 的顺序、每格的下标、
+    // 每个节点最终拿到的尺寸，全在这一张表上。
+    // 顺序错一格、多一格，或者移动后两个父亲名下都有同一个节点，
+    // 这里都直接看得出来。
+    fn dump_tree(
+        &self,
+    ) {
+        println!("----- 当前的树 -----");
+
+        self.dump_node(0, 0);
+
+        println!(
+            "----- 共 {} 个节点 -----",
+            self.nodes.len()
+        );
+    }
+
+    fn dump_node(
+        &self,
+        node: u64,
+        depth: usize,
+    ) {
+        let pad = "  ".repeat(depth);
+
+        let object = self
+            .node(node)
+            .object
+            .map_or_else(
+                || "无对象".to_string(),
+                |item| format!("{item:p}"),
+            );
+
+        let layout = self
+            .node(node)
+            .taffy
+            .and_then(|t| self.tree.layout(t).ok())
+            .map(|l| format!(
+                "{:.0}x{:.0} @({:.0},{:.0})",
+                l.size.width,
+                l.size.height,
+                l.location.x,
+                l.location.y,
+            ))
+            .unwrap_or_else(|| "不参与布局".to_string());
+
+        println!(
+            "{pad}node {node}  {object}  {layout}"
+        );
+
+        // 顺序对账：Qt 的 childItems 顺序必须跟我们记的一样。
+        // 我们这边只数「有 Qt 对象的孩子」—— 占位节点在 Qt 里本来就没东西。
+        if let Some(parent_object) = self.node(node).object {
+            let expected: Vec<u64> = self
+                .node(node)
+                .children
+                .iter()
+                .filter_map(|child| {
+                    self.object_of_node(*child)
+                })
+                .map(|item| item as u64)
+                .collect();
+
+            if !expected.is_empty() {
+                // SAFETY: parent_object 来自 create_* / root_item()，
+                //            这一刻还活着（正在被 dump 的这个节点就是证据）。
+                let actual = unsafe {
+                    self.host.child_order(parent_object)
+                };
+
+                if actual == expected {
+                    println!(
+                        "{pad}  叠放顺序 ✓ {} 个孩子",
+                        expected.len()
+                    );
+                } else {
+                    println!(
+                        "{pad}  叠放顺序 ✗ 我们={expected:?} \
+                         Qt={actual:?}"
+                    );
+                }
+            }
+        }
+
+        for child in self.node(node).children.iter() {
+            self.dump_node(*child, depth + 1);
+        }
+    }
+
+
     // 路径 -> (父节点, 在父节点里的下标)
     //
     // 路径是「第几个子节点」的序列。
@@ -1949,13 +2381,54 @@ impl WriteMutations for QtRenderer {
     }
 
 
+    // 用栈顶 m 个新节点替换掉 id 那个节点（连同它的子树）。
+    //
+    // 什么时候会来：同一个位置换了「模板」。
+    // diff_node 一看 template 不一样就整棵换掉
+    // （diff/node.rs:53-58 → 先 create_children 建好 m 个，
+    //  再 remove_node_inner(..., Some(m)) —— m 传进去了，
+    //  于是发的是 ReplaceWith 而不是单独的 Remove）。
+    //
+    // m = 0 是合法的：那就是「换成空」，等于纯删除。
     fn replace_node_with(
         &mut self,
-        _id: ElementId,
-        _m: usize,
+        id: ElementId,
+        m: usize,
     ) {
-        panic!(
-            "replace_node_with not implemented"
+        let new_nodes = self.pop_m(m);
+
+        let target = self.lookup(id).unwrap_or_else(|| {
+            panic!(
+                "ReplaceWith 的目标 ElementId({}) 不在树里",
+                id.0
+            )
+        });
+
+        // 位置必须在删之前取：destroy_subtree 会把这一格从父亲那里摘掉，
+        // 摘完之后「原来的下标」正好还是新节点该插进去的地方。
+        let parent = self.node(target).parent.unwrap_or_else(|| {
+            panic!(
+                "ReplaceWith：node {target} 没有父节点，没地方插"
+            )
+        });
+
+        let index =
+            self.index_in_parent(parent, target).unwrap_or_else(|| {
+                panic!(
+                    "ReplaceWith：node {target} 不在 node {parent} \
+                     的孩子列表里"
+                )
+            });
+
+        let removed = self.destroy_subtree(target);
+
+        self.insert_nodes_at(parent, index, &new_nodes);
+
+        println!(
+            "[Dioxus] ReplaceWith id={} → 删 node {target}\
+             （子树 {removed} 个），换上 {} 个节点",
+            id.0,
+            new_nodes.len(),
         );
     }
 
@@ -2142,24 +2615,38 @@ impl WriteMutations for QtRenderer {
     }
 
 
+    // 把栈顶 m 个节点插到 id 那个节点后面。
     fn insert_nodes_after(
         &mut self,
-        _id: ElementId,
-        _m: usize,
+        id: ElementId,
+        m: usize,
     ) {
-        panic!(
-            "insert_nodes_after not implemented"
+        let new_nodes = self.pop_m(m);
+
+        self.insert_relative(id, &new_nodes, true);
+
+        println!(
+            "[Dioxus] InsertAfter id={} → 插了 {} 个节点",
+            id.0,
+            new_nodes.len(),
         );
     }
 
 
+    // 把栈顶 m 个节点插到 id 那个节点前面。
     fn insert_nodes_before(
         &mut self,
-        _id: ElementId,
-        _m: usize,
+        id: ElementId,
+        m: usize,
     ) {
-        panic!(
-            "insert_nodes_before not implemented"
+        let new_nodes = self.pop_m(m);
+
+        self.insert_relative(id, &new_nodes, false);
+
+        println!(
+            "[Dioxus] InsertBefore id={} → 插了 {} 个节点",
+            id.0,
+            new_nodes.len(),
         );
     }
 
@@ -2314,6 +2801,10 @@ impl WriteMutations for QtRenderer {
     // 「先摘下来留着待会儿插回去」。列表重排（移动）走的是另一条路：
     // push_all_root_nodes + insert_nodes_*（diff/iterator.rs:343-375），
     // 全程不发 Remove。
+    // Dioxus 说：把这个节点连同它整棵子树从 UI 里拿掉。
+    //
+    // 这里的 Remove 是「诀别」，不是 DOM 那种「先摘下来留着待会儿插回去」：
+    // 具体契约见 destroy_subtree 上方的注释，移动走的是 insert_nodes_*。
     fn remove_node(
         &mut self,
         id: ElementId,
@@ -2327,72 +2818,12 @@ impl WriteMutations for QtRenderer {
             return;
         };
 
-
-        // 1. 整棵子树拉平（占位节点也在里面：它没对象，
-        //    但它的账和布局位置都得跟着清）。
-        let mut subtree = Vec::new();
-        let mut walk = vec![node];
-
-        while let Some(current) = walk.pop() {
-            subtree.push(current);
-
-            walk.extend(
-                self.node(current).children.iter().copied()
-            );
-        }
-
-
-        // 2. 从父亲的孩子列表里摘掉这一格。
-        let parent = self.node(node).parent;
-
-        if let Some(parent) = parent {
-            if let Some(parent_node) =
-                self.nodes.get_mut(&parent)
-            {
-                parent_node
-                    .children
-                    .retain(|child| *child != node);
-            }
-
-            // 布局树的 children 以 Node.children 为准，整体重设一遍。
-            self.sync_taffy_children(parent);
-        }
-
-
-        // 3. Qt：只有子树的根需要说一声，孩子跟着它一起没。
-        if let Some(object) = self.node(node).object {
-            // SAFETY: 这是 create_* 给出来的指针，这一刻还没被删；
-            //            调用完 C++ 就把它从两棵树上摘掉了，
-            //            而下面我们连自己的账都不留 —— 没有别人会再碰它。
-            unsafe {
-                self.host
-                    .pin_mut()
-                    .destroy(object);
-            }
-        }
-
-
-        // 4. 每个节点：布局节点删掉、ElementId 清掉、Node 删掉。
-        //    taffy 的 remove 只管自己（taffy_tree.rs:672-686 会把孩子
-        //    的 parent 置空但不删孩子），所以子树里每个都要单独删，
-        //    先父后子也没关系：孩子那一刻仍是合法 id。
-        for current in subtree.iter() {
-            if let Some(taffy) = self.node(*current).taffy {
-                self.tree
-                    .remove(taffy)
-                    .expect("taffy: remove 失败");
-            }
-
-            self.forget_element_ids(*current);
-            self.nodes.remove(current);
-        }
-
+        let size = self.destroy_subtree(node);
 
         println!(
             "[Dioxus] Remove id={} → node {node}，\
-             连带子树 {} 个节点",
-            id.0,
-            subtree.len(),
+             连带子树 {size} 个节点",
+            id.0
         );
     }
 }
@@ -2520,15 +2951,16 @@ fn main() {
 
 
     // --------------------------------------------------------
-    // 4.7 手动驱动一次 diff：把矩形从 2 个减到 1 个
+    // 4.7 手动把 diff 驱动完一遍（DIFF_SCRIPT 那张表）
     //
     // 为什么要「手动」：事件回路还没接（下一步），没有东西会去 poll
     // VirtualDom，所以 UI 不会自己变。但 diff 的输出侧得先能跑起来
-    // 才谈得上回路，于是这里用三个公开 API 把它推过一遍：
+    // 才谈得上回路，于是每一步都做同样三件事：
     //
-    //     RECTANGLE_COUNT.store(1)   让下一次渲染的树真的短一格
+    //     DIFF_STEP.store(n)         让下一次渲染的树真的变一下
     //     vdom.mark_all_dirty()      把所有 scope 标脏
-    //     vdom.render_immediate(...) 走 diff，吐出 Mutation::Remove
+    //     vdom.render_immediate(...) 走 diff，把 mutation 吐给 renderer
+    //     vdom.relayout()            批量边界：一轮 diff 跑完才算一次布局
     //
     // 为什么是 mark_all_dirty 而不是 mark_dirty(ScopeId::ROOT)：
     // VirtualDom::new_with_component（virtual_dom.rs:296）先把应用包了一层
@@ -2537,40 +2969,33 @@ fn main() {
     // 就不会再跑子 scope —— 一条 mutation 都不会发。
     // （实测过：mark_dirty(ROOT) 之后 app() 根本没被再渲染第二次。）
     //
-    // 为什么挑「非 keyed 列表变短」这个形状：它发出来的是单独的 Remove
-    // （diff/iterator.rs:57 → diff/mod.rs:87 那里 replace_with 是 None），
-    // 而不是 ReplaceWith —— 正是要验证的那条分支。
-    //
-    // 期待看到的顺序（前三行都在 exec() 之前）：
-    //     [app] 被渲染，矩形数 = 1
-    //     [Qt] destroy scheduled …        ← 已从两棵树摘掉，内存还没放
-    //     [Dioxus] Remove id=… → node …，连带子树 1 个节点
-    //     …（exec 转起来之后）
-    //     [Qt] object destroyed …          ← deleteLater 真跑了，同一地址
+    // 每一步该看到什么 mutation，写在 DIFF_SCRIPT 那张表上方。
+    // 布局这边也要跟着验：每步之后 dump 一次树，
+    // 看 children 顺序、下标和尺寸是不是跟 diff 一致。
     // --------------------------------------------------------
 
-    println!(
-        "\n===== 手动 diff：矩形 {} → 1 =====",
-        RECTANGLE_COUNT.load(Ordering::Relaxed)
-    );
+    for step in 1..DIFF_SCRIPT.len() {
+        println!(
+            "\n===== 手动 diff 第 {step} 步：key {:?} → {:?} =====",
+            DIFF_SCRIPT[step - 1],
+            DIFF_SCRIPT[step]
+        );
 
-    RECTANGLE_COUNT.store(1, Ordering::Relaxed);
+        DIFF_STEP.store(step, Ordering::Relaxed);
 
-    vdom.mark_all_dirty();
+        vdom.mark_all_dirty();
 
-    vdom.render_immediate(
-        &mut renderer
-    );
+        vdom.render_immediate(
+            &mut renderer
+        );
 
-    // 批量边界：diff 吐完了，重算一次布局。
-    // 被删掉的那些节点已经不在 nodes / taffy 里，
-    // 所以这一步不会再碰它们任何指针。
-    renderer.relayout();
+        // 批量边界：这一轮 mutation 全落完了，重算一次布局。
+        // 被删掉的那些节点已经不在 nodes / taffy 里，
+        // 所以这一步不会再碰它们的任何指针。
+        renderer.relayout();
 
-    println!(
-        "[driver] renderer 里还剩 {} 个节点\n",
-        renderer.nodes.len()
-    );
+        renderer.dump_tree();
+    }
 
 
     // --------------------------------------------------------

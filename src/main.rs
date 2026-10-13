@@ -125,6 +125,13 @@ use taffy::prelude::{
 
 #[cxx::bridge]
 mod ffi {
+    // C++ 侧那个同名 struct（cpp/qt_host.h），字段名必须一一对上。
+    #[derive(Debug)]
+    struct TextMeasure {
+        width: f64,
+        height: f64,
+    }
+
     unsafe extern "C++" {
         include!("cxx-qt-lib/qvariant.h");
         /// QString from cxx_qt_lib
@@ -210,8 +217,8 @@ mod ffi {
 
         // 布局结果写给 Qt：几何的唯一入口。
         //
-        // 不复用 set_property 是因为它只能塞 QString，
-        // 而 x / y / width / height 是数字属性。
+        // 单独开一个函数而不是走 set_property，是为了让「几何」
+        // 有一个明确的出口 —— 五个数字一次写完，也省掉属性名查找。
         fn set_geometry(
             self: Pin<&mut QtHost>,
             id: u64,
@@ -228,6 +235,28 @@ mod ffi {
 
         fn window_height(
             self: &QtHost,
+        ) -> f64;
+
+        // 量一段文本要多大 —— 走的是 QQuickText 同一套算法
+        // （QTextLayout + design metrics），见 cpp/qt_host.cpp。
+        //
+        // max_width <= 0 表示不限宽。
+        fn measure_text(
+            self: &QtHost,
+            text: &str,
+            max_width: f64,
+        ) -> TextMeasure;
+
+        // 下面两个只用于对照：读 Qt 对象自己报的 implicit size。
+        // 读它会触发 QQuickText 同步算一次尺寸，所以没 polish 也准。
+        fn implicit_width(
+            self: &QtHost,
+            id: u64,
+        ) -> f64;
+
+        fn implicit_height(
+            self: &QtHost,
+            id: u64,
         ) -> f64;
     }
 }
@@ -382,6 +411,12 @@ struct Node {
     // （动态属性是 SetAttribute，静态属性在模板里），
     // 真正的输入时刻是 relayout()。
     style: Vec<(&'static str, String)>,
+
+    // 这个节点上显示的文本（只有文本类节点会有）。
+    //
+    // 现在用来做「测量 vs Qt implicit size」的对照；
+    // 下一步接上 taffy 的 measure function，喂给它的也是这个。
+    content: String,
 }
 
 
@@ -520,6 +555,7 @@ impl QtRenderer {
                         "column".to_string(),
                     ),
                 ],
+                content: String::new(),
             },
         );
 
@@ -584,6 +620,7 @@ impl QtRenderer {
                 children: Vec::new(),
                 taffy,
                 style: Vec::new(),
+                content: String::new(),
             },
         );
 
@@ -761,6 +798,12 @@ impl QtRenderer {
                             value,
                         );
 
+                        self.record_content(
+                            element_node,
+                            name,
+                            value,
+                        );
+
                         let value = cxx_qt_lib::QString::from(*value);
                         let value = cxx_qt_lib::QVariant::from(&value);
 
@@ -921,6 +964,31 @@ impl QtRenderer {
     }
 
 
+    // 记下这个节点显示的文本。
+    //
+    // 现在唯一的用处是对照测量：拿同一个字符串去问 Qt
+    // 「你量出来多少」和「你自己渲染要多少」。
+    // 下一步接 taffy 的 measure function，喂给它的也是这个值。
+    fn record_content(
+        &mut self,
+        node: u64,
+        name: &str,
+        value: &str,
+    ) {
+        if name != "text" {
+            return;
+        }
+
+
+        self.nodes
+            .get_mut(&node)
+            .unwrap_or_else(|| {
+                panic!("unknown node id {node}")
+            })
+            .content = value.to_string();
+    }
+
+
     // 父节点的孩子列表变了，就把布局树的 children 整体重设一遍。
     //
     // 刻意不做增量：这里的调用点是「树结构真的变了」的时刻
@@ -1044,6 +1112,67 @@ impl QtRenderer {
 
             self.apply_geometry(child);
         }
+    }
+
+
+    // 对照检查：我们量的文本尺寸 vs Qt 自己报的 implicit size。
+    //
+    // 这一步刻意不接进布局 —— 先把「测量口径」这个变量消掉。
+    // 两边不一致就先别往下接：差 1px 会在 flex 分配里累积成可见的错位。
+    //
+    // 期待看到什么：不限宽那一行 Δ 应该是 0.0/0.0。
+    // 如果 Δ 不是 0，最可能的原因是字体两边不同（现在两边都该是
+    // QGuiApplication::font()），或者 useDesignMetrics 没开。
+    fn verify_text_measurement(
+        &mut self,
+    ) {
+        let mut ids: Vec<u64> =
+            self.nodes.keys().copied().collect();
+
+        ids.sort_unstable();
+
+
+        println!("\n===== 文本测量对照 =====");
+
+        for id in ids {
+            let Some(object) =
+                self.node(id).object.filter(|o| *o != 0)
+            else {
+                continue;
+            };
+
+            let content = self.node(id).content.clone();
+
+            // 只有文本节点值得比：Rectangle / Item 的 implicit 是 0。
+            if content.is_empty() {
+                continue;
+            }
+
+            let free = self.host.measure_text(&content, -1.0);
+            let wrapped = self.host.measure_text(&content, 100.0);
+
+            let implicit_w = self.host.implicit_width(object);
+            let implicit_h = self.host.implicit_height(object);
+
+            println!(
+                "[measure] node {id} obj {object} \
+                 text={content:?}"
+            );
+            println!(
+                "   不限宽  我们 {:.1}x{:.1}   \
+                 Qt implicit {:.1}x{:.1}   Δ{:.1}/{:.1}",
+                free.width, free.height,
+                implicit_w, implicit_h,
+                free.width - implicit_w,
+                free.height - implicit_h,
+            );
+            println!(
+                "   限宽100 我们 {:.1}x{:.1}",
+                wrapped.width, wrapped.height
+            );
+        }
+
+        println!("====================\n");
     }
 
 
@@ -1814,6 +1943,12 @@ impl WriteMutations for QtRenderer {
         };
 
 
+        // 记下内容，测量对照要用（布局属性和普通属性都可能有文本）。
+        if let Some(node) = self.lookup(id) {
+            self.record_content(node, name, text);
+        }
+
+
         // 布局属性在这里只记账，不写给 Qt：
         // width / height 之类的最终归宿是 taffy 的输入，
         // 再由 relayout() 通过 set_geometry 推回去。
@@ -2002,6 +2137,16 @@ fn main() {
     // --------------------------------------------------------
 
     renderer.relayout();
+
+
+    // --------------------------------------------------------
+    // 4.6 文本测量对照（临时诊断，不是布局的一环）
+    //
+    // 目的：证明「我们算的文本尺寸」和「Qt 渲染时认为需要的尺寸」
+    // 是同一个数。对上了才把 measure 接进 taffy。
+    // --------------------------------------------------------
+
+    renderer.verify_text_measurement();
 
 
     // --------------------------------------------------------

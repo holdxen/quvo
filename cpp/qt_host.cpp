@@ -1,4 +1,9 @@
-#include "qt_host.h"
+// 只 include 生成头，不要同时 include 源码树里的 "qt_host.h"：
+// cxx-qt-build 会把头文件复制到 target 下，两份路径不同、`#pragma once`
+// 认不出来，于是 QtHost / TextMeasure 都会被定义两遍。
+// 生成头本身就会带上复制过来的 qt_host.h，而且它才有 bridge
+// shared struct（TextMeasure）的完整定义。
+#include "test_dioxus_qt/src/main.cxx.h"
 
 #include <QtCore/QByteArray>
 #include <QtCore/QDebug>
@@ -7,6 +12,9 @@
 #include <QtCore/QUrl>
 
 #include <QtGui/QColor>
+#include <QtGui/QFont>
+#include <QtGui/QTextLayout>
+#include <QtGui/QTextOption>
 
 #include <QtQml/QQmlComponent>
 #include <QtQml/QQmlEngine>
@@ -15,6 +23,9 @@
 #include <QtQuick/QQuickWindow>
 
 #include <unordered_map>
+
+// FLT_MAX —— QQuickText 不限宽时用的也是它（qquicktext.cpp:834）。
+#include <cfloat>
 
 namespace {
 
@@ -418,4 +429,99 @@ QtHost::set_property(
             << "="
             << value;
     }
+}
+
+TextMeasure
+QtHost::measure_text(
+    rust::Str text,
+    double max_width
+) const
+{
+    // 字体：默认构造的 QFont 就是 QGuiApplication::font()，
+    // 和 C++ 那段裸 Text {} 用的是同一个来源。
+    // 等 font 变成 Rust 下发的样式属性时，这里要改成收进来的那个 font，
+    // 否则「量的」和「画的」又会分成两个作者。
+    QFont font;
+
+    QTextLayout layout(
+        to_qstring(text),
+        font
+    );
+
+    layout.setCacheEnabled(true);
+
+    QTextOption option;
+
+    // qquicktext.cpp:818 —— shouldUseDesignMetrics =
+    //     renderType != NativeRendering，而 renderType 默认是 QtRendering。
+    // 所以要对齐默认渲染，这里必须用设计度量。
+    option.setUseDesignMetrics(true);
+
+    // QQuickText 的默认 wrapMode 是 Wrap（= WrapAtWordBoundaryOrAnywhere）。
+    // 不限宽时靠下面 lineWidth = FLT_MAX 让它不折行，和 Qt 一样的做法。
+    option.setWrapMode(
+        QTextOption::WrapAtWordBoundaryOrAnywhere
+    );
+
+    layout.setTextOption(option);
+
+    // qquicktext.cpp:833-835：宽度无效时 Qt 用的就是 FLT_MAX。
+    const qreal line_width = max_width > 0.0
+        ? max_width
+        : qreal(FLT_MAX);
+
+    layout.beginLayout();
+
+    qreal height = 0.0;
+
+    for (;;) {
+        QTextLine line = layout.createLine();
+
+        // qtextlayout.h:194
+        if (!line.isValid()) {
+            break;
+        }
+
+        line.setLineWidth(line_width);
+
+        // QTextLine::height() 内部会 ceil（qtextlayout.cpp:1524），
+        // QQuickText 累加的也是同一个函数（qquicktext.cpp:1307）。
+        height += line.height();
+    }
+
+    layout.endLayout();
+
+    // qquicktext.cpp:1044：implicitWidth 用的就是 maximumWidth()。
+    return { layout.maximumWidth(), height };
+}
+
+
+double
+QtHost::implicit_width(
+    std::uint64_t id
+) const
+{
+    auto* item =
+        qobject_cast<QQuickItem*>(
+            object_for(id)
+        );
+
+    // QQuickItem::implicitWidth() -> 虚函数 getImplicitWidth()
+    // -> QQuickTextPrivate::getImplicitWidth()（qquicktext.cpp:109）
+    // 会强制同步跑一次 updateSize()，所以没 polish 过也读得到。
+    return item ? item->implicitWidth() : 0.0;
+}
+
+
+double
+QtHost::implicit_height(
+    std::uint64_t id
+) const
+{
+    auto* item =
+        qobject_cast<QQuickItem*>(
+            object_for(id)
+        );
+
+    return item ? item->implicitHeight() : 0.0;
 }

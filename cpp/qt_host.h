@@ -8,6 +8,14 @@
 class QObject;
 class QVariant;
 
+// 文本测量结果，和 QQuickText 的 implicitWidth / implicitHeight 同一口径。
+//
+// 定义不在这里：bridge 里的 shared struct 由 cxx 生成
+// （target/.../test_dioxus_qt/src/main.cxx.h），这里只前置声明，
+// 需要完整类型的 .cpp 自己 include 那个生成头。
+// 重复定义会撞出 "redefinition of 'TextMeasure'"。
+struct TextMeasure;
+
 class QtHost {
 public:
     QtHost();
@@ -66,6 +74,25 @@ public:
         rust::Str name,
         const QVariant &value
     );
+
+    // 量一段文本需要多大。
+    //
+    // max_width <= 0 表示不限宽（对应 QQuickText 里 widthValid() == false
+    // 时把 lineWidth 设成 FLT_MAX 那条分支）。
+    TextMeasure measure_text(
+        rust::Str text,
+        double max_width
+    ) const;
+
+    // 读一个已存在对象的 implicit size —— 只为了做对照。
+    // 读它会让 QQuickText 同步算一次尺寸（见 getImplicitWidth）。
+    double implicit_width(
+        std::uint64_t id
+    ) const;
+
+    double implicit_height(
+        std::uint64_t id
+    ) const;
 
 private:
     QObject* object_for(

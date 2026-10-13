@@ -8,7 +8,7 @@ cxx = "1.0"
 
 cxx-qt-lib = { version = "0.10", features = ["qt_full"] }
 
-dioxus = { version = "=0.7.10", default-features = false, features = [ "macro", "html", "third-party-renderer", ]}
+dioxus = { version = "=0.7.10", default-features = false, features = [ "macro", "html", "third-party-renderer", "hooks", ]}
 dioxus-signals = "0.7.10"
 
 taffy = "0.15"

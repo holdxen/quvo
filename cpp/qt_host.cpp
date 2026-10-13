@@ -6,7 +6,9 @@
 #include "test_dioxus_qt/src/main.cxx.h"
 
 #include <QtCore/QByteArray>
+#include <QtCore/QCoreApplication>
 #include <QtCore/QDebug>
+#include <QtCore/QEvent>
 #include <QtCore/QMetaObject>
 #include <QtCore/QObject>
 #include <QtCore/QString>
@@ -16,6 +18,7 @@
 
 #include <QtGui/QColor>
 #include <QtGui/QFont>
+#include <QtGui/QMouseEvent>
 #include <QtGui/QTextLayout>
 #include <QtGui/QTextOption>
 #include <QtGui/QGuiApplication>
@@ -113,6 +116,69 @@ QQuickItem* instantiate(
 } // namespace
 
 
+// 一个「谁被按了」的转发器。
+//
+// 没有 Q_OBJECT 宏 —— 我们只重写 QObject::eventFilter 这个虚函数，
+// 不需要信号/槽，也就不需要 moc（cxx-qt-build 没跑 moc 这一步）。
+class ClickFilter : public QObject
+{
+public:
+    ClickFilter(
+        QQuickItem* item,
+        const std::string& name,
+        std::uint32_t element
+    )
+        : m_item(item)
+        , m_name(name)
+        , m_element(element)
+    {
+        // 所有权挂在 item 上：item 被 destroy（deleteLater）时
+        // ~QObject 递归删孩子，这个 filter 跟着走，不会悬空。
+        setParent(item);
+    }
+
+    const std::string& name() const { return m_name; }
+    QQuickItem* item() const { return m_item; }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (event->type() != QEvent::MouseButtonPress) {
+            return false;
+        }
+
+        auto *mouse = static_cast<QMouseEvent *>(event);
+
+        // 坐标一并带上：dioxus 那边的 MouseData 要读 element/client 坐标，
+        // 只传「谁被按了」是个残缺的负载。
+        const QPointF local = mouse->position();
+
+        rust::Str str(m_name.c_str(), m_name.size());
+
+        qDebug()
+            << "[Qt] click on" << watched
+            << "at" << local
+            << "-> dispatch" << m_name.c_str()
+            << "element" << m_element;
+
+        qt_handle_event(
+            str,
+            m_element,
+            static_cast<double>(local.x()),
+            static_cast<double>(local.y())
+        );
+
+        // false = 不吃这个事件，Qt 继续按它自己的规矩处理。
+        return false;
+    }
+
+private:
+    QQuickItem* m_item;
+    std::string m_name;
+    std::uint32_t m_element;
+};
+
+
 struct QtHost::Impl {
     // engine 先声明，
     // 这样析构时 window 会先于 engine 销毁。
@@ -122,6 +188,14 @@ struct QtHost::Impl {
     // 假事件源的心跳（见 QtHost::start_driver 的注释）。
     // 挂在 window 上，由 QObject 父子树负责释放。
     QTimer *driver_timer = nullptr;
+
+    // 我们装出去的 event filter。
+    //
+    // 只是「按 (item, name) 找得到、好撤」的登记簿，不管所有权 ——
+    // 所有权在 QObject 父子树上（filter 的 parent 就是那个 item）。
+    // item 被 destroy 时 filter 一起没了，这里的裸指针就变陈旧，
+    // 所以 destroy 路径要顺手把它们剔掉（见 QtHost::destroy）。
+    std::vector<ClickFilter*> listeners;
 
     // 这里不再存 id -> 对象的表：指针本身就是句柄，
     // Rust 侧拿着它直接调下面的方法。
@@ -378,6 +452,22 @@ QtHost::destroy(
     item->setParent(nullptr);
 
 
+    // 这个 item 名下的 event filter 是它的 QObject 孩子，
+    // 会跟着它一起被 ~QObject 递归删掉。
+    // 这里不用主动删它们，但登记簿里那些裸指针必须剔干净 ——
+    // 留着的话下一次 remove_click_listener 就会解引用野指针。
+    for (auto it = impl_->listeners.begin();
+         it != impl_->listeners.end(); )
+    {
+        if ((*it)->item() == item) {
+            it = impl_->listeners.erase(it);
+            continue;
+        }
+
+        ++it;
+    }
+
+
     // 内存的释放推给事件循环，理由（QObject::deleteLater 的文档同款）：
     // 以后这套 mutation 是在 Qt 的事件处理里跑下来的，
     // 「点了某个节点 → 重渲染正好把它删掉」这条路上当场 delete，
@@ -408,6 +498,104 @@ QtHost::stack_before(
 
 
     child->stackBefore(sibling);
+}
+
+
+void
+QtHost::add_click_listener(
+    QQuickItem* item,
+    rust::Str name,
+    std::uint32_t element
+)
+{
+    if (item == nullptr) {
+        return;
+    }
+
+    const std::string key(name.data(), name.size());
+
+    // 同一个 (item, name) 只留一个 filter：先撤旧的。
+    // 不然重渲染把同一个监听器再挂一遍，一次点击就会派发到 Rust 两次。
+    remove_click_listener(item, name);
+
+    auto *filter = new ClickFilter(item, key, element);
+
+    item->installEventFilter(filter);
+
+    impl_->listeners.push_back(filter);
+
+    qDebug()
+        << "[Qt] click listener installed on" << item
+        << "name" << key.c_str()
+        << "element" << element;
+}
+
+
+void
+QtHost::remove_click_listener(
+    QQuickItem* item,
+    rust::Str name
+)
+{
+    if (item == nullptr) {
+        return;
+    }
+
+    const std::string key(name.data(), name.size());
+
+    for (auto it = impl_->listeners.begin();
+         it != impl_->listeners.end(); )
+    {
+        ClickFilter *filter = *it;
+
+        if (filter->item() == item && filter->name() == key) {
+            item->removeEventFilter(filter);
+
+            it = impl_->listeners.erase(it);
+
+            // filter 的 parent 是 item，这里显式删也安全：
+            // ~QObject 会把它从父亲的 children 里摘掉。
+            delete filter;
+
+            continue;
+        }
+
+        ++it;
+    }
+}
+
+
+void
+send_click_to(
+    QQuickItem* item
+)
+{
+    if (item == nullptr) {
+        return;
+    }
+
+    // 一个左键按下。坐标取 item 的中心 —— 对这个 demo 来说坐标没人看，
+    // 重要的是事件类型必须是 MouseButtonPress，filter 才认。
+    const QPointF local(
+        item->width() / 2.0,
+        item->height() / 2.0
+    );
+
+    QMouseEvent press(
+        QEvent::MouseButtonPress,
+        local,
+        item->mapToScene(local),
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier
+    );
+
+    // sendEvent 是同步派发：调用返回之前，eventFilter 就已经跑过了。
+    qDebug()
+            << "[Qt] synthetic press sent to"
+            << item;
+
+    QCoreApplication::sendEvent(item, &press);
 }
 
 

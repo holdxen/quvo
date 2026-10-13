@@ -24,13 +24,14 @@ public:
     void show();
 
     // 起一个 QTimer 当**假的事件源**：每 interval_ms 叫一次 Rust 的
-    // qt_driver_tick()，由它去推 DIFF_STEP 并发纸条。
+    // qt_driver_tick()，由它去推 DIFF_STEP、并往一个装了监听器的节点
+    // 同步发一次左键按下（见下面的 send_click_to）。
     //
     // 注意它和「回路」已经没关系了 —— 它不 poll 任何东西。
-    // 真实形态里这一格是鼠标/键盘：事件 → handle_event → 写 signal
-    // → dioxus 发纸条 → waker 被调 → 才轮到 request_pump_poll()。
-    // 脚本跑完 Rust 那边会调 stop_driver() 把它关掉，
-    // 于是日志里连这一行都不再有 —— 空转真的不存在。
+    // 它只做真实形态里鼠标/键盘做的那一步：事件 → handle_event → 写 signal
+    // → dioxus 发纸条 → waker 被调 → 才轮到 schedule_pump_poll()。
+    // 列表脚本跑完 Rust 那边会调 stop_driver() 把它关掉，
+    // 于是连这最后一步都不再有 —— 剩下的点击全是窗口里真按出来的。
     void start_driver(
         int interval_ms
     );
@@ -122,6 +123,33 @@ public:
         QQuickItem* sibling
     );
 
+    // -----------------------------
+    // 输入事件
+    // -----------------------------
+    //
+    // 为什么用 event filter 而不是 MouseArea：
+    // 我们的节点是从内联 QML 实例化出来的裸 QQuickItem，
+    // 它本身没有 clicked 这种信号可以 connect；
+    // 而 MouseArea 得塞进 QML 里，就成了「谁的几何说话」的第二个作者，
+    // 还会往 childItems 里多插一个我们账本上没有的节点
+    // （child_order 的交叉检查立刻会 ✗）。
+    // filter 装在 item 上：不占 visual tree，不吃事件（返回 false），
+    // 只负责「有人按在这上面了」这件事转告 Rust。
+    void add_click_listener(
+        QQuickItem* item,
+        rust::Str name,
+        std::uint32_t element
+    );
+
+    // 撤掉 add_click_listener 装的那个 filter（removeEventFilter + delete）。
+    // 不做的话：节点被 destroy 之后 filter 还挂在事件线上 ——
+    // filter 本身是 item 的 QObject 孩子（构造时 setParent 过），
+    // 会跟着一起析构，但「同一格重挂两次」得靠这个先撤掉旧的。
+    void remove_click_listener(
+        QQuickItem* item,
+        rust::Str name
+    );
+
     // 把 Dioxus 侧送来的属性写到 Qt 对象上。
     // 目前就是 QObject::setProperty(name, value)，
     // 属性名与 Qt 属性名同名（Dioxus 的 text -> QtQuick.Text::text）。
@@ -190,3 +218,16 @@ std::unique_ptr<QtHost> new_qt_host();
 // 于是原来的 interval 轮询整个删掉了：空闲时 Qt 阻塞在 exec() 里，
 // 一次 poll 都不会发生。
 void schedule_pump_poll();
+
+
+// 只给离屏自检用：直接往这个 item 同步发一个左键按下（QCoreApplication::sendEvent），
+// 于是装在它上面的 ClickFilter 立刻被调到、再回调进 Rust。
+// 真窗口下这条换成你用鼠标点。
+//
+// 为什么是自由函数而不是 QtHost 的成员：它不需要 host 里的任何状态，
+// 而调用方（Rust 的 driver）此刻**不能**借着 Pump ——
+// sendEvent 是同步的，会当场回调 qt_handle_event，而那个函数自己要再借一次 PUMP。
+// 挂在 QtHost 上就非得从 renderer 里拿 host，等于自己跟自己抢借用。
+void send_click_to(
+    QQuickItem* item
+);

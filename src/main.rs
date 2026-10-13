@@ -57,7 +57,8 @@
 //! ## 阅读顺序建议
 //!
 //! 1. `app()` —— 用户写的 UI 就三行
-//! 2. `mod ffi` —— Rust 能让 C++ 做的全部十六件事
+//! 2. `mod ffi` —— Rust ↔ C++ 的双向接口：22 个正向（1 个造 QtHost + 21 个方法）
+//!    + 2 个 C++ 自由函数 + 3 个 C++ 回调 Rust
 //! 3. `QtRenderer` 的三个字段 —— renderer 记了哪三本账
 //! 4. `impl WriteMutations` —— 指令如何变成 Qt 调用（核心）
 //! 5. `main()` —— 拼起来的顺序
@@ -65,18 +66,30 @@
 //!
 //! ## 当前边界（重要）
 //!
-//! mount（首次渲染）整条路是通的；diff 只通了一条分支：
+//! 已经通到底的：
 //!
-//! - `remove_node` 实现了，配套的 C++ `destroy` 也在 ——
-//!   `main()` 第 4.7 步会手动驱动一次「列表变短」来看它真的删了对象；
-//! - `replace_node_with` / `insert_nodes_after` / `insert_nodes_before`
-//!   在本文件里还是 panic；
-//! - `assign_node_id` 是空的，所以模板深处的静态元素没有 ElementId，
-//!   给它们的更新会被静丢掉；
-//! - 输入侧还是 0：事件监听是空实现，`main()` 里也没有东西去 poll
-//!   VirtualDom —— 第 4.7 步那次 diff 是手动推的，不是自己变的。
+//! - `WriteMutations` 五条指令全实现了（LoadTemplate / SetAttribute /
+//!   AppendChildren / ReplacePlaceholder / 三条 diff 分支 / Remove / AssignId），
+//!   配套的 C++ `destroy`、`place`（同父移动）也在；
+//! - `assign_node_id` 按 path 找回那个静态节点，见 `instance_paths`；
+//! - 回路是自己转的：Qt 的 timer/Rust 的 `QtWaker` → `schedule_pump_poll`
+//!   → `qt_pump_poll` 把 `wait_for_work` poll 到 Pending 为止；
+//! - 输入侧走真事件：`create_event_listener` 在 QQuickItem 上装
+//!   `ClickFilter`，`qt_handle_event` 把 `Rc<PlatformEventData>` 送进
+//!   `runtime().handle_event("click", ...)`。
 //!
-//! 详见 `main()` 的注释。
+//! 还是假的 / 还缺的：
+//!
+//! - **点击的来源**是 `send_click_to`（`QCoreApplication::sendEvent` 造一个
+//!   左键按下），为了让 offscreen 也能证明链路通；真窗口下该删的就是这条。
+//! - **列表的内容**是 `DIFF_SCRIPT` 在推进（9 步跑完自动关 driver），
+//!   不是用户改的。
+//! - 监听器只认 `QEvent::MouseButtonPress`：名字是 Dioxus 给什么就存什么、
+//!   回调时原样交回去，所以 `onkeydown` 这种也会装上一个「鼠标按下才响」的
+//!   filter —— 真要做别的输入，得让 `ClickFilter` 分清事件类型。
+//! - 窗口 resize 没有触发重排；字体还是 Qt 自己的默认值，
+//!   没和 `measure_text` 用同一个来源；
+//!   `AttributeValue::{Int, Float, Bool, None}` 在属性过滤那步被丢掉。
 
 use cxx::UniquePtr;
 
@@ -85,6 +98,7 @@ use cxx_qt_lib::QGuiApplication;
 use dioxus::dioxus_core::{
     AttributeValue,
     ElementId,
+    Event,
     RuntimeGuard,
     ScopeId,
     Template,
@@ -95,6 +109,56 @@ use dioxus::dioxus_core::{
 };
 
 use dioxus::prelude::*;
+
+// dioxus-html 那套事件类型：本项目要自己造一个 PlatformEventData 的负载，
+// 并且要装一个 HtmlEventConverter，所以这些名字都得进来。
+use dioxus::html::{
+    AnimationData,
+    CancelData,
+    ClipboardData,
+    CompositionData,
+    DragData,
+    FocusData,
+    FormData,
+    HasMouseData,
+    HtmlEventConverter,
+    ImageData,
+    InteractionElementOffset,
+    InteractionLocation,
+    KeyboardData,
+    MediaData,
+    Modifiers,
+    ModifiersInteraction,
+    MouseData,
+    MountedData,
+    PlatformEventData,
+    PointerData,
+    PointerInteraction,
+    ResizeData,
+    ScrollData,
+    SelectionData,
+    ToggleData,
+    TouchData,
+    TransitionData,
+    VisibleData,
+    WheelData,
+    set_event_converter,
+};
+
+// 坐标 / 按键这两个子模块没在 dioxus-html 的根上 re-export
+// （lib.rs:29-30 只有 `pub mod geometry;` 和 `pub mod input_data;`），
+// 所以得写全路径。
+use dioxus::html::geometry::{
+    ClientPoint,
+    ElementPoint,
+    PagePoint,
+    ScreenPoint,
+};
+
+use dioxus::html::input_data::{
+    MouseButton,
+    MouseButtonSet,
+};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -341,8 +405,24 @@ mod ffi {
             parent: *mut QQuickItem,
         ) -> Vec<u64>;
 
+        // 给一个 item 装「谁按了我」的 event filter，
+        // 按下去就回调 Rust 的 qt_handle_event(name, element)。
+        unsafe fn add_click_listener(
+            self: Pin<&mut QtHost>,
+            item: *mut QQuickItem,
+            name: &str,
+            element: u32,
+        );
+
+        unsafe fn remove_click_listener(
+            self: Pin<&mut QtHost>,
+            item: *mut QQuickItem,
+            name: &str,
+        );
+
         // 起一个 QTimer 当**假的事件源**：每 interval_ms 调一次 Rust 的
-        // qt_driver_tick()。它不 poll 任何东西 —— 真实形态里这一格是鼠标。
+        // qt_driver_tick()（推列表一格 + 合成一次点击）。
+        // 它不 poll 任何东西 —— 回路在 qt_pump_poll 那边，两件事分开。
         fn start_driver(
             self: Pin<&mut QtHost>,
             interval_ms: i32,
@@ -362,6 +442,13 @@ mod ffi {
         include!("test_dioxus_qt/cpp/qt_host.h");
 
         fn schedule_pump_poll();
+
+        // 离屏自检用：同步往某个 item 发一个左键按下。
+        // 自由函数（不挂 QtHost），原因见 cpp 那边的注释：
+        // 调用它的时候绝不能借着 Pump。
+        unsafe fn send_click_to(
+            item: *mut QQuickItem,
+        );
     }
 
     // 反方向：C++ 调 Rust。
@@ -374,6 +461,15 @@ mod ffi {
 
         // 回路本身：poll 一次 wait_for_work，醒了才渲染。
         fn qt_pump_poll();
+
+        // Qt 的 event filter 检测到了按下，把「谁被按了 + 在哪」交回 Rust。
+        // element 是 add_click_listener 当初登记的那个 ElementId。
+        fn qt_handle_event(
+            name: &str,
+            element: u32,
+            x: f64,
+            y: f64,
+        );
     }
 }
 
@@ -494,10 +590,9 @@ fn Rectangle(
 //     老 key 一个都不留    → 先 create 新的，再把最后一个老的
 //                           换成 ReplaceWith        （diff/iterator.rs:305-308）
 //
-// 事件回路已经接上了，这张表现在只是**假的事件源**：
-// driver_send_work 每 TICKS_PER_STEP 个 tick 推一格、发一张纸条。
-// 等 create_event_listener + handle_event 落地，该删的是这张表，
-// 回路本身不动。
+// 事件回路已经接上了，这张表现在只是**列表那一半的假事件源**：
+// driver_advance_list 每 TICKS_PER_STEP 个 tick 推一格、发一张纸条。
+// 点击那一半是真的（Qt 事件 → handle_event → 写 signal）。
 const DIFF_SCRIPT: &[&[usize]] = &[
     &[0, 1],       // 第 4 步 mount 就是这个样子
     &[0],          // Remove
@@ -525,7 +620,17 @@ fn app() -> Element {
     // 没有 main.qml，也没有 QML 的 Layout / anchors。
     let keys = diff_keys();
 
-    println!("[app] 被渲染，列表 key = {keys:?}");
+    // 真状态：由 Qt 的鼠标事件写、由这条 scope 读。
+    // 读它（`clicks()`）就是把本 scope 订阅到这个 signal 上 ——
+    // 于是「点一下」之后的链路全是 dioxus 自己的机制：
+    // write → 发纸条 → 我们的 waker → Qt 事件 → poll Ready → diff → SetAttribute。
+    let mut clicks = use_signal(|| 0usize);
+
+    let clicks_shown = clicks();
+
+    println!(
+        "[app] 被渲染，列表 key = {keys:?}，clicks = {clicks_shown}"
+    );
 
     // 每个条目两把「身份证」，都编码在尺寸里，dump_tree 一眼能读出来：
     //
@@ -536,9 +641,16 @@ fn app() -> Element {
     // （[0] 和 [1]），于是每次新建实例都会收到两条 AssignId。
     // 绑错节点的话：矩形那条宽度会落到文本上 —— 文本变成显式宽度、
     // 矩形退回自动宽度，日志里立刻对不上。
-    let items: Vec<(usize, usize, usize)> = keys
+    let items: Vec<(usize, usize, usize, String)> = keys
         .iter()
-        .map(|key| (*key, 100 + key * 50, 20 + key * 7))
+        .map(|key| {
+            (
+                *key,
+                100 + key * 50,
+                20 + key * 7,
+                format!("key {key} · clicks {clicks_shown}"),
+            )
+        })
         .collect();
 
     rsx! {
@@ -563,19 +675,36 @@ fn app() -> Element {
             // 写在这里，它们是本次模板 root 的第 0 / 第 1 个孩子，
             // dioxus 必须先发 AssignId([0]) / AssignId([1])，
             // 再各自发 SetAttribute（diff/node.rs:816 → :871）。
-            for (key, item_width, rect_width) in items {
+            for (key, item_width, rect_width, text) in items {
+                // 竖排 + 80 高：两个孩子都排在**主轴**上，
+                // 交叉轴（宽度）因此不会被 stretch 改写，
+                // 而 15 + 40 = 55 < 80 也就没有主轴收缩。
+                //
+                // 这件事必须显式管起来：行内排放不下时 taffy 会 flex-shrink，
+                // 把矩形那个「宽度身份证」从 20+7k 挤成别的数 ——
+                // 检测器会因为布局合法溢出而假红。
                 qt-column {
                     key: "{key}",
                     width: "{item_width}",
-                    height: "40",
+                    height: "80",
+                    flex_direction: "column",
 
                     qt-text {
-                        text: "key {key}",
+                        text: "{text}",
                     }
 
+                    // 监听器也挂在这个**内层**元素上：
+                    // 它没有 ElementId 的话，CreateEventListener 根本送不到节点上
+                    // —— 这条正好把 assign_node_id 和事件接在一起验了。
+                    //
+                    // rsx 里名字仍是 onclick，但送到我们手里时已经是 "click"
+                    // （diff/node.rs:533 把 "on" 前缀剥掉了）。
                     qt-rectangle {
                         width: "{rect_width}",
                         height: "40",
+                        onclick: move |_| {
+                            clicks += 1;
+                        },
                     }
                 }
             }
@@ -732,6 +861,13 @@ struct QtRenderer {
     // 在任何嵌套子模板被 load 之前发完。
     instance_paths: Vec<(Vec<u8>, u64)>,
 
+    // 装了事件监听器的节点（node id）。
+    //
+    // 存在的理由只有一个：驱动（测试的事件源）得找一个**还活着**的可点元素，
+    // 不能把某个曾经见过的裸指针存下来再点 —— 列表一变那棵子树就没了。
+    // create_event_listener 往里加，remove_event_listener 和 destroy_subtree 往外删。
+    listeners: Vec<u64>,
+
 
     // 布局树。
     //
@@ -833,6 +969,7 @@ impl QtRenderer {
             // 否则第一条 AppendChildren 就找不到父节点。
             element_to_node: vec![Some(0)],
             instance_paths: Vec::new(),
+            listeners: Vec::new(),
         }
     }
 
@@ -954,6 +1091,67 @@ impl QtRenderer {
         id: ElementId,
     ) -> Option<QQuickItemId> {
         self.object_of_node(self.lookup(id)?)
+    }
+
+
+    /// 「现在可以点谁」—— 驱动（测试的事件源）用。
+    ///
+    /// 每次现问，绝不把裸指针存下来：列表一变，那棵子树就被 destroy 了，
+    /// 存下来的指针第二次点就是野指针。这里存的是 node id，
+    /// 逐个经 object_of_node 回到 `nodes` 这本**活账**里查对象
+    /// —— 节点被 destroy_subtree 从 nodes 里删掉之后这里自然查不到，
+    /// 所以 `listeners` 里的残留只会让这一格查空，不会点到死对象。
+    fn click_target(
+        &self,
+    ) -> Option<QQuickItemId> {
+        self.listeners
+            .iter()
+            .find_map(|node| self.object_of_node(*node))
+    }
+
+
+    /// 自检用：把账上所有还活着的监听器，按 remove_event_listener 那条路撤掉。
+    ///
+    /// 为什么要手动撤：dioxus 只在「同一个元素上，旧属性集有 onclick、新属性集没有」
+    /// 时才发 RemoveEventListener（diff/node.rs:475-478 → :500-504），
+    /// 而**闭包换了它不发** —— :458-460 那条
+    /// `(Listener, Listener) => false`，注释写的是「解释器按 name+element id 找监听器，
+    /// 所以不必重写」。本 demo 的属性集从头到尾没变过，
+    /// 所以 remove_event_listener 这条分支一次都走不到。
+    /// 走一遍总比只写着好看。
+    fn remove_all_listeners_for_test(
+        &mut self,
+    ) -> usize {
+        // 先把 (node, ElementId) 收集齐再动手：
+        // remove_event_listener 要 &mut self，边遍历 listeners 边调它就是双重借用。
+        let pairs: Vec<(u64, ElementId)> = self
+            .listeners
+            .clone()
+            .into_iter()
+            .filter_map(|node| {
+                self.element_to_node
+                    .iter()
+                    .enumerate()
+                    .find(|(_, bound)| **bound == Some(node))
+                    .map(|(id, _)| (node, ElementId(id)))
+            })
+            .collect();
+
+        let mut removed = 0;
+
+        for (node, element) in pairs {
+            self.remove_event_listener("click", element);
+
+            removed += 1;
+
+            println!(
+                "[self-check] 手动撤 node {node} \
+                 （ElementId({})）上的监听器",
+                element.0
+            );
+        }
+
+        removed
     }
 
 
@@ -1928,6 +2126,14 @@ impl QtRenderer {
             self.forget_element_ids(*current);
             self.nodes.remove(current);
         }
+
+        // 监听器登记簿跟着清 —— 这一棵里任何节点身上的监听器都随对象一起没了。
+        // 说清楚它**不是**安全性的来源：安全性来自 click_target 每次都回 nodes 查
+        // （见上面），节点一删那条查询就查空。这里的 retain 只是不让簿子无限长。
+        //（Qt 那侧也不用管 —— filter 是这个 item 的 QObject 孩子，
+        //  ~QObject 递归删，destroy 里还顺手把 C++ 的登记簿剔了一遍。）
+        self.listeners
+            .retain(|live| self.nodes.contains_key(live));
 
 
         subtree.len()
@@ -2904,19 +3110,86 @@ impl WriteMutations for QtRenderer {
     }
 
 
+    // Dioxus 说：这个 ElementId 身上挂了一个事件监听器（rsx 里的 onclick）。
+    //
+    // 我们把它翻译成「在对应的那个 QQuickItem 上装一个 event filter」，
+    // filter 认出按下就回调 qt_handle_event(name, element)。
+    //
+    // name 是 rsx 属性名（onclick 的话 dioxus 那边给的是什么，见
+    // qt_handle_event 上方的说明）—— 我们只把它当字符串原样存着，
+    // 回调时再交回给 Rust，由 Rust 决定往 runtime 里送什么。
     fn create_event_listener(
         &mut self,
-        _name: &'static str,
-        _id: ElementId,
+        name: &'static str,
+        id: ElementId,
     ) {
+        let Some(node) = self.lookup(id) else {
+            println!(
+                "[Dioxus] CreateEventListener {name} id={} \
+                 还没有映射到节点，监听器装不上",
+                id.0
+            );
+
+            return;
+        };
+
+        let Some(object) = self.object_of_node(node) else {
+            println!(
+                "[Dioxus] CreateEventListener {name} id={} \
+                 是占位节点（node {node}），装不了监听器",
+                id.0
+            );
+
+            return;
+        };
+
+        // SAFETY: object 来自 object_of_node，也就是某个还活在树上的节点的指针；
+        //            filter 的所有权交给 Qt（parent 就是那个 item）。
+        unsafe {
+            self.host.pin_mut().add_click_listener(
+                object,
+                name,
+                id.0 as u32,
+            );
+        }
+
+        if !self.listeners.contains(&node) {
+            self.listeners.push(node);
+        }
+
+        println!(
+            "[Dioxus] CreateEventListener {name} id={} → node {node} 已装到 Qt 上",
+            id.0
+        );
     }
 
 
     fn remove_event_listener(
         &mut self,
-        _name: &'static str,
-        _id: ElementId,
+        name: &'static str,
+        id: ElementId,
     ) {
+        let Some(node) = self.lookup(id) else {
+            return;
+        };
+
+        let Some(object) = self.object_of_node(node) else {
+            return;
+        };
+
+        // SAFETY: 同上 —— 指针来自还活着的节点。
+        unsafe {
+            self.host
+                .pin_mut()
+                .remove_click_listener(object, name);
+        }
+
+        self.listeners.retain(|live| *live != node);
+
+        println!(
+            "[Dioxus] RemoveEventListener {name} id={}",
+            id.0
+        );
     }
 
 
@@ -3033,6 +3306,8 @@ struct Pump {
     waker: Waker,
     /// DIFF_SCRIPT 走到第几步
     step: usize,
+    /// 已经转过多少个 tick（列表纸条按 TICKS_PER_STEP 间隔发）
+    ticks: usize,
 }
 
 // 只有主线程会碰它（Qt 的 timer 回调、Qt 事件队列里的 functor 都在这条线程），
@@ -3043,8 +3318,19 @@ thread_local! {
     static PUMP: RefCell<Option<Pump>> = const { RefCell::new(None) };
 }
 
-/// 假事件源的间隔 —— 和回路无关，纯粹是「多久模拟一次用户操作」。
+/// 假事件源的间隔。
 const DRIVER_INTERVAL_MS: i32 = 200;
+
+/// 列表纸条的间隔（多少个 tick 推一格）。点击是每个 tick 都点。
+const TICKS_PER_STEP: usize = 3;
+
+/// 监听器自检放在脚本的第几步。
+///
+/// 挑 5 是因为那一格 `[2,0,1,3]` 里 key 3 是**新建**的 ——
+/// 新建的 mount 一定会重发 CreateEventListener，
+/// 于是「撤光 → 点不到 → 下一轮渲染又装回来 → 又点得到」这一整圈
+/// 在一次运行里就能看到，不用另外造事件源。
+const LISTENER_SWEEP_STEP: usize = 5;
 
 /// 把 vdom + renderer 交给回路，起假事件源，并**先 poll 一次**。
 ///
@@ -3067,6 +3353,7 @@ fn install_pump(
             renderer,
             waker: Waker::from(Arc::new(QtWaker)),
             step: 0,
+            ticks: 0,
         });
     });
 
@@ -3102,6 +3389,89 @@ fn install_pump(
 ///    它问的是「当前线程正在跑的那个 runtime」，不是我们手里的这个。
 ///    第一次跑的时候没加 guard，当场 panic
 ///    「Must be called from inside a Dioxus runtime」（runtime.rs:100）。
+/// 列表那一半：把 DIFF_SCRIPT 推一格，走 channel 发一张纸条。
+///
+/// 这一半**故意还是假的**，为的是让增删 / 移动 / ReplaceWith 那条 diff 路径
+/// 继续被回归测试。真事件（下面那次点击）只驱动 signal 那一条。
+fn driver_advance_list(
+    pump: &mut Pump,
+) {
+    if pump.step + 1 >= DIFF_SCRIPT.len() {
+        // timer 已经关了，理论上到不了这里。
+        return;
+    }
+
+    pump.step += 1;
+
+    DIFF_STEP
+        .store(pump.step, Ordering::Relaxed);
+
+    println!(
+        "[driver] 发纸条 Immediate(ScopeId::APP)，\
+         下一次渲染的 key = {:?}",
+        DIFF_SCRIPT[pump.step]
+    );
+
+    let runtime = pump.vdom.runtime();
+
+    let _guard = RuntimeGuard::new(
+        runtime.clone(),
+    );
+
+    // 这一行**里面**发生的事：纸条进 channel → recv_task.wake()
+    // → QtWaker::wake_by_ref → schedule_pump_poll() 把一次 poll 排进
+    // Qt 的事件队列。所以我们并没有在这里渲染，只是登记了「稍后叫我」。
+    runtime.needs_update(ScopeId::APP);
+
+    if pump.step + 1 >= DIFF_SCRIPT.len() {
+        println!(
+            "[driver] 列表脚本跑完，关掉假纸条 —— \
+             之后只剩真点击在驱动回路"
+        );
+
+        pump.renderer
+            .host
+            .pin_mut()
+            .stop_driver();
+    }
+
+    // 监听器那一半的自检。
+    //
+    // 放在 needs_update **之后**、而不是等渲染跑完：这一格的渲染还在事件队列里，
+    // 所以现在撤完，同一个 tick 里 qt_driver_tick 去查目标就查不到，
+    // 当场打一行「不点」。这行是**撤成功的证据**，不是「什么都没发生」——
+    // 上一行还打印着可点目标 true，这一 tick 就变 false，
+    // 而 C++ 那边 removeEventFilter + delete 没做对的话这里根本不会变。
+    if pump.step == LISTENER_SWEEP_STEP {
+        let before = pump
+            .renderer
+            .click_target()
+            .is_some();
+
+        let removed = pump
+            .renderer
+            .remove_all_listeners_for_test();
+
+        let after = pump
+            .renderer
+            .click_target()
+            .is_some();
+
+        println!(
+            "[self-check] 撤掉 {removed} 个监听器：\
+             可点目标 {before} → {after}"
+        );
+    }
+}
+
+
+/// 每个 tick 干的两件事。
+///
+/// 1) 每 TICKS_PER_STEP 个 tick 推一格列表（假纸条，见上面）。
+/// 2) **每次都真点一下**：往一个还活着、装了监听器的元素同步发一次左键按下。
+///    这一步之后整条链全是 dioxus 自己的机制：
+///    filter → qt_handle_event → handle_event → listener 写 signal
+///    → 发纸条 → wake → Qt 事件 → poll Ready → diff → SetAttribute。
 fn qt_driver_tick() {
     PUMP.with(|slot| {
         let mut guard = slot.borrow_mut();
@@ -3110,45 +3480,34 @@ fn qt_driver_tick() {
             return;
         };
 
-        if pump.step + 1 >= DIFF_SCRIPT.len() {
-            // timer 已经关了，理论上到不了这里。
-            return;
-        }
+        pump.ticks += 1;
 
-        pump.step += 1;
-
-        DIFF_STEP
-            .store(pump.step, Ordering::Relaxed);
-
-        println!(
-            "[driver] 发纸条 Immediate(ScopeId::APP)，\
-             下一次渲染的 key = {:?}",
-            DIFF_SCRIPT[pump.step]
-        );
-
-        let runtime = pump.vdom.runtime();
-
-        let _guard = RuntimeGuard::new(
-            runtime.clone(),
-        );
-
-        // 这一行**里面**发生的事：纸条进 channel → recv_task.wake()
-        // → QtWaker::wake_by_ref → schedule_pump_poll() 把一次 poll 排进
-        // Qt 的事件队列。所以我们并没有在这里渲染，只是登记了「稍后叫我」。
-        runtime.needs_update(ScopeId::APP);
-
-        if pump.step + 1 >= DIFF_SCRIPT.len() {
-            println!(
-                "[driver] 最后一张纸条发完，关掉假事件源 —— \
-                 之后日志里不会再出现任何 poll"
-            );
-
-            pump.renderer
-                .host
-                .pin_mut()
-                .stop_driver();
+        if pump.ticks % TICKS_PER_STEP == 0 {
+            driver_advance_list(pump);
         }
     });
+
+    // 查目标要借 Pump，但**查完立刻放开**：
+    // send_click_to 是同步派发，会当场回调 qt_handle_event，
+    // 而那个函数自己要再 borrow_mut 一次 —— 借着点就是 BorrowMutError。
+    let target = PUMP.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|pump| pump.renderer.click_target())
+    });
+
+    match target {
+        // SAFETY: target 是刚从活账本里查出来的节点指针。这中间没有任何东西
+        //            会删节点：渲染只在 qt_pump_poll 里发生，而它在事件队列里，
+        //            必须等我们这个回调返回之后才可能被执行。
+        Some(target) => unsafe {
+            ffi::send_click_to(target);
+        },
+
+        None => println!(
+            "[driver] 还没有装了监听器的节点，这一 tick 不点"
+        ),
+    }
 }
 
 
@@ -3224,12 +3583,227 @@ fn qt_pump_poll() {
 
 
 // ============================================================
+// 事件：Qt 的鼠标按下 → dioxus 的 listener
+// ============================================================
+//
+// 这条链上有三个名字要对齐，都是从源码里读出来的，别改错：
+//
+// 1. rsx 里写 `onclick`，模板里存的是 `"onclick"`；
+//    dioxus-core 发 CreateEventListener 时**剥掉前两个字**：
+//    `to.create_event_listener(&attribute.name[2..], id)`（diff/node.rs:533），
+//    所以我们收到的是 `"click"`。
+//    Runtime 匹配 listener 时也是同一个剥法：
+//    `attr.name.get(2..) == Some(name)`（runtime.rs:435）——
+//    于是「原样把 C++ 送回的名字交给 handle_event」正好对得上。
+//
+// 2. 负载类型不是 MouseData，而是 `PlatformEventData`：
+//    rsx 那个 onclick 的 listener 真正的签名是
+//    `|e: Event<PlatformEventData>|`，进去以后才 `e.map(|d| d.into())`
+//    转成 MouseData（dioxus-html events/mod.rs:29-33），
+//    而 `Event::data()` 那边是 `downcast::<T>().unwrap()`（core/events.rs:647）。
+//    所以 Rc<dyn Any> 里装的**必须**是 Rc<PlatformEventData>，
+//    我们自己的鼠标数据放在它的 Box<dyn Any> 内核里。
+//
+// 3. `From<&PlatformEventData> for MouseData` 走的是全局 converter
+//    （generated.rs:353-364 → with_event_converter，mod.rs:76-82），
+//    而那个全局值 `.unwrap()` 一个 Option ——
+//    不调 `set_event_converter` 装上转换器，第一次点就是 panic。
+//    转换器有 21 支（每种事件一支），这里只把 mouse 那支做成真的。
+
+/// 我们的鼠标负载。
+///
+/// 只要满足 `HasMouseData: PointerInteraction: InteractionElementOffset
+/// + ModifiersInteraction`（point_interaction.rs:37）这一串 supertrait 就行，
+/// 每个 getter 交一个数出去。
+#[derive(Clone, Debug)]
+struct QtMouseData {
+    /// item 本地坐标（QMouseEvent::position()）
+    x: f64,
+    y: f64,
+}
+
+impl InteractionLocation for QtMouseData {
+    // Qt 这边没有「视口 / 页面 / 屏幕」这三套坐标系，
+    // 本项目里全用同一个本地坐标顶上 —— 数值上不等价于浏览器，
+    // 但类型和通路是真的。
+    fn client_coordinates(&self) -> ClientPoint {
+        ClientPoint::new(self.x, self.y)
+    }
+
+    fn screen_coordinates(&self) -> ScreenPoint {
+        ScreenPoint::new(self.x, self.y)
+    }
+
+    fn page_coordinates(&self) -> PagePoint {
+        PagePoint::new(self.x, self.y)
+    }
+}
+
+impl InteractionElementOffset for QtMouseData {
+    fn element_coordinates(&self) -> ElementPoint {
+        ElementPoint::new(self.x, self.y)
+    }
+}
+
+impl ModifiersInteraction for QtMouseData {
+    fn modifiers(&self) -> Modifiers {
+        Modifiers::empty()
+    }
+}
+
+impl PointerInteraction for QtMouseData {
+    // filter 只认 MouseButtonPress，而且送进来的就是左键
+    // （见 QtHost::send_click / 真实鼠标也是左键）。
+    fn trigger_button(&self) -> Option<MouseButton> {
+        Some(MouseButton::Primary)
+    }
+
+    fn held_buttons(&self) -> MouseButtonSet {
+        [MouseButton::Primary].into()
+    }
+}
+
+impl HasMouseData for QtMouseData {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// 平台事件 → dioxus-html 通用事件的转换器。
+///
+/// 只实现 mouse 那一支；其余 20 支保留（trait 要求全实现，没有默认实现），
+/// 但一被调到就当场 panic —— 本项目根本没有那些事件，
+/// 静默返回一个假数据比 panic 更糟。
+struct QtEventConverter;
+
+/// 剩下那些事件：统一生成「不许走」的实现。
+macro_rules! unhandled_events {
+    ($($method:ident => $data:ty),* $(,)?) => {
+        $(
+            fn $method(
+                &self,
+                _event: &PlatformEventData,
+            ) -> $data {
+                panic!(
+                    "本项目只派发鼠标按下，{} 没有实现",
+                    stringify!($method)
+                )
+            }
+        )*
+    };
+}
+
+impl HtmlEventConverter for QtEventConverter {
+    fn convert_mouse_data(
+        &self,
+        event: &PlatformEventData,
+    ) -> MouseData {
+        // 这个 downcast 的目标类型就是我们自己塞进 PlatformEventData 的那个，
+        // 两边是同一份代码在管，所以失败就是真出错，直接 panic。
+        let data = event
+            .downcast::<QtMouseData>()
+            .expect("PlatformEventData 里装的应该是 QtMouseData");
+
+        MouseData::new(data.clone())
+    }
+
+    unhandled_events! {
+        convert_animation_data => AnimationData,
+        convert_cancel_data => CancelData,
+        convert_clipboard_data => ClipboardData,
+        convert_composition_data => CompositionData,
+        convert_drag_data => DragData,
+        convert_focus_data => FocusData,
+        convert_form_data => FormData,
+        convert_image_data => ImageData,
+        convert_keyboard_data => KeyboardData,
+        convert_media_data => MediaData,
+        convert_mounted_data => MountedData,
+        convert_pointer_data => PointerData,
+        convert_resize_data => ResizeData,
+        convert_scroll_data => ScrollData,
+        convert_selection_data => SelectionData,
+        convert_toggle_data => ToggleData,
+        convert_touch_data => TouchData,
+        convert_transition_data => TransitionData,
+        convert_visible_data => VisibleData,
+        convert_wheel_data => WheelData,
+    }
+}
+
+/// 把转换器装进那个全局槽。必须在任何点击进来之前调一次。
+fn install_event_converter() {
+    set_event_converter(
+        std::boxed::Box::new(QtEventConverter),
+    );
+
+    println!("[event] HtmlEventConverter 装好了（只认 mouse 那一支）");
+}
+
+
+/// Qt 的 event filter 送上来的按下。
+///
+/// 名字是 C++ 那边原样带回来的（CreateEventListener 当初收到什么，
+/// filter 就存什么），所以这里的 `name` 已经是剥掉 `on` 的形式。
+///
+/// 这条链跑完会发生：listener 里写了 signal → dioxus 发纸条 →
+/// 我们的 waker 被调 → Qt 排一个事件 → 下一次 poll Ready → 渲染。
+/// 全程没有一行代码是「手动把 scope 标脏」。
+fn qt_handle_event(
+    name: &str,
+    element: u32,
+    x: f64,
+    y: f64,
+) {
+    PUMP.with(|slot| {
+        let mut guard = slot.borrow_mut();
+
+        let Some(pump) = guard.as_mut() else {
+            println!(
+                "[event] {name} 来了，但回路还没装好，丢掉"
+            );
+
+            return;
+        };
+
+        // 先进 runtime：listener 里要读写 signal，signal 要找得到当前 scope。
+        let runtime = pump.vdom.runtime();
+
+        let _guard = RuntimeGuard::new(
+            runtime.clone(),
+        );
+
+        let payload: std::rc::Rc<dyn std::any::Any> = std::rc::Rc::new(
+            PlatformEventData::new(std::boxed::Box::new(QtMouseData { x, y })),
+        );
+
+        // propagates = true：click 在 dioxus-html 里是会冒泡的事件
+        // （runtime.rs:374 就靠这个布尔决定走 bubbling 还是 non-bubbling）。
+        let event = Event::new(payload, true);
+
+        println!(
+            "[event] handle_event({name:?}, ElementId({element})) \
+             坐标 ({x:.1}, {y:.1})"
+        );
+
+        runtime.handle_event(
+            name,
+            event,
+            ElementId(element as usize),
+        );
+    });
+}
+
+
+// ============================================================
 // Main
 // ============================================================
 //
 // 现在这个 main 只做两轮：第 4 步 mount，然后把 vdom + renderer 交给回路
 // （第 5 步 install_pump），剩下的全在 Qt 的事件循环里发生。
-// UI 会自己变 9 次 —— 但那 9 次的源头还是假的（DIFF_SCRIPT 喂的纸条）。
+// UI 会自己变、自己响应点击 —— 但两件事的**内容**还是假的
+// （列表来自 DIFF_SCRIPT，按下来自 send_click_to 合成的 QMouseEvent），
+// **机制**全是真的：channel + waker + handle_event + diff。
 //
 // 顺便说明为什么 Qt 和 Dioxus 谁当主循环：
 // 这里让 Qt 当（app.exec()），因为 QQuickWindow 的渲染、
@@ -3358,20 +3932,28 @@ fn main() {
     //
     // main 到这里就把 vdom / renderer 整个交出去，之后自己再也不碰它们。
 
+    // 转换器必须比第一次点击更早装好：
+    // onclick 的 listener 里那步 `From<&PlatformEventData> for MouseData`
+    // 会 unwrap 一个全局 Option，没装就是一声 panic。
+    install_event_converter();
+
     install_pump(
         vdom,
         renderer,
     );
 
 
-    // 这条链上还剩什么是假的：纸条的**内容**。
-    // 真实形态应该是 Qt 的鼠标事件 → create_event_listener
-    // （那个空实现，见 impl WriteMutations）→ runtime().handle_event(...)
-    // （runtime.rs:369）→ handler 里写 signal → dioxus 自己发那张纸条。
-    // 现在用 DIFF_SCRIPT + 一个原子变量把它替了。
+    // 输入这一侧的链到这里是真的了：
+    // Qt 的 MouseButtonPress → ClickFilter（create_event_listener 装上去的）
+    // → qt_handle_event → runtime().handle_event(...)（runtime.rs:369）
+    // → handler 里写 signal → wake → qt_pump_poll → diff → SetAttribute。
     //
-    // 脚本跑完（9 步）之后 driver 不再发纸条，日志会一直停在 Pending ——
-    // 那就是「回路在转、但没有空转渲染」的证据。
+    // driver 里还剩两处假：
+    // 1. 事件是合成的 —— send_click_to 用 QCoreApplication::sendEvent
+    //    往一个「账本上有监听器」的节点丢一个左键按下。
+    //    真窗口下这条可以整条删掉，鼠标自己会来。
+    // 2. 列表的**内容**还是 DIFF_SCRIPT 在推进（9 步跑完就停）。
+    //    脚本停掉之后日志里剩下的渲染，全是真点击驱动的。
 
     println!(
         "Qt event loop started. \

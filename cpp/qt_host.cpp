@@ -33,6 +33,8 @@
 
 #include <algorithm>
 
+const QString TEXT_ITEM_NAME = QStringLiteral("qt_quick_text_item");
+
 namespace {
 
 QString to_qstring(rust::Str text)
@@ -313,6 +315,7 @@ Text {
 
     // 此刻对象已经有了内容，但还没进 visual tree。
     if (item != nullptr) {
+        item->setObjectName(TEXT_ITEM_NAME);
         item->setProperty("text", to_qstring(text));
 
         // Text 的构造函数给自己设了 Qt::LeftButton（qquicktext.cpp:96），
@@ -750,7 +753,7 @@ QtHost::is_text_item(
     // 判据是「这个 item 自己有没有一段要显示的文字」，不是 Rust 记的账、
     // 也不是名字。空文本一并算 false：QTextLayout 对 "" 照样吐一行高
     // （0 x lineHeight），少了这层判断，一个空标签会白占一行。
-    return !text_of_item(item).isEmpty();
+    return item->objectName() == TEXT_ITEM_NAME;
 }
 
 

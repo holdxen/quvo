@@ -30,6 +30,8 @@
 // FLT_MAX —— QQuickText 不限宽时用的也是它（qquicktext.cpp:834）。
 #include <cfloat>
 
+#include <algorithm>
+
 namespace {
 
 QString to_qstring(rust::Str text)
@@ -311,6 +313,12 @@ Text {
     // 此刻对象已经有了内容，但还没进 visual tree。
     if (item != nullptr) {
         item->setProperty("text", to_qstring(text));
+
+        // Text 的构造函数给自己设了 Qt::LeftButton（qquicktext.cpp:96），
+        // 也就是「文本是点击目标」。这里的文本纯展示，而且按钮上的标签
+        // 正好盖在按钮上面 —— 留着它，点标签那一下会被文本吃掉。
+        // 关掉之后命中测试直接跳过它，那一下落到后面的矩形上。
+        item->setAcceptedMouseButtons(Qt::NoButton);
     }
 
     return item;
@@ -478,12 +486,27 @@ QtHost::add_click_listener(
 
     item->installEventFilter(filter);
 
+    // 这一步才是「点得到 / 点不到」的分水岭，光装 filter 没用：
+    // 真鼠标的派发要先过命中测试，而命中测试把
+    // acceptedMouseButtons() == Qt::NoButton 的项**直接当不存在**
+    // （qquickdeliveryagent.cpp:2258，pointerTargets 的谓词）。
+    // 裸 QQuickItem / Rectangle 的默认值就是 NoButton
+    // （qquickitem_p.h:1092-1096：extra 没分配、LeftMouseButtonAccepted 没置 → 空集），
+    // 所以事件在到不了这个 item 之前就被丢了，filter 自然一次都没被调到。
+    //
+    // 之前离屏自检能通，是因为 QCoreApplication::sendEvent(item, ...) 是直接
+    // 把这个对象当事件接收者，绕过了整条命中测试（QQuickItem::event()
+    // 里没有任何 acceptedMouseButtons 检查，qquickitem.cpp:9326/9353）。
+    item->setAcceptedMouseButtons(Qt::LeftButton);
+
     impl_->listeners.push_back(filter);
 
     qDebug()
         << "[Qt] click listener installed on" << item
         << "name" << key.c_str()
-        << "element" << element;
+        << "element" << element
+        << "acceptedMouseButtons"
+        << int(item->acceptedMouseButtons());
 }
 
 
@@ -517,6 +540,20 @@ QtHost::remove_click_listener(
         }
 
         ++it;
+    }
+
+    // 这个 item 上一个 filter 都不剩了，就把命中测试的入场券也一起收回来 ——
+    // 不然它留着 Qt::LeftButton，会当成点击目标白占一格，
+    // 把后面的（比如它父亲上的）监听器挤掉。
+    const bool still_watched = std::any_of(
+        impl_->listeners.begin(),
+        impl_->listeners.end(),
+        [item](const ClickFilter *filter) {
+            return filter->item() == item;
+        });
+
+    if (!still_watched) {
+        item->setAcceptedMouseButtons(Qt::NoButton);
     }
 }
 

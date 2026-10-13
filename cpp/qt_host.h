@@ -120,6 +120,12 @@ public:
     // （child_order 的交叉检查立刻会 ✗）。
     // filter 装在 item 上：不占 visual tree，不吃事件（返回 false），
     // 只负责「有人按在这上面了」这件事转告 Rust。
+    //
+    // 但光装 filter 点不到：真鼠标要先过命中测试，那里把
+    // acceptedMouseButtons() == Qt::NoButton 的项当不存在跳过
+    // （qquickdeliveryagent.cpp:2258），而裸 QQuickItem / Rectangle 的默认
+    // 就是 NoButton（qquickitem_p.h:1092-1096）。所以这里同时把
+    // Qt::LeftButton 打开，remove 时如果这个 item 没别的监听器了就关回去。
     void add_click_listener(
         QQuickItem* item,
         rust::Str name,

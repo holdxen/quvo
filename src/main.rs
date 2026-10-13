@@ -1645,15 +1645,15 @@ impl QtRenderer {
                 continue;
             };
 
-            let content = self.node(id).content.clone();
+            let content = self.node(id).content.as_str();
 
             // 只有文本节点值得比：Rectangle / Item 的 implicit 是 0。
             if content.is_empty() {
                 continue;
             }
 
-            let free = self.host.measure_text(&content, -1.0);
-            let wrapped = self.host.measure_text(&content, 100.0);
+            let free = self.host.measure_text(content, -1.0);
+            let wrapped = self.host.measure_text(content, 100.0);
 
             // SAFETY: 同一个对象指针，来自 create_*；
             // 读 implicit size 不改对象所有权，也不管它挂没挂。

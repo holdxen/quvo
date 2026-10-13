@@ -7,6 +7,7 @@
 
 #include <QtCore/QByteArray>
 #include <QtCore/QDebug>
+#include <QtCore/QMetaObject>
 #include <QtCore/QObject>
 #include <QtCore/QString>
 #include <QtCore/QTimer>
@@ -118,9 +119,9 @@ struct QtHost::Impl {
     QQmlEngine engine;
     QQuickWindow window;
 
-    // 回路的心跳。挂在 window 上（QObject 父子树负责释放），
-    // 所以 start_pump 里 new 完不用管它的死活。
-    QTimer *pump_timer = nullptr;
+    // 假事件源的心跳（见 QtHost::start_driver 的注释）。
+    // 挂在 window 上，由 QObject 父子树负责释放。
+    QTimer *driver_timer = nullptr;
 
     // 这里不再存 id -> 对象的表：指针本身就是句柄，
     // Rust 侧拿着它直接调下面的方法。
@@ -162,36 +163,71 @@ std::unique_ptr<QtHost> new_qt_host()
 }
 
 
+namespace {
+
+// 只用来给 invokeMethod 当一个「归属哪条线程的事件循环」的 context 对象：
+// 它没有子类化，也不接任何信号，构造在 main 之前、活在主线程。
+// 用 context 而不是 QTimer::singleShot(0) 的原因：singleShot 会把 functor
+// 排到**调用它的那条线程**的循环里，而 waker 以后可能被别的线程调用
+// （后台 task 发纸条）；context 把落点钉死在主线程。
+QObject g_pump_context;
+
+} // namespace
+
+
+void schedule_pump_poll()
+{
+    QMetaObject::invokeMethod(
+        &g_pump_context,
+        []() {
+            qt_pump_poll();
+        },
+        Qt::QueuedConnection
+    );
+}
+
+
 void QtHost::show()
 {
     impl_->window.show();
 }
 
 
-void QtHost::start_pump(
+void QtHost::start_driver(
     int interval_ms
 )
 {
     // 挂在 window 上当 QObject 父节点：窗口析构时 timer 一起走，
     // 不需要自己 delete。
-    if (impl_->pump_timer == nullptr) {
-        impl_->pump_timer = new QTimer(&impl_->window);
+    if (impl_->driver_timer == nullptr) {
+        impl_->driver_timer = new QTimer(&impl_->window);
     }
 
-    // 直接调生成头里声明的那个全局函数（`void qt_pump_tick() noexcept;`）。
-    // lambda 形式的 connect 不需要 moc，QTimer 也不是信号发射方以外的东西。
+    // 直接调生成头里声明的那个全局函数（`void qt_driver_tick() noexcept;`）。
+    // lambda 形式的 connect 不需要 moc。
     QObject::connect(
-        impl_->pump_timer,
+        impl_->driver_timer,
         &QTimer::timeout,
         []() {
-            qt_pump_tick();
+            qt_driver_tick();
         }
     );
 
-    impl_->pump_timer->start(interval_ms);
+    impl_->driver_timer->start(interval_ms);
 
     qDebug()
-        << "[Qt] pump timer started," << interval_ms << "ms";
+        << "[Qt] driver timer started," << interval_ms << "ms"
+        << "（它只发纸条，不 poll）";
+}
+
+
+void QtHost::stop_driver()
+{
+    if (impl_->driver_timer != nullptr) {
+        impl_->driver_timer->stop();
+
+        qDebug() << "[Qt] driver timer stopped";
+    }
 }
 
 

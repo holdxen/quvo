@@ -23,19 +23,19 @@ public:
 
     void show();
 
-    // 起一个 QTimer，每 interval_ms 把「回路」叫起来一次。
+    // 起一个 QTimer 当**假的事件源**：每 interval_ms 叫一次 Rust 的
+    // qt_driver_tick()，由它去推 DIFF_STEP 并发纸条。
     //
-    // timeout 里调的是 Rust 那边的 qt_pump_tick —— cxx 把 `extern "Rust"`
-    // 的自由函数在生成头里声明成一个全局 C++ 函数（`void qt_pump_tick() noexcept;`），
-    // 所以这里 include 生成头就能直接调。
-    //
-    // 为什么是 Qt 反过来叫 Rust：Dioxus 的 wait_for_work 是 async，
-    // 而这条线程已经被 app.exec() 占了，不能再自己转圈。
-    // 于是借 Qt 的循环当 executor —— 每次 timeout poll 一次，
-    // 没活就立刻把控制权还回去。
-    void start_pump(
+    // 注意它和「回路」已经没关系了 —— 它不 poll 任何东西。
+    // 真实形态里这一格是鼠标/键盘：事件 → handle_event → 写 signal
+    // → dioxus 发纸条 → waker 被调 → 才轮到 request_pump_poll()。
+    // 脚本跑完 Rust 那边会调 stop_driver() 把它关掉，
+    // 于是日志里连这一行都不再有 —— 空转真的不存在。
+    void start_driver(
         int interval_ms
     );
+
+    void stop_driver();
 
     // 窗口根 = window.contentItem()。
     //
@@ -169,3 +169,24 @@ private:
 };
 
 std::unique_ptr<QtHost> new_qt_host();
+
+
+// 把「该 poll 一次 wait_for_work 了」塞进 Qt 的事件队列。
+//
+// 谁来调：Rust 的 waker（Wake::wake_by_ref）。dioxus 发纸条的那一刻就会调它
+// （futures-channel：unbounded_send → do_send_nb → queue_push_and_signal
+//  → recv_task.wake()，mpsc/mod.rs:457），而 recv_task 就是我们上次 poll 时
+// 通过 Context 交进去的那个 waker。
+//
+// 为什么是全局函数而不是 QtHost 的成员：waker 手里没有 UniquePtr<QtHost> 可用
+// —— 它被调用的那一刻，Pump 正被 borrow_mut 借着（host 就在 Pump 里面），
+// 想拿 host 就是二次借用。自由函数不需要任何接收者，也就绕开了这件事。
+//
+// 为什么只能「排队」不能当场调 ::qt_pump_poll()：wake() 是在 needs_update
+// 那一行**里面**被同步调进来的，那一刻我们可能正在渲染、正在借着 Pump。
+// QueuedConnection 把它推到本次回调返回之后由事件循环执行，
+// 重入被语义挡掉。
+//
+// 于是原来的 interval 轮询整个删掉了：空闲时 Qt 阻塞在 exec() 里，
+// 一次 poll 都不会发生。
+void schedule_pump_poll();

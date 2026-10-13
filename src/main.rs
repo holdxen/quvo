@@ -334,31 +334,46 @@ mod ffi {
             item: *mut QQuickItem,
         ) -> f64;
 
-        // 起一个 QTimer，每 interval_ms 把 Qt 事件循环叫起来一次，
-        // 每次 timeout 都去调下面那个 `extern "Rust"` 的 qt_pump_tick。
-        //
-        // 这就是「借 Qt 的循环当 executor」的那一半：
-        // Dioxus 这边不再自己转圈，只是搭 Qt 的便车。
-        fn start_pump(
-            self: Pin<&mut QtHost>,
-            interval_ms: i32,
-        );
-
         // 诊断用：读 Qt 侧 childItems 的实际顺序（对象地址）。
         // 见 cpp/qt_host.h 的注释 —— 插到中间这件事，从坐标上看不出来。
         unsafe fn child_order(
             self: &QtHost,
             parent: *mut QQuickItem,
         ) -> Vec<u64>;
+
+        // 起一个 QTimer 当**假的事件源**：每 interval_ms 调一次 Rust 的
+        // qt_driver_tick()。它不 poll 任何东西 —— 真实形态里这一格是鼠标。
+        fn start_driver(
+            self: Pin<&mut QtHost>,
+            interval_ms: i32,
+        );
+
+        fn stop_driver(
+            self: Pin<&mut QtHost>
+        );
+    }
+
+    // C++ 的自由函数：把「该 poll 一次了」排队投进主线程的事件循环。
+    // 谁调它：下面的 QtWaker::wake_by_ref —— 也就是 dioxus 发纸条的那一刻
+    // （futures-channel: unbounded_send → queue_push_and_signal
+    //  → recv_task.wake()，mpsc/mod.rs:457）。
+    // 为什么它是自由函数、而且为什么只能排队：见 cpp/qt_host.h 的注释。
+    unsafe extern "C++" {
+        include!("test_dioxus_qt/cpp/qt_host.h");
+
+        fn schedule_pump_poll();
     }
 
     // 反方向：C++ 调 Rust。
     //
-    // cxx 会把 `extern "Rust"` 里的自由函数在生成头里声明成一个 C++ 函数，
-    // C++ 那边（cpp/qt_host.cpp）include 生成头就能直接调 ——
-    // QTimer::timeout 的 lambda 里就是这么把控制权交回 Rust 的。
+    // cxx 把 `extern "Rust"` 里的自由函数在生成头里声明成**全局** C++ 函数
+    // （`void qt_driver_tick() noexcept;` 这种），C++ include 生成头就能直接调。
     extern "Rust" {
-        fn qt_pump_tick();
+        // 假事件源：推一格 DIFF_STEP 并发纸条。
+        fn qt_driver_tick();
+
+        // 回路本身：poll 一次 wait_for_work，醒了才渲染。
+        fn qt_pump_poll();
     }
 }
 
@@ -2866,31 +2881,55 @@ impl WriteMutations for QtRenderer {
 //
 // 形状就一句话：
 //
-//     Qt 的 QTimer 每 20ms 转一次 → 每次转都 poll 一遍 wait_for_work()
+//     有人发纸条 → dioxus 调我们的 waker → waker 让 Qt 排一个事件
+//     → 事件的 functor 里 poll 一次 wait_for_work()
 //     → Pending 就什么都不做，Ready 就 render_immediate + relayout
 //
 // 为什么要「poll 一次」而不是 `.await`：
 // `wait_for_work` 是 `async fn`（virtual_dom.rs:445），`.await` 需要一个
 // executor 去驱动它；而这里唯一的线程已经被 `app.exec()` 占着
-// （`block_on` 会把纸条的来源也一起堵死）。所以把它当成一个
-// 「每次事件都问一句」的同步接口来用 —— 这就是借 Qt 的循环当 executor。
+// （`block_on` 会把纸条的来源也一起堵死 —— 纸条的源头恰恰是 Qt 事件回调）。
+// 所以「等」这件事只有 Qt 的循环有资格做，Rust 这边只负责被叫起来 poll 一次。
 //
-// 一个关键的好性质：future **不需要跨 tick 存着**。
+// 一个关键的好性质：future **不需要跨事件存着**。
 // wait_for_work 的全部状态都在 VirtualDom 自己身上：
 // 纸条在 `self.rx`（virtual_dom.rs:215 那个 UnboundedReceiver），
 // 脏 scope 在脏表里。future 本身只是「先看一眼，没有就等」这段流程，
-// 所以每个 tick 现场新建一个、poll 一次、丢掉，一条消息都不会漏。
+// 所以每次被叫起来现场新建一个、循环 poll 到 Pending、丢掉，一条消息都不会漏。
 //
-// waker 为什么可以什么都不做：真正的唤醒源是 Qt 的 timer，不是 Rust 的 waker。
-// 纸条来了没人被 wake —— 下一个 tick 自己会再问一遍。
-// poll 因此不是「必须有人 wake 才能醒」，而是「主动问一句有没有活」。
+// 这一版是 **wake 驱动**，不是轮询：
+// poll 到 Pending 时我们把 waker 交了出去（Context 里那个），
+// dioxus 下一次发纸条就会同步调它
+// （futures-channel：unbounded_send → do_send_nb → queue_push_and_signal
+//  → recv_task.wake()，mpsc/mod.rs:457）。
+// 我们的 waker 只做一件事：让 Qt 把「再 poll 一次」排进事件队列
+// （C++ 的 schedule_pump_poll）。于是空闲时一次 poll 都不会发生 ——
+// 上一版那个每 20ms 转一圈的 QTimer 已经删掉了。
+//
+// QTimer 还在，但角色换了：它是**假的事件源**（qt_driver_tick），
+// 只负责「推一格 + 发纸条」，跟回路无关。
+// 真实形态里这一格会被鼠标/键盘事件替掉。
 
-/// 什么都不做的 waker，见上面最后一段。
-struct IdleWaker;
+/// 纸条到了该干什么：把「再 poll 一次」排队交给 Qt 的事件循环。
+///
+/// 注意这里**不能**直接调 qt_pump_poll()：wake_by_ref 是在
+/// `needs_update(...)` 那一行里面被同步调进来的，那一刻 Pump 正被
+/// `borrow_mut` 借着（driver 自己就拿着这个借用），当场 poll 就是重入。
+/// QueuedConnection 把它推到本次回调返回之后再执行。
+struct QtWaker;
 
-impl Wake for IdleWaker {
-    fn wake(self: Arc<Self>) {}
-    fn wake_by_ref(self: &Arc<Self>) {}
+impl Wake for QtWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        // 只是往 Qt 的事件队列里投一个 functor（QMetaObject::invokeMethod,
+        // QueuedConnection）：不碰任何对象指针，也不当场回调 Rust，
+        // 所以此刻就算 Pump 正被借着也没问题。
+        // （它是 cxx 生成的**安全**函数：没有 self、没有指针参数。）
+        ffi::schedule_pump_poll();
+    }
 }
 
 /// 回路的两端：VirtualDom（脏表 + 纸条队列）和我们的 renderer，
@@ -2900,53 +2939,53 @@ struct Pump {
     vdom: VirtualDom,
     renderer: QtRenderer,
     waker: Waker,
-    /// 已经转过多少个 tick
-    ticks: usize,
     /// DIFF_SCRIPT 走到第几步
     step: usize,
 }
 
-// Qt 的 timer 回调是这条线程上唯一碰 Pump 的地方，
+// 只有主线程会碰它（Qt 的 timer 回调、Qt 事件队列里的 functor 都在这条线程），
 // 所以 thread_local + RefCell 就够（不需要 Sync，也不需要锁）。
-// 真正的 re-entrance（渲染中又触发一次 tick）会把 borrow_mut 打成 panic，
+// 真正的 re-entrance（渲染中又进来一次）会把 borrow_mut 打成 panic，
 // 那是「回路里又跑回路」的信号，不是要悄悄吞掉的情况。
 thread_local! {
     static PUMP: RefCell<Option<Pump>> = const { RefCell::new(None) };
 }
 
-/// 多少个 tick 喂一次假纸条（下面 driver_send_work 用）。
-const TICKS_PER_STEP: usize = 3;
+/// 假事件源的间隔 —— 和回路无关，纯粹是「多久模拟一次用户操作」。
+const DRIVER_INTERVAL_MS: i32 = 200;
 
-/// QTimer 的间隔。
-const PUMP_INTERVAL_MS: i32 = 20;
-
-/// 把 vdom + renderer 交给回路，并让 Qt 开始 tick。
+/// 把 vdom + renderer 交给回路，起假事件源，并**先 poll 一次**。
+///
+/// 那一次先 poll 不是走形式：waker 只有在 future 被 poll 到 Pending 之后
+/// 才算交给了 channel（`recv_task` 里存的就是它）。装好之后不 poll 一次，
+/// 后面 dioxus 发纸条时手上没有 waker 可调，回路就永远醒不过来了。
 fn install_pump(
     vdom: VirtualDom,
     mut renderer: QtRenderer,
 ) {
-    // 先起 timer：这一步必须在把 renderer 交出去之前做，
-    // 因为 host 藏在 renderer 里面。
+    // 起 timer 要在把 renderer 交出去之前：host 藏在 renderer 里面。
     renderer
         .host
         .pin_mut()
-        .start_pump(PUMP_INTERVAL_MS);
+        .start_driver(DRIVER_INTERVAL_MS);
 
     PUMP.with(|slot| {
         *slot.borrow_mut() = Some(Pump {
             vdom,
             renderer,
-            waker: Waker::from(Arc::new(IdleWaker)),
-            ticks: 0,
+            waker: Waker::from(Arc::new(QtWaker)),
             step: 0,
         });
     });
 
     println!(
-        "[pump] 回路装好了：每 {PUMP_INTERVAL_MS}ms 一个 tick，\
-         每 {TICKS_PER_STEP} 个 tick 喂一张纸条（共 {} 步）",
+        "[pump] 回路装好了（wake 驱动，无轮询）：\
+         假事件源每 {DRIVER_INTERVAL_MS}ms 发一张纸条，共 {} 步",
         DIFF_SCRIPT.len() - 1
     );
+
+    // 先把 waker 交出去。
+    qt_pump_poll();
 }
 
 
@@ -2971,45 +3010,7 @@ fn install_pump(
 ///    它问的是「当前线程正在跑的那个 runtime」，不是我们手里的这个。
 ///    第一次跑的时候没加 guard，当场 panic
 ///    「Must be called from inside a Dioxus runtime」（runtime.rs:100）。
-fn driver_send_work(
-    pump: &mut Pump,
-) {
-    if pump.step + 1 >= DIFF_SCRIPT.len() {
-        // 脚本跑完了：静默，一个 tick 一行会淹掉日志。
-        return;
-    }
-
-    pump.step += 1;
-
-    DIFF_STEP
-        .store(pump.step, Ordering::Relaxed);
-
-    println!(
-        "[driver] tick {} → 发 Immediate(ScopeId::APP) 纸条，\
-         下一次渲染的 key = {:?}",
-        pump.ticks,
-        DIFF_SCRIPT[pump.step]
-    );
-
-    if pump.step + 1 >= DIFF_SCRIPT.len() {
-        println!(
-            "[driver] 这是最后一张纸条，之后回路只会 Pending，\
-             一行渲染都不会再产生"
-        );
-    }
-
-    let runtime = pump.vdom.runtime();
-
-    let _guard = RuntimeGuard::new(
-        runtime.clone(),
-    );
-
-    runtime.needs_update(ScopeId::APP);
-}
-
-
-/// 每个 Qt tick 干的事。这就是 C++ 那边 QTimer::timeout 调进来的函数。
-fn qt_pump_tick() {
+fn qt_driver_tick() {
     PUMP.with(|slot| {
         let mut guard = slot.borrow_mut();
 
@@ -3017,53 +3018,115 @@ fn qt_pump_tick() {
             return;
         };
 
-        pump.ticks += 1;
-
-        // 1. 定时喂一张纸条。发完就 return —— 故意不在这一次去醒：
-        //    这样「发纸条」和「醒过来渲染」一定落在两个不同的 tick 上，
-        //    日志里能看出因果不是同一句函数调用串起来的。
-        if pump.ticks % TICKS_PER_STEP == 0 {
-            driver_send_work(pump);
-
+        if pump.step + 1 >= DIFF_SCRIPT.len() {
+            // timer 已经关了，理论上到不了这里。
             return;
         }
+
+        pump.step += 1;
+
+        DIFF_STEP
+            .store(pump.step, Ordering::Relaxed);
+
+        println!(
+            "[driver] 发纸条 Immediate(ScopeId::APP)，\
+             下一次渲染的 key = {:?}",
+            DIFF_SCRIPT[pump.step]
+        );
+
+        let runtime = pump.vdom.runtime();
+
+        let _guard = RuntimeGuard::new(
+            runtime.clone(),
+        );
+
+        // 这一行**里面**发生的事：纸条进 channel → recv_task.wake()
+        // → QtWaker::wake_by_ref → schedule_pump_poll() 把一次 poll 排进
+        // Qt 的事件队列。所以我们并没有在这里渲染，只是登记了「稍后叫我」。
+        runtime.needs_update(ScopeId::APP);
+
+        if pump.step + 1 >= DIFF_SCRIPT.len() {
+            println!(
+                "[driver] 最后一张纸条发完，关掉假事件源 —— \
+                 之后日志里不会再出现任何 poll"
+            );
+
+            pump.renderer
+                .host
+                .pin_mut()
+                .stop_driver();
+        }
+    });
+}
+
+
+/// 回路本身：反复 poll `wait_for_work` 直到 Pending，中间每次 Ready 都渲染一轮。
+/// 调用者只有一个：C++ 的 `schedule_pump_poll()` 排进事件队列的那个 functor。
+///
+/// **为什么必须循环到 Pending** —— 这不是为了效率，是为了重新挂上 waker：
+/// `wait_for_work` 醒来的那条路径（virtual_dom.rs:452，脏表非空就直接 return）
+/// 根本没碰 `rx.next()`，于是 channel 里 `recv_task` 存着的那个 waker 是空的；
+/// 下一次 `unbounded_send` 就 wake 不到任何人。
+/// 第一版就踩在这上面：只有第一条纸条渲染了，后面 7 条发出去没人醒。
+/// 循环到 Pending 之后，最后那次 poll 会走到 `wait_for_event().await`
+/// （virtual_dom.rs:460）→ `rx.next()` 把我们的 waker 存回 channel，重新武装。
+///
+/// 顺带这也修掉另一个问题：一次 wake 里可能已经堆了好几张纸条，
+/// `process_events` 一次收不完 —— 循环能把它们全 drain 掉。
+///
+/// Pending 分支就是这条回路的「睡着」：什么都不做，waker 躺在 channel 里，
+/// 下一次会不会被叫起来完全取决于**有没有人发纸条**，不取决于有没有定时器在转。
+fn qt_pump_poll() {
+    PUMP.with(|slot| {
+        let mut guard = slot.borrow_mut();
+
+        let Some(pump) = guard.as_mut() else {
+            return;
+        };
 
         let Pump {
             vdom,
             renderer,
             waker,
-            ticks,
             ..
         } = pump;
 
-        // 2. poll wait_for_work 一次。
-        let woke = {
-            let mut fut = std::pin::pin!(
-                vdom.wait_for_work()
+        let mut rounds = 0usize;
+
+        loop {
+            let woke = {
+                let mut fut = std::pin::pin!(
+                    vdom.wait_for_work()
+                );
+
+                let mut cx = Context::from_waker(&*waker);
+
+                fut.as_mut().poll(&mut cx).is_ready()
+            };
+
+            if !woke {
+                println!(
+                    "[pump] poll → Pending（waker 已交回 channel，等下一次 wake），\
+                     这一轮渲染了 {rounds} 次"
+                );
+
+                break;
+            }
+
+            // 醒了才干活。
+            rounds += 1;
+
+            println!("[pump] poll → Ready #{rounds}，render_immediate");
+
+            vdom.render_immediate(
+                renderer
             );
 
-            let mut cx = Context::from_waker(&*waker);
+            // 批量边界：这一轮 mutation 全落完了，算一次布局。
+            renderer.relayout();
 
-            fut.as_mut().poll(&mut cx).is_ready()
-        };
-
-        if !woke {
-            println!("[pump] tick {ticks} → Pending，这一轮什么都不做");
-
-            return;
+            renderer.dump_tree();
         }
-
-        // 3. 醒了才干活。
-        println!("[pump] tick {ticks} → Ready，render_immediate");
-
-        vdom.render_immediate(
-            renderer
-        );
-
-        // 批量边界：这一轮 mutation 全落完了，算一次布局。
-        renderer.relayout();
-
-        renderer.dump_tree();
     });
 }
 
@@ -3195,11 +3258,11 @@ fn main() {
     //
     // 原来这段是「第 4.7 步：exec 之前用 for 循环手动把 diff 推完」
     // （store → mark_all_dirty → render_immediate → relayout → dump_tree）。
-    // 现在那三件事被拆进了 Qt 的循环里，而且拆成了两个不同的 tick：
+    // 现在这些事全在 exec 之后、由事件循环驱动：
     //
-    //     tick 3k   → driver_send_work：needs_update(ScopeId::APP) 发纸条
-    //     tick 3k+1 → poll wait_for_work → Ready → render_immediate + relayout
-    //     其余 tick → Pending，一行渲染都不产生
+    //     QTimer(200ms) → qt_driver_tick：推一格 + 发纸条（假事件源）
+    //     纸条 → 我们的 waker → C++ schedule_pump_poll() → 排一个 Qt 事件
+    //     事件 → qt_pump_poll：poll 一次 wait_for_work → Ready → 渲染 + 布局
     //
     // main 到这里就把 vdom / renderer 整个交出去，之后自己再也不碰它们。
 

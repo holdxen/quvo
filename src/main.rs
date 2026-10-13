@@ -56,10 +56,11 @@
 //!
 //! ## 阅读顺序建议
 //!
-//! 1. `app()` —— 用户写的 UI 就三行
-//! 2. `mod ffi` —— Rust ↔ C++ 的双向接口：22 个正向（1 个造 QtHost + 21 个方法）
-//!    + 2 个 C++ 自由函数 + 3 个 C++ 回调 Rust
-//! 3. `QtRenderer` 的三个字段 —— renderer 记了哪三本账
+//! 1. `app()` —— counter demo 那一屏，加三个按钮
+//! 2. `mod ffi` —— Rust ↔ C++ 的双向接口：20 个正向（1 个造 QtHost + 19 个方法）
+//!    + 1 个 C++ 自由函数 + 2 个 C++ 回调 Rust
+//! 3. `struct QtRenderer` 的字段注释 —— 树账（nodes/stack）、
+//!    id 账（element_to_node/instance_paths）、布局账（tree/root_taffy）各记什么
 //! 4. `impl WriteMutations` —— 指令如何变成 Qt 调用（核心）
 //! 5. `main()` —— 拼起来的顺序
 //!
@@ -72,24 +73,26 @@
 //!   AppendChildren / ReplacePlaceholder / 三条 diff 分支 / Remove / AssignId），
 //!   配套的 C++ `destroy`、`place`（同父移动）也在；
 //! - `assign_node_id` 按 path 找回那个静态节点，见 `instance_paths`；
-//! - 回路是自己转的：Qt 的 timer/Rust 的 `QtWaker` → `schedule_pump_poll`
-//!   → `qt_pump_poll` 把 `wait_for_work` poll 到 Pending 为止；
-//! - 输入侧走真事件：`create_event_listener` 在 QQuickItem 上装
-//!   `ClickFilter`，`qt_handle_event` 把 `Rc<PlatformEventData>` 送进
-//!   `runtime().handle_event("click", ...)`。
+//! - 回路是自己转的：Rust 的 `QtWaker` → `schedule_pump_poll`
+//!   → `qt_pump_poll` 把 `wait_for_work` poll 到 Pending 为止，空闲时零轮询；
+//! - 输入侧走真事件，而且是**唯一的**纸条来源：
+//!   `create_event_listener` 在 QQuickItem 上装 `ClickFilter`，
+//!   鼠标按下 → `qt_handle_event` → `runtime().handle_event("click", ...)`
+//!   → listener 写 signal → wake → 渲染。
+//!   以前那个每 200ms 推一格的假事件源（QTimer + DIFF_SCRIPT + send_click_to）
+//!   整条删掉了，`app()` 现在就是个 counter，不点不动。
 //!
-//! 还是假的 / 还缺的：
+//! 还缺的：
 //!
-//! - **点击的来源**是 `send_click_to`（`QCoreApplication::sendEvent` 造一个
-//!   左键按下），为了让 offscreen 也能证明链路通；真窗口下该删的就是这条。
-//! - **列表的内容**是 `DIFF_SCRIPT` 在推进（9 步跑完自动关 driver），
-//!   不是用户改的。
 //! - 监听器只认 `QEvent::MouseButtonPress`：名字是 Dioxus 给什么就存什么、
 //!   回调时原样交回去，所以 `onkeydown` 这种也会装上一个「鼠标按下才响」的
 //!   filter —— 真要做别的输入，得让 `ClickFilter` 分清事件类型。
 //! - 窗口 resize 没有触发重排；字体还是 Qt 自己的默认值，
 //!   没和 `measure_text` 用同一个来源；
 //!   `AttributeValue::{Int, Float, Bool, None}` 在属性过滤那步被丢掉。
+//! - 因为事件源只剩鼠标，offscreen 跑起来之后日志里不会再有渲染 ——
+//!   回路醒着但没人叫醒它。click→handle_event→渲染那一段的回归测试
+//!   搬到了 `mod tests` 里（不碰 Qt，直接在 VirtualDom 上派发事件）。
 
 use cxx::UniquePtr;
 
@@ -100,7 +103,6 @@ use dioxus::dioxus_core::{
     ElementId,
     Event,
     RuntimeGuard,
-    ScopeId,
     Template,
     TemplateAttribute,
     TemplateNode,
@@ -109,6 +111,11 @@ use dioxus::dioxus_core::{
 };
 
 use dioxus::prelude::*;
+
+// Signal 的写方法（set / apply / replace）都在 WritableExt 上，
+// dioxus 的 prelude 不带它（要 dioxus 的 "signals" feature 才转发），
+// 而本项目本来就直接依赖 dioxus-signals。
+use dioxus_signals::WritableExt;
 
 // dioxus-html 那套事件类型：本项目要自己造一个 PlatformEventData 的负载，
 // 并且要装一个 HtmlEventConverter，所以这些名字都得进来。
@@ -163,10 +170,6 @@ use dioxus::html::input_data::{
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{
-    AtomicUsize,
-    Ordering,
-};
 use std::task::{
     Context,
     Wake,
@@ -419,18 +422,6 @@ mod ffi {
             item: *mut QQuickItem,
             name: &str,
         );
-
-        // 起一个 QTimer 当**假的事件源**：每 interval_ms 调一次 Rust 的
-        // qt_driver_tick()（推列表一格 + 合成一次点击）。
-        // 它不 poll 任何东西 —— 回路在 qt_pump_poll 那边，两件事分开。
-        fn start_driver(
-            self: Pin<&mut QtHost>,
-            interval_ms: i32,
-        );
-
-        fn stop_driver(
-            self: Pin<&mut QtHost>
-        );
     }
 
     // C++ 的自由函数：把「该 poll 一次了」排队投进主线程的事件循环。
@@ -442,23 +433,13 @@ mod ffi {
         include!("test_dioxus_qt/cpp/qt_host.h");
 
         fn schedule_pump_poll();
-
-        // 离屏自检用：同步往某个 item 发一个左键按下。
-        // 自由函数（不挂 QtHost），原因见 cpp 那边的注释：
-        // 调用它的时候绝不能借着 Pump。
-        unsafe fn send_click_to(
-            item: *mut QQuickItem,
-        );
     }
 
     // 反方向：C++ 调 Rust。
     //
     // cxx 把 `extern "Rust"` 里的自由函数在生成头里声明成**全局** C++ 函数
-    // （`void qt_driver_tick() noexcept;` 这种），C++ include 生成头就能直接调。
+    // （`void qt_pump_poll() noexcept;` 这种），C++ include 生成头就能直接调。
     extern "Rust" {
-        // 假事件源：推一格 DIFF_STEP 并发纸条。
-        fn qt_driver_tick();
-
         // 回路本身：poll 一次 wait_for_work，醒了才渲染。
         fn qt_pump_poll();
 
@@ -559,151 +540,156 @@ fn Rectangle(
 //      所以宽度不是这条检查的信号，高度才是。）
 //
 // 2. 静态属性和动态属性两条路都走到了：
-//    <qt-column> 上那几个是模板里写死的 → TemplateAttribute::Static，
-//    在 create_template_node 里就记进布局账本；
-//    Text / Rectangle 那几个是组件 props 插值 → SetAttribute，
+//    <qt-column> / <qt-rectangle> 上那些写死的字面量是
+//    TemplateAttribute::Static，在 create_template_node 里就记进布局账本；
+//    Text 的 text、条目的 text、count 的插值是动态属性 → SetAttribute，
 //    在 set_attribute 里记账。
 //
-// 3. <qt-column> 的模板里现在有「两个洞」
-//    （Text 是一个组件调用；for 循环整块是另一个 Dynamic 节点）：
+// 3. 根 <qt-column> 的模板里有**三个洞**：
+//    Text 组件调用、那个 `if`、`for` 循环各是一个 Dynamic 节点，
+//    于是每次渲染都会收到三次 ReplacePlaceholder，而且 Dioxus 是
+//    倒着发的 —— 正好是「先写完属性再装载孩子」那条不变式的活教材
+//    （diff/node.rs:616-620）。
+//    第三个洞一次顶上来 m 个节点（m = 当前条目数，0..=4）。
 //
-//        node_paths = [ [0,0], [0,1] ]
-//
-//    所以 ReplacePlaceholder 会被调用两次，而且 Dioxus 是
-//    倒着发的（先 [0,1] 再 [0,0]）—— 正好是那条不变式的活教材。
-//    第二个洞一次顶上来 m 个节点（m = 当前矩形个数）。
+//    按钮那一行不是洞：它是模板里的静态子树，但它那三个 qt-rectangle
+//    各带一个动态 onclick，所以每个都会先吃一条 AssignId
+//    —— 没有 AssignId 就没有 ElementId，监听器根本送不到节点上。
 
-// 手动 diff 的脚本表 —— 这不是 UI 状态的正道。
+// counter demo：唯一的真状态是一个整数，唯一的输入是真鼠标。
 //
-// 正道是 signal + 事件回路：signal 变了 → 有人 poll VirtualDom →
-// render_immediate 出 diff。那条回路还没接（下一步），
-// 所以这里写死一张脚本表，让 main() 能确定地把 diff 走过一遍。
+// diff 的几条分支现在全由点击自己跑出来：
 //
-// 为什么表里放的是「key 列表」而不是个数：只有 keyed 列表才凑得出四种不同的
-// diff 结果，一条 mutation 都不漏 ——
+//     点「加一」→ 列表尾部多出新 key   → InsertAfter（新建）
+//                                        （diff/iterator.rs:452-469）
+//     点「减一」→ 少了一个 key         → 单独的 Remove
+//                                        （diff/iterator.rs:316）
+//     点到 3    → 同一个坑位从空长成有 → ReplacePlaceholder
 //
-//     老 key 少了一个      → 单独的 Remove        （diff/iterator.rs:316）
-//     尾部多了新 key       → InsertAfter，新节点    （diff/iterator.rs:452-469）
-//     key 全在、只换顺序   → InsertBefore/After，
-//                           递过来的是**已有**的节点（移动全程不发 Remove，
-//                           见 diff/iterator.rs:343-375）
-//     老 key 一个都不留    → 先 create 新的，再把最后一个老的
-//                           换成 ReplaceWith        （diff/iterator.rs:305-308）
-//
-// 事件回路已经接上了，这张表现在只是**列表那一半的假事件源**：
-// driver_advance_list 每 TICKS_PER_STEP 个 tick 推一格、发一张纸条。
-// 点击那一半是真的（Qt 事件 → handle_event → 写 signal）。
-const DIFF_SCRIPT: &[&[usize]] = &[
-    &[0, 1],       // 第 4 步 mount 就是这个样子
-    &[0],          // Remove
-    &[0, 1, 2],    // InsertAfter，两个都是新建的
-    &[2, 0, 1],    // InsertBefore：移动已有节点（被移的在锚点后面 —— 下标不变）
-    &[1, 2, 0],    // InsertBefore：再往回收一格
-    &[2, 0, 1, 3], // InsertAfter：新建一个 + 移动一个，被移的那个在锚点前面，
-                   // 而且要插到末尾 —— place 的「摘了再挂回去」那支为它而加
-    &[3, 0, 1, 2], // 一步发两条：InsertAfter + InsertBefore
-    &[1, 2, 3, 0], // InsertBefore 一次挪两个
-    &[7, 8],       // 没有共同 key：Remove×3 + ReplaceWith
-];
-
-static DIFF_STEP: AtomicUsize = AtomicUsize::new(0);
-
-fn diff_keys() -> Vec<usize> {
-    let step = DIFF_STEP
-        .load(Ordering::Relaxed)
-        .min(DIFF_SCRIPT.len() - 1);
-
-    DIFF_SCRIPT[step].to_vec()
-}
-
+// 以前这三条靠 DIFF_SCRIPT（一份写死的 key 表 + 一个每 200ms 推一格的
+// QTimer）跑，脚本删了；编在宽度里的那把「key 身份证」也跟着删了 ——
+// 它验的是脚本给的顺序和屏幕上的顺序一致，而脚本已经没了。
+// 留下来不依赖事件源的检查是每次渲染后 dump_tree 里的 child_order 交叉检查。
 fn app() -> Element {
-    // 没有 main.qml，也没有 QML 的 Layout / anchors。
-    let keys = diff_keys();
-
-    // 真状态：由 Qt 的鼠标事件写、由这条 scope 读。
-    // 读它（`clicks()`）就是把本 scope 订阅到这个 signal 上 ——
-    // 于是「点一下」之后的链路全是 dioxus 自己的机制：
+    // 唯一的真状态。读它（`count()`）就是把本 scope 订阅到这个 signal 上；
+    // 写它（下面三个 onclick）之后整条链全是 dioxus 自己的机制：
     // write → 发纸条 → 我们的 waker → Qt 事件 → poll Ready → diff → SetAttribute。
-    let mut clicks = use_signal(|| 0usize);
+    let mut count = use_signal(|| 0i64);
 
-    let clicks_shown = clicks();
+    let shown = count();
 
-    println!(
-        "[app] 被渲染，列表 key = {keys:?}，clicks = {clicks_shown}"
-    );
+    println!("[app] 被渲染，count = {shown}");
 
-    // 每个条目两把「身份证」，都编码在尺寸里，dump_tree 一眼能读出来：
-    //
-    //     容器宽 = 100 + 50 * key      → 这一格住的是哪个 key
-    //     矩形宽 = 20  + 7  * key      → 第二个 AssignId 有没有绑对人
-    //
-    // 两个都写成**动态属性**，而且都落在同一个模板实例的不同路径上
-    // （[0] 和 [1]），于是每次新建实例都会收到两条 AssignId。
-    // 绑错节点的话：矩形那条宽度会落到文本上 —— 文本变成显式宽度、
-    // 矩形退回自动宽度，日志里立刻对不上。
-    let items: Vec<(usize, usize, usize, String)> = keys
-        .iter()
-        .map(|key| {
-            (
-                *key,
-                100 + key * 50,
-                20 + key * 7,
-                format!("key {key} · clicks {clicks_shown}"),
-            )
-        })
-        .collect();
+    // 跟着 count 长的一排条目：最多加到 4 行然后封顶，
+    // 于是往回点（-1 / reset / 条目上那个小方块）会一行行缩回去。
+    let rows: Vec<i64> = (0..shown).take(4).collect();
 
     rsx! {
+        // 没有 main.qml，也没有 QML 的 Layout / anchors ——
+        // 这里的 width / height / gap / flex_direction 是布局输入，
+        // 唯一作者还是 relayout()。
         qt-column {
             width: "600",
-            height: "180",
+            height: "320",
             flex_direction: "column",
             gap: "12",
 
             Text {
-                text: "Hello from Dioxus -> Qt Quick (taffy layout)",
+                text: "counter = {shown}",
             }
 
-            // 每个条目刻意做成「一个容器 + 两个孩子」，也就是 3 个节点的一棵小子树。
-            // 这样删一个条目时 destroy 只调用一次、日志里却有 3 行 object destroyed，
-            // 同时证明：孩子是 QObject 的孩子（跟着父亲递归析构）、
-            // 我们的账本整棵清干净了、没有双重释放。
+            // 这一格是**条件**，不是 keyed 列表：
+            // count 到 3 之前这里没有孩子，到了就长出一行文本。
+            // 同一个坑位从空长成有东西 → ReplacePlaceholder；
+            // 退回空 → 那条无共同 key 的 Remove / ReplaceWith 分支。
+            if shown >= 3 {
+                Text {
+                    text: "已经点到 {shown}：下面条目上的小方块每点一下减一",
+                }
+            }
+
+            // 一行三个按钮。容器还是 qt-column，只是 flex_direction 给 row。
             //
-            // 两个孩子都写成**原生元素** + 动态属性，就是为了逼出 AssignId：
-            // 用 Text { } 组件的话，动态 text 落在它自己那个模板的**根**上
-            // （根的 id 从 LoadTemplate 就有，永远不需要 AssignId）；
-            // 写在这里，它们是本次模板 root 的第 0 / 第 1 个孩子，
-            // dioxus 必须先发 AssignId([0]) / AssignId([1])，
-            // 再各自发 SetAttribute（diff/node.rs:816 → :871）。
-            for (key, item_width, rect_width, text) in items {
-                // 竖排 + 80 高：两个孩子都排在**主轴**上，
-                // 交叉轴（宽度）因此不会被 stretch 改写，
-                // 而 15 + 40 = 55 < 80 也就没有主轴收缩。
-                //
-                // 这件事必须显式管起来：行内排放不下时 taffy 会 flex-shrink，
-                // 把矩形那个「宽度身份证」从 20+7k 挤成别的数 ——
-                // 检测器会因为布局合法溢出而假红。
-                qt-column {
-                    key: "{key}",
-                    width: "{item_width}",
-                    height: "80",
-                    flex_direction: "column",
+            // 按钮里的 qt-rectangle 是**内层静态元素** + 动态 onclick，
+            // 所以 dioxus 必须先给它 AssignId，再发 CreateEventListener
+            // （diff/node.rs:856-874 → :533）——
+            // 没有 ElementId 的话监听器根本送不到节点上。
+            // rsx 里写的是 onclick，送到我们手里已经是 "click"
+            // （:533 把 "on" 前缀剥掉了）。
+            qt-column {
+                width: "380",
+                height: "48",
+                flex_direction: "row",
+                gap: "12",
+
+                qt-rectangle {
+                    width: "110",
+                    height: "48",
+                    color: "#d9825f",
+                    onclick: move |_| {
+                        count -= 1;
+                    },
 
                     qt-text {
-                        text: "{text}",
+                        text: "减一",
+                    }
+                }
+
+                qt-rectangle {
+                    width: "110",
+                    height: "48",
+                    color: "#5f9ed9",
+                    onclick: move |_| {
+                        count += 1;
+                    },
+
+                    qt-text {
+                        text: "加一",
+                    }
+                }
+
+                qt-rectangle {
+                    width: "110",
+                    height: "48",
+                    color: "#8a8f98",
+                    onclick: move |_| {
+                        count.set(0);
+                    },
+
+                    qt-text {
+                        text: "归零",
+                    }
+                }
+            }
+
+            // 每个条目是「一个容器 + 两个孩子」，也就是 3 个节点的一棵小子树。
+            // 于是删一个条目时 destroy 只调用一次、日志里却有 3 行 object destroyed，
+            // 同时证明：孩子是 QObject 的孩子（跟着父亲递归析构）、
+            // 账本整棵清干净了、没有双重释放。
+            //
+            // 两个孩子都写成原生元素 + 动态属性，就是为了逼出两条 AssignId
+            // （路径 [0] 和 [1]）：用 Text { } 组件的话动态 text 落在
+            // 它自己那个模板的**根**上，根的 id 从 LoadTemplate 就有，永远不需要 AssignId。
+            for row in rows {
+                // 横排 + 定宽 300：文本是自动宽度，小方块 20x20，
+                // 加起来远小于 300 —— 不会触发 flex-shrink 把尺寸改写掉。
+                qt-column {
+                    key: "{row}",
+                    width: "300",
+                    height: "28",
+                    flex_direction: "row",
+                    gap: "8",
+
+                    qt-text {
+                        text: "第 {row} 行 · 当前 count = {shown}",
                     }
 
-                    // 监听器也挂在这个**内层**元素上：
-                    // 它没有 ElementId 的话，CreateEventListener 根本送不到节点上
-                    // —— 这条正好把 assign_node_id 和事件接在一起验了。
-                    //
-                    // rsx 里名字仍是 onclick，但送到我们手里时已经是 "click"
-                    // （diff/node.rs:533 把 "on" 前缀剥掉了）。
                     qt-rectangle {
-                        width: "{rect_width}",
-                        height: "40",
+                        width: "20",
+                        height: "20",
+                        color: "#7fa8a0",
                         onclick: move |_| {
-                            clicks += 1;
+                            count -= 1;
                         },
                     }
                 }
@@ -861,13 +847,6 @@ struct QtRenderer {
     // 在任何嵌套子模板被 load 之前发完。
     instance_paths: Vec<(Vec<u8>, u64)>,
 
-    // 装了事件监听器的节点（node id）。
-    //
-    // 存在的理由只有一个：驱动（测试的事件源）得找一个**还活着**的可点元素，
-    // 不能把某个曾经见过的裸指针存下来再点 —— 列表一变那棵子树就没了。
-    // create_event_listener 往里加，remove_event_listener 和 destroy_subtree 往外删。
-    listeners: Vec<u64>,
-
 
     // 布局树。
     //
@@ -969,7 +948,6 @@ impl QtRenderer {
             // 否则第一条 AppendChildren 就找不到父节点。
             element_to_node: vec![Some(0)],
             instance_paths: Vec::new(),
-            listeners: Vec::new(),
         }
     }
 
@@ -1091,67 +1069,6 @@ impl QtRenderer {
         id: ElementId,
     ) -> Option<QQuickItemId> {
         self.object_of_node(self.lookup(id)?)
-    }
-
-
-    /// 「现在可以点谁」—— 驱动（测试的事件源）用。
-    ///
-    /// 每次现问，绝不把裸指针存下来：列表一变，那棵子树就被 destroy 了，
-    /// 存下来的指针第二次点就是野指针。这里存的是 node id，
-    /// 逐个经 object_of_node 回到 `nodes` 这本**活账**里查对象
-    /// —— 节点被 destroy_subtree 从 nodes 里删掉之后这里自然查不到，
-    /// 所以 `listeners` 里的残留只会让这一格查空，不会点到死对象。
-    fn click_target(
-        &self,
-    ) -> Option<QQuickItemId> {
-        self.listeners
-            .iter()
-            .find_map(|node| self.object_of_node(*node))
-    }
-
-
-    /// 自检用：把账上所有还活着的监听器，按 remove_event_listener 那条路撤掉。
-    ///
-    /// 为什么要手动撤：dioxus 只在「同一个元素上，旧属性集有 onclick、新属性集没有」
-    /// 时才发 RemoveEventListener（diff/node.rs:475-478 → :500-504），
-    /// 而**闭包换了它不发** —— :458-460 那条
-    /// `(Listener, Listener) => false`，注释写的是「解释器按 name+element id 找监听器，
-    /// 所以不必重写」。本 demo 的属性集从头到尾没变过，
-    /// 所以 remove_event_listener 这条分支一次都走不到。
-    /// 走一遍总比只写着好看。
-    fn remove_all_listeners_for_test(
-        &mut self,
-    ) -> usize {
-        // 先把 (node, ElementId) 收集齐再动手：
-        // remove_event_listener 要 &mut self，边遍历 listeners 边调它就是双重借用。
-        let pairs: Vec<(u64, ElementId)> = self
-            .listeners
-            .clone()
-            .into_iter()
-            .filter_map(|node| {
-                self.element_to_node
-                    .iter()
-                    .enumerate()
-                    .find(|(_, bound)| **bound == Some(node))
-                    .map(|(id, _)| (node, ElementId(id)))
-            })
-            .collect();
-
-        let mut removed = 0;
-
-        for (node, element) in pairs {
-            self.remove_event_listener("click", element);
-
-            removed += 1;
-
-            println!(
-                "[self-check] 手动撤 node {node} \
-                 （ElementId({})）上的监听器",
-                element.0
-            );
-        }
-
-        removed
     }
 
 
@@ -2127,14 +2044,8 @@ impl QtRenderer {
             self.nodes.remove(current);
         }
 
-        // 监听器登记簿跟着清 —— 这一棵里任何节点身上的监听器都随对象一起没了。
-        // 说清楚它**不是**安全性的来源：安全性来自 click_target 每次都回 nodes 查
-        // （见上面），节点一删那条查询就查空。这里的 retain 只是不让簿子无限长。
-        //（Qt 那侧也不用管 —— filter 是这个 item 的 QObject 孩子，
-        //  ~QObject 递归删，destroy 里还顺手把 C++ 的登记簿剔了一遍。）
-        self.listeners
-            .retain(|live| self.nodes.contains_key(live));
-
+        // 监听器不留账：Qt 的 filter 是这个 item 的 QObject 孩子，
+        // ~QObject 递归删；C++ 的登记簿在 destroy 里也已经剔过了。
 
         subtree.len()
     }
@@ -3153,10 +3064,6 @@ impl WriteMutations for QtRenderer {
             );
         }
 
-        if !self.listeners.contains(&node) {
-            self.listeners.push(node);
-        }
-
         println!(
             "[Dioxus] CreateEventListener {name} id={} → node {node} 已装到 Qt 上",
             id.0
@@ -3183,8 +3090,6 @@ impl WriteMutations for QtRenderer {
                 .pin_mut()
                 .remove_click_listener(object, name);
         }
-
-        self.listeners.retain(|live| *live != node);
 
         println!(
             "[Dioxus] RemoveEventListener {name} id={}",
@@ -3269,17 +3174,16 @@ impl WriteMutations for QtRenderer {
 //  → recv_task.wake()，mpsc/mod.rs:457）。
 // 我们的 waker 只做一件事：让 Qt 把「再 poll 一次」排进事件队列
 // （C++ 的 schedule_pump_poll）。于是空闲时一次 poll 都不会发生 ——
-// 上一版那个每 20ms 转一圈的 QTimer 已经删掉了。
-//
-// QTimer 还在，但角色换了：它是**假的事件源**（qt_driver_tick），
-// 只负责「推一格 + 发纸条」，跟回路无关。
-// 真实形态里这一格会被鼠标/键盘事件替掉。
+// 连那个每 200ms 推一格的假事件源 QTimer 也已经删了：
+// 现在纸条只有一个来源，就是窗口里的鼠标按下
+// （ClickFilter → qt_handle_event → runtime().handle_event）。
 
 /// 纸条到了该干什么：把「再 poll 一次」排队交给 Qt 的事件循环。
 ///
 /// 注意这里**不能**直接调 qt_pump_poll()：wake_by_ref 是在
-/// `needs_update(...)` 那一行里面被同步调进来的，那一刻 Pump 正被
-/// `borrow_mut` 借着（driver 自己就拿着这个借用），当场 poll 就是重入。
+/// `runtime.handle_event(...)` 里面被同步调进来的（listener 写 signal
+/// → needs_update → unbounded_send → wake），那一刻 qt_handle_event
+/// 正把 Pump `borrow_mut` 借着，当场 poll 就是重入。
 /// QueuedConnection 把它推到本次回调返回之后再执行。
 struct QtWaker;
 
@@ -3304,13 +3208,9 @@ struct Pump {
     vdom: VirtualDom,
     renderer: QtRenderer,
     waker: Waker,
-    /// DIFF_SCRIPT 走到第几步
-    step: usize,
-    /// 已经转过多少个 tick（列表纸条按 TICKS_PER_STEP 间隔发）
-    ticks: usize,
 }
 
-// 只有主线程会碰它（Qt 的 timer 回调、Qt 事件队列里的 functor 都在这条线程），
+// 只有主线程会碰它（Qt 事件队列里的 functor、Qt 的输入回调都在这条线程），
 // 所以 thread_local + RefCell 就够（不需要 Sync，也不需要锁）。
 // 真正的 re-entrance（渲染中又进来一次）会把 borrow_mut 打成 panic，
 // 那是「回路里又跑回路」的信号，不是要悄悄吞掉的情况。
@@ -3318,196 +3218,30 @@ thread_local! {
     static PUMP: RefCell<Option<Pump>> = const { RefCell::new(None) };
 }
 
-/// 假事件源的间隔。
-const DRIVER_INTERVAL_MS: i32 = 200;
-
-/// 列表纸条的间隔（多少个 tick 推一格）。点击是每个 tick 都点。
-const TICKS_PER_STEP: usize = 3;
-
-/// 监听器自检放在脚本的第几步。
-///
-/// 挑 5 是因为那一格 `[2,0,1,3]` 里 key 3 是**新建**的 ——
-/// 新建的 mount 一定会重发 CreateEventListener，
-/// 于是「撤光 → 点不到 → 下一轮渲染又装回来 → 又点得到」这一整圈
-/// 在一次运行里就能看到，不用另外造事件源。
-const LISTENER_SWEEP_STEP: usize = 5;
-
-/// 把 vdom + renderer 交给回路，起假事件源，并**先 poll 一次**。
+/// 把 vdom + renderer 交给回路，并**先 poll 一次**。
 ///
 /// 那一次先 poll 不是走形式：waker 只有在 future 被 poll 到 Pending 之后
 /// 才算交给了 channel（`recv_task` 里存的就是它）。装好之后不 poll 一次，
 /// 后面 dioxus 发纸条时手上没有 waker 可调，回路就永远醒不过来了。
 fn install_pump(
     vdom: VirtualDom,
-    mut renderer: QtRenderer,
+    renderer: QtRenderer,
 ) {
-    // 起 timer 要在把 renderer 交出去之前：host 藏在 renderer 里面。
-    renderer
-        .host
-        .pin_mut()
-        .start_driver(DRIVER_INTERVAL_MS);
-
     PUMP.with(|slot| {
         *slot.borrow_mut() = Some(Pump {
             vdom,
             renderer,
             waker: Waker::from(Arc::new(QtWaker)),
-            step: 0,
-            ticks: 0,
         });
     });
 
     println!(
-        "[pump] 回路装好了（wake 驱动，无轮询）：\
-         假事件源每 {DRIVER_INTERVAL_MS}ms 发一张纸条，共 {} 步",
-        DIFF_SCRIPT.len() - 1
+        "[pump] 回路装好了（wake 驱动、零轮询）：\
+         纸条的唯一来源是窗口里的鼠标按下"
     );
 
     // 先把 waker 交出去。
     qt_pump_poll();
-}
-
-
-/// 假的事件源：把 DIFF_SCRIPT 的下一步推进去，然后**走 channel** 发纸条。
-///
-/// 为什么用 `runtime().needs_update(ScopeId::APP)` 而不是 `mark_all_dirty()`：
-/// needs_update（runtime.rs:542）→ ScopeState::needs_update（scope_context.rs:135）
-/// → `sender.unbounded_send(SchedulerMsg::Immediate(id))`（:142）——
-/// 它是**真·纸条路径**，wait_for_work 得走一遍
-/// `wait_for_event().await`（virtual_dom.rs:460）才醒得过来。
-/// 而 mark_all_dirty 是直接往脏表里塞，醒都不醒就 Ready 了，
-/// 那条 await 根本没被验证过。
-///
-/// ScopeId::APP = 3（scopes.rs:50：0 是 RootScopeWrapper、
-/// 1 是默认 SuspenseBoundary、2 是 ErrorBoundary、3 才是 app()），
-/// 这也正是上次 mark_dirty(ScopeId::ROOT) 毫无反应的根源：标的是 0 那个壳。
-///
-/// ⚠️ 调之前要把 runtime 推进 thread-local 的栈里（RuntimeGuard）。
-///    不是形式主义：needs_update → ScopeState::needs_update_any
-///    → `self.sender()`，而 sender() 的实现是
-///    `Runtime::current().sender.clone()`（scope_context.rs:97-99）——
-///    它问的是「当前线程正在跑的那个 runtime」，不是我们手里的这个。
-///    第一次跑的时候没加 guard，当场 panic
-///    「Must be called from inside a Dioxus runtime」（runtime.rs:100）。
-/// 列表那一半：把 DIFF_SCRIPT 推一格，走 channel 发一张纸条。
-///
-/// 这一半**故意还是假的**，为的是让增删 / 移动 / ReplaceWith 那条 diff 路径
-/// 继续被回归测试。真事件（下面那次点击）只驱动 signal 那一条。
-fn driver_advance_list(
-    pump: &mut Pump,
-) {
-    if pump.step + 1 >= DIFF_SCRIPT.len() {
-        // timer 已经关了，理论上到不了这里。
-        return;
-    }
-
-    pump.step += 1;
-
-    DIFF_STEP
-        .store(pump.step, Ordering::Relaxed);
-
-    println!(
-        "[driver] 发纸条 Immediate(ScopeId::APP)，\
-         下一次渲染的 key = {:?}",
-        DIFF_SCRIPT[pump.step]
-    );
-
-    let runtime = pump.vdom.runtime();
-
-    let _guard = RuntimeGuard::new(
-        runtime.clone(),
-    );
-
-    // 这一行**里面**发生的事：纸条进 channel → recv_task.wake()
-    // → QtWaker::wake_by_ref → schedule_pump_poll() 把一次 poll 排进
-    // Qt 的事件队列。所以我们并没有在这里渲染，只是登记了「稍后叫我」。
-    runtime.needs_update(ScopeId::APP);
-
-    if pump.step + 1 >= DIFF_SCRIPT.len() {
-        println!(
-            "[driver] 列表脚本跑完，关掉假纸条 —— \
-             之后只剩真点击在驱动回路"
-        );
-
-        pump.renderer
-            .host
-            .pin_mut()
-            .stop_driver();
-    }
-
-    // 监听器那一半的自检。
-    //
-    // 放在 needs_update **之后**、而不是等渲染跑完：这一格的渲染还在事件队列里，
-    // 所以现在撤完，同一个 tick 里 qt_driver_tick 去查目标就查不到，
-    // 当场打一行「不点」。这行是**撤成功的证据**，不是「什么都没发生」——
-    // 上一行还打印着可点目标 true，这一 tick 就变 false，
-    // 而 C++ 那边 removeEventFilter + delete 没做对的话这里根本不会变。
-    if pump.step == LISTENER_SWEEP_STEP {
-        let before = pump
-            .renderer
-            .click_target()
-            .is_some();
-
-        let removed = pump
-            .renderer
-            .remove_all_listeners_for_test();
-
-        let after = pump
-            .renderer
-            .click_target()
-            .is_some();
-
-        println!(
-            "[self-check] 撤掉 {removed} 个监听器：\
-             可点目标 {before} → {after}"
-        );
-    }
-}
-
-
-/// 每个 tick 干的两件事。
-///
-/// 1) 每 TICKS_PER_STEP 个 tick 推一格列表（假纸条，见上面）。
-/// 2) **每次都真点一下**：往一个还活着、装了监听器的元素同步发一次左键按下。
-///    这一步之后整条链全是 dioxus 自己的机制：
-///    filter → qt_handle_event → handle_event → listener 写 signal
-///    → 发纸条 → wake → Qt 事件 → poll Ready → diff → SetAttribute。
-fn qt_driver_tick() {
-    PUMP.with(|slot| {
-        let mut guard = slot.borrow_mut();
-
-        let Some(pump) = guard.as_mut() else {
-            return;
-        };
-
-        pump.ticks += 1;
-
-        if pump.ticks % TICKS_PER_STEP == 0 {
-            driver_advance_list(pump);
-        }
-    });
-
-    // 查目标要借 Pump，但**查完立刻放开**：
-    // send_click_to 是同步派发，会当场回调 qt_handle_event，
-    // 而那个函数自己要再 borrow_mut 一次 —— 借着点就是 BorrowMutError。
-    let target = PUMP.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .and_then(|pump| pump.renderer.click_target())
-    });
-
-    match target {
-        // SAFETY: target 是刚从活账本里查出来的节点指针。这中间没有任何东西
-        //            会删节点：渲染只在 qt_pump_poll 里发生，而它在事件队列里，
-        //            必须等我们这个回调返回之后才可能被执行。
-        Some(target) => unsafe {
-            ffi::send_click_to(target);
-        },
-
-        None => println!(
-            "[driver] 还没有装了监听器的节点，这一 tick 不点"
-        ),
-    }
 }
 
 
@@ -3652,8 +3386,9 @@ impl ModifiersInteraction for QtMouseData {
 }
 
 impl PointerInteraction for QtMouseData {
-    // filter 只认 MouseButtonPress，而且送进来的就是左键
-    // （见 QtHost::send_click / 真实鼠标也是左键）。
+    // filter 只认 MouseButtonPress，而且我们只把主键当「点了」；
+    // 中键/右键也在这个类型里报成 Primary —— 要分就得让 ClickFilter
+    // 把 mouse->button 一起带过来（现在只带了坐标）。
     fn trigger_button(&self) -> Option<MouseButton> {
         Some(MouseButton::Primary)
     }
@@ -3766,7 +3501,18 @@ fn qt_handle_event(
             return;
         };
 
-        // 先进 runtime：listener 里要读写 signal，signal 要找得到当前 scope。
+        // 先把 runtime 推进这条线程的栈里，再派发。
+        // 不是形式主义：listener 里那句 `count += 1` 走的是
+        // needs_update（runtime.rs:542）→ ScopeState::needs_update
+        // → `self.sender()`，而 sender() 的实现是
+        // `Runtime::current().sender.clone()`（scope_context.rs:97-99）——
+        // 它问的是「当前线程正在跑的那个 runtime」，不是我们手里的这个。
+        // 没加 guard 的 versions 当场 panic
+        // 「Must be called from inside a Dioxus runtime」（runtime.rs:100）。
+        //
+        // 顺带：needs_update 是**真·纸条路径**（unbounded_send(SchedulerMsg::Immediate)
+        // → recv_task.wake()），mark_all_dirty 那种直接写脏表的写法醒都不醒就 Ready，
+        // wait_for_work 里那条 await（virtual_dom.rs:460）根本没被走过。
         let runtime = pump.vdom.runtime();
 
         let _guard = RuntimeGuard::new(
@@ -3801,9 +3547,8 @@ fn qt_handle_event(
 //
 // 现在这个 main 只做两轮：第 4 步 mount，然后把 vdom + renderer 交给回路
 // （第 5 步 install_pump），剩下的全在 Qt 的事件循环里发生。
-// UI 会自己变、自己响应点击 —— 但两件事的**内容**还是假的
-// （列表来自 DIFF_SCRIPT，按下来自 send_click_to 合成的 QMouseEvent），
-// **机制**全是真的：channel + waker + handle_event + diff。
+// 从这里开始，屏幕上的每一次变化都是你点出来的 —— main 里没有任何
+// 一行还会主动改状态。
 //
 // 顺便说明为什么 Qt 和 Dioxus 谁当主循环：
 // 这里让 Qt 当（app.exec()），因为 QQuickWindow 的渲染、
@@ -3870,23 +3615,15 @@ fn main() {
     // --------------------------------------------------------
     // 4. Dioxus 执行 app()
     //
-    // 然后产生 mutation：
+    // 这一句把 app() 跑一遍，产出的 mutation 全进 QtRenderer：
+    // 先 LoadTemplate 建出根容器，再给那三个按钮 AssignId + SetAttribute
+    // + NewEventListener（顺序就是模板里写下的顺序），
+    // 最后 rebuild 硬编码的那句 append_children(ElementId(0), m) 把整棵挂上窗口根
+    // （virtual_dom.rs:579）。
     //
-    // LoadTemplate
-    // AppendChildren
-    //
-    // 这些 mutation 进入 QtRenderer。
-    //
-    // 精确一点，本项目实际产生的顺序是：
-    //
-    //     LoadTemplate(<qt-text>)       建 Text + 一个坑位
-    //     SetAttribute("text", "Hello") 组件 props 是动态值
-    //     LoadTemplate(<qt-rectangle>)  建 Rectangle
-    //     ReplacePlaceholder([0], 1)    Rectangle 顶掉坑位
-    //     AppendChildren(ElementId(0),1)整棵挂到窗口根
-    //
-    // rebuild 的定义就在 virtual_dom.rs:579，
-    // 最后那句 append_children(ElementId(0), m) 是它硬编码的收尾。
+    // 想看不用跑窗口：`cargo test` 里 first_render_is_zero_with_three_buttons
+    // 用 dioxus-core 自带的 Mutations 把同一股指令流原样录了下来，
+    // 不需要 Qt 在场。
     // --------------------------------------------------------
 
     vdom.rebuild(
@@ -3907,6 +3644,11 @@ fn main() {
 
     renderer.relayout();
 
+    // 布局落完先打一次树：现在纸条只能由真鼠标产生，
+    // 首屏这份 dump 就是「不点一下也能看到的」child_order 交叉检查。
+    // 之后每一屏由 qt_pump_poll 里那句 dump_tree 负责。
+    renderer.dump_tree();
+
 
     // --------------------------------------------------------
     // 4.6 文本测量对照（临时诊断，不是布局的一环）
@@ -3923,37 +3665,28 @@ fn main() {
     // --------------------------------------------------------
     //
     // 原来这段是「第 4.7 步：exec 之前用 for 循环手动把 diff 推完」
-    // （store → mark_all_dirty → render_immediate → relayout → dump_tree）。
-    // 现在这些事全在 exec 之后、由事件循环驱动：
+    // （store → mark_all_dirty → render_immediate → relayout → dump_tree），
+    // 再后来是 QTimer 每 200ms 推一格 —— 那些现在都没有了。剩下的形状是：
     //
-    //     QTimer(200ms) → qt_driver_tick：推一格 + 发纸条（假事件源）
-    //     纸条 → 我们的 waker → C++ schedule_pump_poll() → 排一个 Qt 事件
-    //     事件 → qt_pump_poll：poll 一次 wait_for_work → Ready → 渲染 + 布局
+    //     窗口里的鼠标按下 → ClickFilter → qt_handle_event
+    //     → runtime().handle_event(...)（runtime.rs:369）
+    //     → listener 写 signal → 纸条 → 我们的 waker
+    //     → C++ schedule_pump_poll() → 排一个 Qt 事件
+    //     → qt_pump_poll：poll wait_for_work → Ready → 渲染 + 布局
     //
-    // main 到这里就把 vdom / renderer 整个交出去，之后自己再也不碰它们。
+    // main 到这里就把 vdom / renderer 整个交出去，之后自己再也不碰它们 ——
+    // 也就是说 exec() 之后如果没有人点按钮，日志里不会再出现一行渲染。
 
     // 转换器必须比第一次点击更早装好：
     // onclick 的 listener 里那步 `From<&PlatformEventData> for MouseData`
-    // 会 unwrap 一个全局 Option，没装就是一声 panic。
+    // 会 unwrap 一个全局 Option，没装就是一声 panic
+    // （实测：dioxus-html/src/events/mod.rs:81 unwrap() on None）。
     install_event_converter();
 
     install_pump(
         vdom,
         renderer,
     );
-
-
-    // 输入这一侧的链到这里是真的了：
-    // Qt 的 MouseButtonPress → ClickFilter（create_event_listener 装上去的）
-    // → qt_handle_event → runtime().handle_event(...)（runtime.rs:369）
-    // → handler 里写 signal → wake → qt_pump_poll → diff → SetAttribute。
-    //
-    // driver 里还剩两处假：
-    // 1. 事件是合成的 —— send_click_to 用 QCoreApplication::sendEvent
-    //    往一个「账本上有监听器」的节点丢一个左键按下。
-    //    真窗口下这条可以整条删掉，鼠标自己会来。
-    // 2. 列表的**内容**还是 DIFF_SCRIPT 在推进（9 步跑完就停）。
-    //    脚本停掉之后日志里剩下的渲染，全是真点击驱动的。
 
     println!(
         "Qt event loop started. \
@@ -4043,5 +3776,491 @@ mod tests {
         let style = style_for(&props);
 
         assert_eq!(style.size.width, Dimension::auto());
+    }
+
+
+    // ============================================================
+    // counter 的那半段：事件 → signal → diff，全程不碰 Qt
+    // ============================================================
+    //
+    // 假事件源（QTimer + DIFF_SCRIPT + send_click_to）删掉之后，
+    // 「点一下会发生什么」在 offscreen 日志里就没得看了 ——
+    // 于是那段验证搬到这里。送进来的事件和窗口里点出来的是同一个形状：
+    // `Event::new(Rc<PlatformEventData>, true)` + `handle_event("click", .., id)`，
+    // 少的只有最外面那一环（ClickFilter 没被穿过），从 runtime 往里全是真的。
+    //
+    // 这里用 dioxus-core 自带的 `Mutations`（一个 Vec<Mutation>）当 renderer：
+    // cargo test 环境里没有 QGuiApplication，碰不了 Qt。
+
+    use dioxus::dioxus_core::{
+        Mutation,
+        Mutations,
+    };
+
+
+    /// 和 qt_handle_event 里那几步一一对应。
+    fn send_click(
+        vdom: &VirtualDom,
+        id: ElementId,
+    ) {
+        // 转换器是个进程级全局槽，没装就 unwrap 炸；每个测试线程各调一次无所谓。
+        set_event_converter(
+            std::boxed::Box::new(QtEventConverter),
+        );
+
+        let runtime = vdom.runtime();
+
+        let _guard = RuntimeGuard::new(
+            runtime.clone(),
+        );
+
+        let payload: std::rc::Rc<dyn std::any::Any> = std::rc::Rc::new(
+            PlatformEventData::new(std::boxed::Box::new(QtMouseData {
+                x: 0.0,
+                y: 0.0,
+            })),
+        );
+
+        runtime.handle_event(
+            "click",
+            Event::new(payload, true),
+            id,
+        );
+    }
+
+
+    /// 跑一轮渲染，把这轮的指令流拿下来。
+    fn render(
+        vdom: &mut VirtualDom,
+    ) -> Vec<Mutation> {
+        let mut out = Mutations::default();
+
+        vdom.render_immediate(
+            &mut out,
+        );
+
+        out.edits
+    }
+
+
+    /// 指令流里出现过的 click 监听器，按 dioxus 发出它们的顺序。
+    fn click_listeners(
+        edits: &[Mutation],
+    ) -> Vec<ElementId> {
+        edits
+            .iter()
+            .filter_map(|edit| match edit {
+                Mutation::NewEventListener { name, id } if name == "click" => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+
+    /// 指令流里被写出去的所有文本。
+    fn texts(
+        edits: &[Mutation],
+    ) -> Vec<String> {
+        edits
+            .iter()
+            .filter_map(|edit| match edit {
+                Mutation::SetAttribute {
+                    name,
+                    value,
+                    ..
+                } if *name == "text" => match value {
+                    AttributeValue::Text(text) => Some(text.to_string()),
+                    _ => None,
+                },
+                Mutation::SetText { value, .. } => Some(value.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+
+    /// 这一轮新建的模板根（LoadTemplate 给的 id）—— 一行条目就是这样一个根。
+    fn loaded_roots(
+        edits: &[Mutation],
+    ) -> Vec<ElementId> {
+        edits
+            .iter()
+            .filter_map(|edit| match edit {
+                Mutation::LoadTemplate { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+
+    /// 这一轮新建的占位节点（模板里那些「洞」）。
+    fn created_placeholder_ids(
+        edits: &[Mutation],
+    ) -> Vec<ElementId> {
+        edits
+            .iter()
+            .filter_map(|edit| match edit {
+                Mutation::CreatePlaceholder { id } => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+
+    /// 这一轮的 AssignId：(模板内路径, 分到的 ElementId)。
+    fn assigned_ids(
+        edits: &[Mutation],
+    ) -> Vec<(Vec<u8>, ElementId)> {
+        edits
+            .iter()
+            .filter_map(|edit| match edit {
+                Mutation::AssignId { path, id } => {
+                    Some((path.to_vec(), *id))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+
+    /// 这一轮的 ReplaceWith：(被换掉的那个节点, 栈上交出去几个节点)。
+    fn replaced(
+        edits: &[Mutation],
+    ) -> Vec<(ElementId, usize)> {
+        edits
+            .iter()
+            .filter_map(|edit| match edit {
+                Mutation::ReplaceWith { id, m } => Some((*id, *m)),
+                _ => None,
+            })
+            .collect()
+    }
+
+
+    /// 一条指令流的「形状」：只留每条 mutation 的种类名。
+    /// 断言写成这个形式，红的时候一眼看得出是哪一步的哪条指令变了。
+    fn kinds(
+        edits: &[Mutation],
+    ) -> Vec<&'static str> {
+        edits
+            .iter()
+            .map(|edit| match edit {
+                Mutation::AppendChildren { .. } => "AppendChildren",
+                Mutation::AssignId { .. } => "AssignId",
+                Mutation::CreatePlaceholder { .. } => "CreatePlaceholder",
+                Mutation::CreateTextNode { .. } => "CreateTextNode",
+                Mutation::LoadTemplate { .. } => "LoadTemplate",
+                Mutation::ReplaceWith { .. } => "ReplaceWith",
+                Mutation::ReplacePlaceholder { .. } => "ReplacePlaceholder",
+                Mutation::InsertAfter { .. } => "InsertAfter",
+                Mutation::InsertBefore { .. } => "InsertBefore",
+                Mutation::SetAttribute { .. } => "SetAttribute",
+                Mutation::SetText { .. } => "SetText",
+                Mutation::NewEventListener { .. } => "NewEventListener",
+                Mutation::RemoveEventListener { .. } => "RemoveEventListener",
+                Mutation::Remove { .. } => "Remove",
+                Mutation::PushRoot { .. } => "PushRoot",
+            })
+            .collect()
+    }
+
+
+    #[test]
+    fn first_render_is_zero_with_three_buttons() {
+        let mut vdom = VirtualDom::new(app);
+
+        let mut out = Mutations::default();
+        vdom.rebuild(&mut out);
+
+        let shown = texts(&out.edits);
+
+        assert!(
+            shown.contains(&"counter = 0".to_string()),
+            "第一屏就该有 counter = 0，实际写出的文本 = {shown:?}"
+        );
+
+        // 三个按钮是仅有的监听器：count = 0 时 if 那格是空的、列表没有一行。
+        assert_eq!(
+            click_listeners(&out.edits).len(),
+            3,
+            "按钮三个，监听器就该三条"
+        );
+
+        assert!(
+            !shown.iter().any(|t| t.starts_with("第 ")),
+            "count = 0 不该有任何一行：{shown:?}"
+        );
+    }
+
+
+    #[test]
+    fn plus_adds_a_row_and_minus_replaces_it() {
+        let mut vdom = VirtualDom::new(app);
+
+        let mut out = Mutations::default();
+        vdom.rebuild(&mut out);
+
+        let buttons = click_listeners(&out.edits);
+
+        // 模板里按钮的顺序就是 减一、加一、归零（write_attrs 按模板顺序发）。
+        // 这条不用猜：下面分别点它们，count 各走各的方向就说明对上了。
+        assert_eq!(buttons.len(), 3);
+
+        send_click(&vdom, buttons[1]);
+
+        let added = render(&mut vdom);
+
+        let shown = texts(&added);
+
+        assert!(
+            shown.contains(&"counter = 1".to_string()),
+            "点「加一」之后要看到 counter = 1，实际 = {shown:?}"
+        );
+        assert!(
+            shown.iter().any(|t| t.starts_with("第 0 行")),
+            "count 到 1 得长出一行，实际 = {shown:?}"
+        );
+
+        // 这一行是**新建**出来的：LoadTemplate 给一个根 id，
+        // 然后那个洞（第一次渲染时就建好的占位节点）被它顶掉。
+        let row_root = loaded_roots(&added);
+
+        assert_eq!(
+            row_root.len(),
+            1,
+            "只该有一个新建的模板根（那一行的容器），实际 = {row_root:?}"
+        );
+
+        let slots = created_placeholder_ids(&out.edits);
+
+        assert_eq!(
+            slots.len(),
+            2,
+            "第一屏就该有两个洞：if 那一格 + for 那一格"
+        );
+
+        let swapped = replaced(&added);
+
+        assert_eq!(swapped.len(), 1);
+        assert!(
+            slots.contains(&swapped[0].0),
+            "被顶掉的必须是那两个占位节点之一，实际 = {:?}",
+            swapped[0].0
+        );
+        assert_eq!(swapped[0].1, 1, "一行 = 栈上一个节点");
+
+        // 行里的两个孩子（文本 path[0]、小方块 path[1]）都得先 AssignId 才有 id，
+        // 而监听器就挂在那个 id 上 —— 这条正好把 assign_node_id 和事件接起来。
+        let assigns = assigned_ids(&added);
+
+        assert_eq!(
+            assigns
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0u8], vec![1u8]],
+            "行容器 path 0 和 1 各要一个 id"
+        );
+
+        let new_listeners = click_listeners(&added);
+
+        assert_eq!(
+            new_listeners,
+            vec![assigns[1].1],
+            "监听器挂在 path [1]（那个小方块）刚拿到的 id 上"
+        );
+        assert!(
+            !buttons.contains(&new_listeners[0]),
+            "而且它是**新**的，不是按钮那三个里的哪个"
+        );
+
+        send_click(&vdom, buttons[0]);
+
+        let removed = render(&mut vdom);
+
+        assert!(
+            texts(&removed).contains(&"counter = 0".to_string()),
+            "点「减一」要回到 0"
+        );
+
+        // 收缩到空**不是**一条 Remove：dioxus 先新建一个占位节点，
+        // 再用它把那一行的根换掉（实测 1→0 的指令流 =
+        // SetAttribute, CreatePlaceholder, ReplaceWith{id: 那一行的根, m: 1}）。
+        assert_eq!(
+            created_placeholder_ids(&removed).len(),
+            1,
+            "槽位要回到占位节点"
+        );
+        assert_eq!(
+            replaced(&removed),
+            vec![(row_root[0], 1)],
+            "被换掉的正是刚才建出来那一行的根 —— renderer 在这里走 destroy"
+        );
+    }
+
+
+
+    #[test]
+    fn milestone_line_grows_at_three_and_shrinks_back_to_a_placeholder() {
+        let mut vdom = VirtualDom::new(app);
+
+        let mut out = Mutations::default();
+        vdom.rebuild(&mut out);
+
+        let buttons = click_listeners(&out.edits);
+
+        // 1 和 2：那一格还是空的。
+        for i in 1..=2 {
+            send_click(&vdom, buttons[1]);
+
+            let edits = render(&mut vdom);
+
+            assert!(
+                !texts(&edits)
+                    .iter()
+                    .any(|t| t.starts_with("已经点到")),
+                "count = {i} 还不该有提示行，实际 = {:?}",
+                texts(&edits)
+            );
+        }
+
+        send_click(&vdom, buttons[1]);
+
+        let at_three = render(&mut vdom);
+
+        assert!(
+            texts(&at_three)
+                .iter()
+                .any(|t| t.starts_with("已经点到 3")),
+            "到 3 了，提示那一格该长出来"
+        );
+        assert_eq!(
+            loaded_roots(&at_three).len(),
+            2,
+            "这一次点击建了两个模板根：提示那一格（Text 组件）+ 新长出来的第 3 行"
+        );
+
+        let swapped = replaced(&at_three);
+
+        assert_eq!(swapped.len(), 1);
+        assert!(
+            created_placeholder_ids(&out.edits).contains(&swapped[0].0),
+            "顶掉的正是第一屏留下的那个洞"
+        );
+
+        send_click(&vdom, buttons[0]);
+
+        let back_to_two = render(&mut vdom);
+
+        assert!(
+            !texts(&back_to_two)
+                .iter()
+                .any(|t| t.starts_with("已经点到")),
+            "回到 2，提示行该没了，实际 = {:?}",
+            texts(&back_to_two)
+        );
+
+        // 实测 3→2 的指令流（ kinds ）：
+        //     SetAttribute, CreatePlaceholder, ReplaceWith,
+        //     SetAttribute, SetAttribute, Remove
+        // 前面那条 CreatePlaceholder+ReplaceWith 是提示那一格**换回占位节点**，
+        // 最后那条 Remove 是行数从 3 缩到 2 —— 两件事走的是两支。
+        assert_eq!(
+            kinds(&back_to_two),
+            vec![
+                "SetAttribute",
+                "CreatePlaceholder",
+                "ReplaceWith",
+                "SetAttribute",
+                "SetAttribute",
+                "Remove",
+            ]
+        );
+    }
+
+
+    #[test]
+    fn reset_wipes_every_row_and_the_count() {
+        let mut vdom = VirtualDom::new(app);
+
+        let mut out = Mutations::default();
+        vdom.rebuild(&mut out);
+
+        let buttons = click_listeners(&out.edits);
+
+        // 加满：条目是 (0..count).take(4)，所以第 4 次之后行数封顶。
+        let mut per_click = Vec::new();
+
+        for _ in 0..5 {
+            send_click(&vdom, buttons[1]);
+
+            per_click.push(render(&mut vdom));
+        }
+
+        // 那三个按钮的监听器只发一次：闭包换了 dioxus 也不重发
+        // （diff/node.rs:458-460 `(Listener, Listener) => false`）。
+        // 注意看的是**按钮那三个 id**有没有再出现 ——
+        // 新建出来的行里那个小方块确实会带一条新监听器，那是另一回事。
+        for (i, edits) in per_click.iter().enumerate() {
+            for id in click_listeners(edits) {
+                assert!(
+                    !buttons.contains(&id),
+                    "第 {} 次点击的重渲染里又发了按钮的监听器 id={:?}",
+                    i + 1,
+                    id
+                );
+            }
+        }
+
+        let fifth = texts(&per_click[4]);
+
+        assert!(
+            fifth
+                .iter()
+                .any(|t| t.starts_with("第 3 行")),
+            "第五屏该还留着第 3 行（行数封顶在 4），实际 = {fifth:?}"
+        );
+        assert!(
+            fifth.contains(&"counter = 5".to_string()),
+            "标题得跟着走，实际 = {fifth:?}"
+        );
+
+        send_click(&vdom, buttons[2]);
+
+        let wiped = render(&mut vdom);
+
+        let after_reset = texts(&wiped);
+
+        assert!(
+            after_reset.contains(&"counter = 0".to_string()),
+            "归零之后要看到 counter = 0，实际 = {after_reset:?}"
+        );
+        assert!(
+            !after_reset.iter().any(|t| t.starts_with("第 ")),
+            "归零之后一行都不该有，实际 = {after_reset:?}"
+        );
+
+        // 实测 5→0 的指令流（kinds，跑出来的原样）：
+        //     SetAttribute, CreatePlaceholder, ReplaceWith,
+        //     CreatePlaceholder, Remove, Remove, Remove, ReplaceWith
+        // 四行条目 + 提示那一格一起消失。两个格各自**换回占位节点**
+        // （两个 CreatePlaceholder + 两个 ReplaceWith），
+        // 行数从 4 缩到 0 时前面三条走 Remove、最后一条被新建的占位换掉。
+        // 直觉里的「五条 Remove」是不存在的 —— 收缩到空那一支不发明 Remove。
+        assert_eq!(
+            kinds(&wiped),
+            vec![
+                "SetAttribute",
+                "CreatePlaceholder",
+                "ReplaceWith",
+                "CreatePlaceholder",
+                "Remove",
+                "Remove",
+                "Remove",
+                "ReplaceWith",
+            ]
+        );
     }
 }

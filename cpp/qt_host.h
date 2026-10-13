@@ -23,21 +23,6 @@ public:
 
     void show();
 
-    // 起一个 QTimer 当**假的事件源**：每 interval_ms 叫一次 Rust 的
-    // qt_driver_tick()，由它去推 DIFF_STEP、并往一个装了监听器的节点
-    // 同步发一次左键按下（见下面的 send_click_to）。
-    //
-    // 注意它和「回路」已经没关系了 —— 它不 poll 任何东西。
-    // 它只做真实形态里鼠标/键盘做的那一步：事件 → handle_event → 写 signal
-    // → dioxus 发纸条 → waker 被调 → 才轮到 schedule_pump_poll()。
-    // 列表脚本跑完 Rust 那边会调 stop_driver() 把它关掉，
-    // 于是连这最后一步都不再有 —— 剩下的点击全是窗口里真按出来的。
-    void start_driver(
-        int interval_ms
-    );
-
-    void stop_driver();
-
     // 窗口根 = window.contentItem()。
     //
     // 以前 Rust 侧用约定的 id 0 表示「挂到窗口根」；
@@ -210,24 +195,13 @@ std::unique_ptr<QtHost> new_qt_host();
 // —— 它被调用的那一刻，Pump 正被 borrow_mut 借着（host 就在 Pump 里面），
 // 想拿 host 就是二次借用。自由函数不需要任何接收者，也就绕开了这件事。
 //
-// 为什么只能「排队」不能当场调 ::qt_pump_poll()：wake() 是在 needs_update
-// 那一行**里面**被同步调进来的，那一刻我们可能正在渲染、正在借着 Pump。
+// 为什么只能「排队」不能当场调 ::qt_pump_poll()：wake() 是在
+// runtime.handle_event(...) 那一行**里面**被同步调进来的
+// （listener 写 signal → needs_update → unbounded_send → wake），
+// 那一刻 qt_handle_event 正借着 PUMP。
 // QueuedConnection 把它推到本次回调返回之后由事件循环执行，
 // 重入被语义挡掉。
 //
 // 于是原来的 interval 轮询整个删掉了：空闲时 Qt 阻塞在 exec() 里，
 // 一次 poll 都不会发生。
 void schedule_pump_poll();
-
-
-// 只给离屏自检用：直接往这个 item 同步发一个左键按下（QCoreApplication::sendEvent），
-// 于是装在它上面的 ClickFilter 立刻被调到、再回调进 Rust。
-// 真窗口下这条换成你用鼠标点。
-//
-// 为什么是自由函数而不是 QtHost 的成员：它不需要 host 里的任何状态，
-// 而调用方（Rust 的 driver）此刻**不能**借着 Pump ——
-// sendEvent 是同步的，会当场回调 qt_handle_event，而那个函数自己要再借一次 PUMP。
-// 挂在 QtHost 上就非得从 renderer 里拿 host，等于自己跟自己抢借用。
-void send_click_to(
-    QQuickItem* item
-);

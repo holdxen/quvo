@@ -6,13 +6,11 @@
 #include "test_dioxus_qt/src/main.cxx.h"
 
 #include <QtCore/QByteArray>
-#include <QtCore/QCoreApplication>
 #include <QtCore/QDebug>
 #include <QtCore/QEvent>
 #include <QtCore/QMetaObject>
 #include <QtCore/QObject>
 #include <QtCore/QString>
-#include <QtCore/QTimer>
 #include <QtCore/QUrl>
 
 
@@ -185,10 +183,6 @@ struct QtHost::Impl {
     QQmlEngine engine;
     QQuickWindow window;
 
-    // 假事件源的心跳（见 QtHost::start_driver 的注释）。
-    // 挂在 window 上，由 QObject 父子树负责释放。
-    QTimer *driver_timer = nullptr;
-
     // 我们装出去的 event filter。
     //
     // 只是「按 (item, name) 找得到、好撤」的登记簿，不管所有权 ——
@@ -212,7 +206,7 @@ struct QtHost::Impl {
 QtHost::QtHost()
     : impl_(std::make_unique<Impl>())
 {
-    impl_->window.resize(640, 220);
+    impl_->window.resize(640, 340);
 
     impl_->window.setTitle(
         QStringLiteral(
@@ -251,44 +245,6 @@ void schedule_pump_poll()
 void QtHost::show()
 {
     impl_->window.show();
-}
-
-
-void QtHost::start_driver(
-    int interval_ms
-)
-{
-    // 挂在 window 上当 QObject 父节点：窗口析构时 timer 一起走，
-    // 不需要自己 delete。
-    if (impl_->driver_timer == nullptr) {
-        impl_->driver_timer = new QTimer(&impl_->window);
-    }
-
-    // 直接调生成头里声明的那个全局函数（`void qt_driver_tick() noexcept;`）。
-    // lambda 形式的 connect 不需要 moc。
-    QObject::connect(
-        impl_->driver_timer,
-        &QTimer::timeout,
-        []() {
-            qt_driver_tick();
-        }
-    );
-
-    impl_->driver_timer->start(interval_ms);
-
-    qDebug()
-        << "[Qt] driver timer started," << interval_ms << "ms"
-        << "（它只发纸条，不 poll）";
-}
-
-
-void QtHost::stop_driver()
-{
-    if (impl_->driver_timer != nullptr) {
-        impl_->driver_timer->stop();
-
-        qDebug() << "[Qt] driver timer stopped";
-    }
 }
 
 
@@ -562,40 +518,6 @@ QtHost::remove_click_listener(
 
         ++it;
     }
-}
-
-
-void
-send_click_to(
-    QQuickItem* item
-)
-{
-    if (item == nullptr) {
-        return;
-    }
-
-    // 一个左键按下。坐标取 item 的中心 —— 对这个 demo 来说坐标没人看，
-    // 重要的是事件类型必须是 MouseButtonPress，filter 才认。
-    const QPointF local(
-        item->width() / 2.0,
-        item->height() / 2.0
-    );
-
-    QMouseEvent press(
-        QEvent::MouseButtonPress,
-        local,
-        item->mapToScene(local),
-        Qt::LeftButton,
-        Qt::LeftButton,
-        Qt::NoModifier
-    );
-
-    // sendEvent 是同步派发：调用返回之前，eventFilter 就已经跑过了。
-    qDebug()
-            << "[Qt] synthetic press sent to"
-            << item;
-
-    QCoreApplication::sendEvent(item, &press);
 }
 
 

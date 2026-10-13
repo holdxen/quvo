@@ -137,6 +137,11 @@ mod ffi {
     }
 
     unsafe extern "C++" {
+        include!(<QQuickItem>);
+        type QQuickItem;
+    }
+
+    unsafe extern "C++" {
         include!("cxx-qt-lib/qvariant.h");
         /// QString from cxx_qt_lib
         type QVariant = cxx_qt_lib::QVariant;
@@ -170,29 +175,29 @@ mod ffi {
         fn create_text(
             self: Pin<&mut QtHost>,
             text: &str,
-        ) -> u64;
+        ) -> *mut QQuickItem;
 
         // 实例化一个 QtQuick.Rectangle。
         // 没有属性需要从 Rust 传：颜色是画的事，
         // 而宽高是布局的事，走 set_geometry。
         fn create_rectangle(
             self: Pin<&mut QtHost>,
-        ) -> u64;
+        ) -> *mut QQuickItem;
 
         // 实例化一个裸 Item 当容器（qt-column）。
         // QML 侧不带 Layout / anchors —— 孩子摆哪里全由 taffy 决定。
         fn create_column(
             self: Pin<&mut QtHost>,
-        ) -> u64;
+        ) -> *mut QQuickItem;
 
         // 把 child 挂到 parent 下面，正式进 visual tree。
         //
         // parent_id == 0 是约定好的「窗口根」，
         // C++ 那边翻译成 window.contentItem()。
-        fn mount(
+        unsafe fn mount(
             self: Pin<&mut QtHost>,
-            parent_id: u64,
-            child_id: u64,
+            parent: *mut QQuickItem,
+            child: *mut QQuickItem,
         );
 
         // 让 child 在叠放顺序上排到 sibling 前面。
@@ -200,10 +205,10 @@ mod ffi {
         // 为什么需要：mount 只能往末尾追加，
         // 而 ReplacePlaceholder 要把新节点插回坑位原来的位置，
         // 所以挂完还要再往前挪一下。
-        fn stack_before(
+        unsafe fn stack_before(
             self: Pin<&mut QtHost>,
-            child_id: u64,
-            sibling_id: u64,
+            child: *mut QQuickItem,
+            sibling: *mut QQuickItem,
         );
 
         // QObject::setProperty(name, QVariant( QString(value)) )。
@@ -212,9 +217,9 @@ mod ffi {
         // Dioxus 侧写 text: "..."，这里就落到 QtQuick.Text::text。
         // 写不进去的（类型不匹配，比如 color 要 QColor、
         // font.pixelSize 要 int）会在 C++ 侧 qWarning。
-        fn set_property(
+        unsafe fn set_property(
             self: Pin<&mut QtHost>,
-            id: u64,
+            item: *mut QQuickItem,
             name: &str,
             value: &QVariant,
         );
@@ -223,9 +228,9 @@ mod ffi {
         //
         // 单独开一个函数而不是走 set_property，是为了让「几何」
         // 有一个明确的出口 —— 五个数字一次写完，也省掉属性名查找。
-        fn set_geometry(
+        unsafe fn set_geometry(
             self: Pin<&mut QtHost>,
-            id: u64,
+            item: *mut QQuickItem,
             x: f64,
             y: f64,
             width: f64,
@@ -255,18 +260,20 @@ mod ffi {
 
         // 下面两个只用于对照：读 Qt 对象自己报的 implicit size。
         // 读它会触发 QQuickText 同步算一次尺寸，所以没 polish 也准。
-        fn implicit_width(
+        unsafe fn implicit_width(
             self: &QtHost,
-            id: u64,
+            item: *mut QQuickItem,
         ) -> f64;
 
-        fn implicit_height(
+        unsafe fn implicit_height(
             self: &QtHost,
-            id: u64,
+            item: *mut QQuickItem,
         ) -> f64;
     }
 }
 
+
+type QQuickItemId = *mut ffi::QQuickItem;
 
 // ============================================================
 // Dioxus 侧的原语：Text

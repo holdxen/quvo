@@ -41,10 +41,8 @@ QString to_qstring(rust::Str text)
 //
 // 返回 0 表示失败（Rust 侧会把 0 当成「这个节点没有 Qt 对象」，
 // 于是既不挂载也不参与布局）。
-std::uint64_t instantiate(
+QQuickItem* instantiate(
     QQmlEngine& engine,
-    std::unordered_map<std::uint64_t, QObject*>& objects,
-    std::uint64_t& next_id,
     const char* qml,
     const char* label
 )
@@ -81,19 +79,21 @@ std::uint64_t instantiate(
 
         delete object;
 
-        return 0;
+        return nullptr;
     }
 
-    const std::uint64_t id = next_id++;
+    return item;
 
-    objects.emplace(id, object);
+    // const std::uint64_t id = next_id++;
 
-    qDebug()
-        << "[Qt] create" << label
-        << "id =" << id
-        << "but NOT mounted yet";
+    // objects.emplace(id, object);
 
-    return id;
+    // qDebug()
+    //     << "[Qt] create" << label
+    //     << "id =" << id
+    //     << "but NOT mounted yet";
+
+    // return id;
 }
 
 } // namespace
@@ -165,13 +165,11 @@ void QtHost::show()
 }
 
 
-std::uint64_t QtHost::create_rectangle() {
+QQuickItem* QtHost::create_rectangle() {
     // 注意这里没有 width / height：
     // 几何一律由 Rust 侧的布局器通过 set_geometry 给。
     return instantiate(
         impl_->engine,
-        impl_->objects,
-        impl_->next_id,
         R"QML(
 import QtQuick
 
@@ -183,14 +181,12 @@ Rectangle {
 }
 
 
-std::uint64_t QtHost::create_column() {
+QQuickItem* QtHost::create_column() {
     // 一个裸 Item —— 没有 Layout，没有 anchors。
     // 它存在的唯一理由是给「容器」一个能装孩子的对象；
     // 孩子摆在哪，完全是布局器的事。
     return instantiate(
         impl_->engine,
-        impl_->objects,
-        impl_->next_id,
         R"QML(
 import QtQuick
 
@@ -202,7 +198,7 @@ Item {
 }
 
 
-std::uint64_t
+QQuickItem *
 QtHost::create_text(rust::Str text)
 {
     // 注意：这不是用户写的 UI，
@@ -210,10 +206,8 @@ QtHost::create_text(rust::Str text)
     //
     // 字体/颜色留在 QML 里 —— 那是「怎么画」；
     // 但 x / y / width / height 属于布局，只能由 set_geometry 决定。
-    const std::uint64_t id = instantiate(
+    QQuickItem *item = instantiate(
         impl_->engine,
-        impl_->objects,
-        impl_->next_id,
         R"QML(
 import QtQuick
 
@@ -223,60 +217,64 @@ Text {
         "Text"
     );
 
-    if (id == 0) {
-        return 0;
+    // if (id == 0) {
+    //     return 0;
+    // }
+
+    // object_for(id)->setProperty(
+    //     "text",
+    //     to_qstring(text)
+    // );
+
+    if (item) {
+        item->setProperty("text", to_qstring(text));
     }
 
-    object_for(id)->setProperty(
-        "text",
-        to_qstring(text)
-    );
-
-    return id;
+    return item;
 }
 
 
 void
 QtHost::mount(
-    std::uint64_t parent_id,
-    std::uint64_t child_id
+    QQuickItem* parent,
+    QQuickItem* child
 )
 {
-    QObject* child =
-        object_for(child_id);
+    // QObject* child =
+    //     object_for(child_id);
 
-    auto* child_item =
-        qobject_cast<QQuickItem*>(
-            child
-        );
+    // auto* child_item =
+    //     qobject_cast<QQuickItem*>(
+    //         child
+    //     );
 
-    if (
-        child == nullptr ||
-        child_item == nullptr
-    ) {
-        qWarning()
-            << "[Qt] cannot mount object"
-            << child_id;
+    // if (
+    //     child == nullptr ||
+    //     child_item == nullptr
+    // ) {
+    //     qWarning()
+    //         << "[Qt] cannot mount object"
+    //         << child_id;
 
-        return;
-    }
+    //     return;
+    // }
 
 
-    // parent_id == 0 就是窗口根。
-    QQuickItem* parent =
-        parent_id == 0
-            ? impl_->window.contentItem()
-            : qobject_cast<QQuickItem*>(
-                  object_for(parent_id)
-              );
+    // // parent_id == 0 就是窗口根。
+    // QQuickItem* parent =
+    //     parent_id == 0
+    //         ? impl_->window.contentItem()
+    //         : qobject_cast<QQuickItem*>(
+    //               object_for(parent_id)
+    //           );
 
-    if (parent == nullptr) {
-        qWarning()
-            << "[Qt] unknown parent"
-            << parent_id;
+    // if (parent == nullptr) {
+    //     qWarning()
+    //         << "[Qt] unknown parent"
+    //         << parent_id;
 
-        return;
-    }
+    //     return;
+    // }
 
 
     // -----------------------------
@@ -290,33 +288,23 @@ QtHost::mount(
     // Qt Quick visual tree
     // -----------------------------
 
-    child_item->setParentItem(parent);
+    child->setParentItem(parent);
 
 
-    qDebug()
-        << "[Qt] mount object"
-        << child_id
-        << "into parent"
-        << parent_id;
+    // qDebug()
+    //     << "[Qt] mount object"
+    //     << child_id
+    //     << "into parent"
+    //     << parent_id;
 }
 
 
 void
 QtHost::stack_before(
-    std::uint64_t child_id,
-    std::uint64_t sibling_id
+    QQuickItem* child,
+    QQuickItem* sibling
 )
 {
-    auto* child =
-        qobject_cast<QQuickItem*>(
-            object_for(child_id)
-        );
-
-    auto* sibling =
-        qobject_cast<QQuickItem*>(
-            object_for(sibling_id)
-        );
-
     if (
         child == nullptr ||
         sibling == nullptr
@@ -331,27 +319,13 @@ QtHost::stack_before(
 
 void
 QtHost::set_geometry(
-    std::uint64_t id,
+    QQuickItem* item,
     double x,
     double y,
     double width,
     double height
 )
 {
-    auto* item =
-        qobject_cast<QQuickItem*>(
-            object_for(id)
-        );
-
-    if (item == nullptr) {
-        qWarning()
-            << "[Qt] set_geometry on unknown object"
-            << id;
-
-        return;
-    }
-
-
     // x / y 是相对 parentItem 的局部坐标，
     // 和布局器输出的 location 是同一个口径，不用换算。
     item->setX(x);
@@ -392,23 +366,11 @@ QtHost::object_for(
 
 void
 QtHost::set_property(
-    std::uint64_t id,
+    QObject *object,
     rust::Str name,
     const QVariant &value
 )
 {
-    QObject* object =
-        object_for(id);
-
-    if (object == nullptr) {
-        qWarning()
-            << "unknown object id"
-            << id;
-
-        return;
-    }
-
-
     const QByteArray property =
         to_qstring(name).toUtf8();
 
@@ -522,14 +484,9 @@ QtHost::measure_text(
 
 double
 QtHost::implicit_width(
-    std::uint64_t id
+    QQuickItem *item
 ) const
 {
-    auto* item =
-        qobject_cast<QQuickItem*>(
-            object_for(id)
-        );
-
     // QQuickItem::implicitWidth() -> 虚函数 getImplicitWidth()
     // -> QQuickTextPrivate::getImplicitWidth()（qquicktext.cpp:109）
     // 会强制同步跑一次 updateSize()，所以没 polish 过也读得到。
@@ -539,13 +496,8 @@ QtHost::implicit_width(
 
 double
 QtHost::implicit_height(
-    std::uint64_t id
+    QQuickItem *item
 ) const
 {
-    auto* item =
-        qobject_cast<QQuickItem*>(
-            object_for(id)
-        );
-
     return item ? item->implicitHeight() : 0.0;
 }

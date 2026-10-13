@@ -162,23 +162,10 @@ std::unique_ptr<QtHost> new_qt_host()
     return std::make_unique<QtHost>();
 }
 
-
-namespace {
-
-// 只用来给 invokeMethod 当一个「归属哪条线程的事件循环」的 context 对象：
-// 它没有子类化，也不接任何信号，构造在 main 之前、活在主线程。
-// 用 context 而不是 QTimer::singleShot(0) 的原因：singleShot 会把 functor
-// 排到**调用它的那条线程**的循环里，而 waker 以后可能被别的线程调用
-// （后台 task 发纸条）；context 把落点钉死在主线程。
-QObject g_pump_context;
-
-} // namespace
-
-
 void schedule_pump_poll()
 {
     QMetaObject::invokeMethod(
-        &g_pump_context,
+        qApp,
         []() {
             qt_pump_poll();
         },

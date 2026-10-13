@@ -527,12 +527,18 @@ fn app() -> Element {
 
     println!("[app] 被渲染，列表 key = {keys:?}");
 
-    // 容器的宽度 = 100 + 50 * key —— 这是给日志用的「身份证」。
-    // dump_tree 打出来的是尺寸，所以每个位置上是哪个 key 一眼就能看出来
-    //（渲染器自己不认识 key，只能把 key 编码进尺寸里）。
-    let items: Vec<(usize, usize)> = keys
+    // 每个条目两把「身份证」，都编码在尺寸里，dump_tree 一眼能读出来：
+    //
+    //     容器宽 = 100 + 50 * key      → 这一格住的是哪个 key
+    //     矩形宽 = 20  + 7  * key      → 第二个 AssignId 有没有绑对人
+    //
+    // 两个都写成**动态属性**，而且都落在同一个模板实例的不同路径上
+    // （[0] 和 [1]），于是每次新建实例都会收到两条 AssignId。
+    // 绑错节点的话：矩形那条宽度会落到文本上 —— 文本变成显式宽度、
+    // 矩形退回自动宽度，日志里立刻对不上。
+    let items: Vec<(usize, usize, usize)> = keys
         .iter()
-        .map(|key| (*key, 100 + key * 50))
+        .map(|key| (*key, 100 + key * 50, 20 + key * 7))
         .collect();
 
     rsx! {
@@ -546,19 +552,30 @@ fn app() -> Element {
                 text: "Hello from Dioxus -> Qt Quick (taffy layout)",
             }
 
-            // 每个条目刻意做成「一个容器 + 一个孩子」，也就是 2 个节点的一棵小子树。
-            // 这样删一个条目时 destroy 只调用一次、日志里却有 2 行 object destroyed，
+            // 每个条目刻意做成「一个容器 + 两个孩子」，也就是 3 个节点的一棵小子树。
+            // 这样删一个条目时 destroy 只调用一次、日志里却有 3 行 object destroyed，
             // 同时证明：孩子是 QObject 的孩子（跟着父亲递归析构）、
             // 我们的账本整棵清干净了、没有双重释放。
-            for (key, item_width) in items {
+            //
+            // 两个孩子都写成**原生元素** + 动态属性，就是为了逼出 AssignId：
+            // 用 Text { } 组件的话，动态 text 落在它自己那个模板的**根**上
+            // （根的 id 从 LoadTemplate 就有，永远不需要 AssignId）；
+            // 写在这里，它们是本次模板 root 的第 0 / 第 1 个孩子，
+            // dioxus 必须先发 AssignId([0]) / AssignId([1])，
+            // 再各自发 SetAttribute（diff/node.rs:816 → :871）。
+            for (key, item_width, rect_width) in items {
                 qt-column {
                     key: "{key}",
                     width: "{item_width}",
                     height: "40",
 
-                    Rectangle {
-                        width: 100.0,
-                        height: 40.0,
+                    qt-text {
+                        text: "key {key}",
+                    }
+
+                    qt-rectangle {
+                        width: "{rect_width}",
+                        height: "40",
                     }
                 }
             }
@@ -696,6 +713,25 @@ struct QtRenderer {
     // 偶尔会跳着分配，所以中间允许出现 None。
     element_to_node: Vec<Option<u64>>,
 
+    // 最近一次 load_template 建立的「模板路径 → 我们的 node id」表。
+    //
+    // 路径的写法（mutations.rs:134-140）：一串 children 的下标，
+    // `[]` = 这一次 load 出来的根，`[0]` = 根的第 0 个孩子，
+    // `[0,1,2]` = 第 1 个孩子的第 2 个孩子的第 3 个孩子。
+    // 注意 dioxus 发过来时已经把「第几个 root」那一位剥掉了（diff/node.rs:871
+    // 传的是 `&path[1..]`）。
+    //
+    // 为什么「只留最近一次」就是对的，靠的是 dioxus 自己写死的一条顺序
+    // （diff/node.rs:616-620）：
+    //
+    //     // !!VERY IMPORTANT!!
+    //     // Write out all attributes before we load the children. Loading the
+    //     // children will change paths we rely on to assign ids ...
+    //
+    // 也就是一个实例的所有 AssignId 一定紧跟它自己的 LoadTemplate、
+    // 在任何嵌套子模板被 load 之前发完。
+    instance_paths: Vec<(Vec<u8>, u64)>,
+
 
     // 布局树。
     //
@@ -796,6 +832,7 @@ impl QtRenderer {
             // 所以这里必须先把 0 号位置占住，
             // 否则第一条 AppendChildren 就找不到父节点。
             element_to_node: vec![Some(0)],
+            instance_paths: Vec::new(),
         }
     }
 
@@ -865,10 +902,10 @@ impl QtRenderer {
 
     // 这个 node 的 node id 挂到 Dioxus 的 ElementId 上。
     //
-    // 会被绑定的只有 Dioxus 「点名」过的那几个节点：
-    // LoadTemplate 的根、CreateTextNode、CreatePlaceholder。
-    // 模板深处的静态元素默认没有 ElementId ——
-    // 想要的话得实现 assign_node_id（这一版是空的，见下面）。
+    // 会被绑定的节点有两类：
+    //     LoadTemplate / CreateTextNode / CreatePlaceholder 的根，
+    //     以及模板深处那些带动态属性的静态元素 —— 后者由 AssignId 送进来
+    //     （见 assign_node_id：靠 instance_paths 按路径找回节点）。
     fn bind(
         &mut self,
         id: ElementId,
@@ -975,6 +1012,20 @@ impl QtRenderer {
         &mut self,
         node: &TemplateNode,
     ) -> u64 {
+        self.create_template_node_at(node, &mut Vec::new())
+    }
+
+    // 按模板结构递归建节点，同时把「每个节点相对本次模板根的路径」记进
+    // instance_paths —— assign_node_id 要靠它找回节点。
+    //
+    // path 里每一位都是**它在模板 children 数组里的下标**（mutations.rs:134-140），
+    // 所以递归时必须老老实实按模板给的顺序建孩子、
+    // 动态位置也要建出占位节点 —— 少建一个，后面所有下标就全错位。
+    fn create_template_node_at(
+        &mut self,
+        node: &TemplateNode,
+        path: &mut Vec<u8>,
+    ) -> u64 {
         match node {
             TemplateNode::Element {
                 tag,
@@ -989,6 +1040,9 @@ impl QtRenderer {
                 // 节点先建出来，属性才有地方记。
                 let element_node =
                     self.new_node(Some(object));
+
+                self.instance_paths
+                    .push((path.clone(), element_node));
 
 
                 // 模板里写死的属性（text: "字面量"）此刻就能应用；
@@ -1039,10 +1093,13 @@ impl QtRenderer {
 
                 // 静态子节点递归建；
                 // 动态位置建出一个占位节点。
-                for child in children.iter() {
-                    let child_node =
-                        self.create_template_node(child);
+                for (idx, child) in children.iter().enumerate() {
+                    path.push(idx as u8);
 
+                    let child_node =
+                        self.create_template_node_at(child, path);
+
+                    path.pop();
 
                     self.attach(
                         element_node,
@@ -1075,8 +1132,13 @@ impl QtRenderer {
                         .pin_mut()
                         .create_text(text);
 
+                let text_node =
+                    self.new_node(Some(object));
 
-                self.new_node(Some(object))
+                self.instance_paths
+                    .push((path.clone(), text_node));
+
+                text_node
             }
 
 
@@ -1088,9 +1150,20 @@ impl QtRenderer {
             // 本 renderer 不需要它 ——
             // 我们是按「它在树的哪个位置」来找这个坑的，
             // 下标信息已经在父子顺序里了。
+            //
+            // 但路径要记：AssignId 也可能是给一个**占位节点**发 id 的
+            // （mutations.rs:145 原文就是 "this element/placeholder"）。
             TemplateNode::Dynamic {
                 ..
-            } => self.new_node(None),
+            } => {
+                let placeholder =
+                    self.new_node(None);
+
+                self.instance_paths
+                    .push((path.clone(), placeholder));
+
+                placeholder
+            }
         }
     }
 
@@ -2180,13 +2253,17 @@ impl WriteMutations for QtRenderer {
         // rsx! 允许多根，但我们的组件全是单根，
         // 所以每个模板只会走到 roots[0]。
 
+        // 这张表只描述**这一个**实例，进来先清空。
+        // 敢只留最近一次的依据见字段注释（diff/node.rs:616-620：
+        // 一个实例的所有属性 mutation 一定排在它的孩子被 load 之前）。
+        self.instance_paths.clear();
+
         let node =
             self.create_template_node(root);
 
 
-        // 只有根节点带 ElementId；
-        // 模板深处的静态元素要等 AssignId 才有 id，
-        // 而 assign_node_id 目前是空实现。
+        // 根节点自带 ElementId；模板深处那些有动态属性的节点，
+        // 由紧跟其后的 AssignId 补上（见 assign_node_id）。
         self.bind(id, node);
 
 
@@ -2348,45 +2425,60 @@ impl WriteMutations for QtRenderer {
 
 
     // ========================================================
-    // 下面这些这一版用不到。
+    // 更新（diff）路径上的那几条 mutation。
     //
-    // 先打个补丁：这个分组标题现在已经不太准了。
-    // create_placeholder 和 replace_placeholder_with_nodes
-    // 现在就在一起跑 —— Rectangle 顶掉 <qt-text> 里那个坑位
-    // 走的正是这两条，它们属于 mount 路径。
+    // 它们首次渲染都不会发，只有重渲染才会有：
     //
-    // 剩下几个真正「用不到」的原因是它们只出现在 diff（更新）路径，
-    // 首次渲染根本不会发：
-    //
-    //     assign_node_id      → AssignId，
-    //                           给模板深处的元素补 id（diff/node.rs:871）
+    //     assign_node_id      → 内层元素补 ElementId
+    //                           （diff/node.rs:856-874）
     //     replace_node_with   → 旧节点整坨被换掉（diff/node.rs:326、381）
     //     remove_node         → 旧节点删除（diff/node.rs:328、383）
     //     insert_nodes_before → 列表重排（diff/iterator.rs:447）
     //     insert_nodes_after  → 列表重排（diff/iterator.rs:467）
     //
-    // 结论：光把 Qt 的事件接上、让 signal 能触发 diff 还不够，
-    // panic 的那几个必须一起实现，否则第一次更新就炸。
-    //
-    // 下一版再真正实现。
+    // create_placeholder / replace_placeholder_with_nodes 属于 mount 路径，
+    // 和上面这些混在这一段里只是因为写下的顺序。
     // ========================================================
 
     // 给模板深处的静态元素补一个 ElementId。
     //
     // path 语义跟 resolve_slot 一样（相对栈顶那个模板根）。
     //
-    // 现在为空实现的后果：
-    // 只要嵌套深一层，比如 <qt-text> 里面还有一个静态 <qt-row>，
-    // 那个内层元素就永远拿不到 ElementId，
-    // Dioxus 之后 SetAttribute(id=内层) 找不到节点，
-    // 属性更新被 object_of 那层静默丢弃
-    // （见 set_attribute 里「还没有映射到 Qt 对象」那个分支）。
-    // 这一版所有属性都挂在模板根上，所以看不出问题。
+    // 什么时候会收到它 —— dioxus 那边的原文写在 diff/node.rs:856-874
+    // （assign_static_node_as_dynamic）：一个模板节点身上挂了**动态属性**，
+    // 而它又不是这次 load 的根节点，dioxus 就现开一个 ElementId、
+    // 先发 assign_node_id(&path[1..], id)、紧跟着一串 set_attribute(id, ...)。
+    // 根节点不需要它（根的 id 从 LoadTemplate 就有了，走 :865 那条 return）。
+    //
+    // 所以这条 mutation 只出现在「属性写在原生元素上」的场合：
+    // 用 Text { } 这类组件时，动态 prop 落在子模板的根上，永远不需要 AssignId。
     fn assign_node_id(
         &mut self,
-        _path: &'static [u8],
-        _id: ElementId,
+        path: &'static [u8],
+        id: ElementId,
     ) {
+        let found = self.instance_paths
+            .iter()
+            .find(|(node_path, _)| node_path.as_slice() == path)
+            .map(|(_, node)| *node);
+
+        let node = found.unwrap_or_else(|| {
+            panic!(
+                "AssignId path={path:?} id={} 找不到节点 —— \
+                 最近一次 LoadTemplate 的实例表里只有 {} 条路径。\
+                 要么是 id 发在了孩子被 load 之后（dioxus 不会这么发，\
+                 见 diff/node.rs:616-620），要么是我们的建序和模板不一致。",
+                id.0,
+                self.instance_paths.len(),
+            )
+        });
+
+        self.bind(id, node);
+
+        println!(
+            "[Dioxus] AssignId path={path:?} id={} → node {node}",
+            id.0
+        );
     }
 
 

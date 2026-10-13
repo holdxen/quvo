@@ -35,7 +35,7 @@
 //! C++ 侧只提供「原子操作」，不提供 UI、不提供布局。
 //!
 //!
-//! ## id 有四层，别搞混
+//! ## 编号有三层，别搞混
 //!
 //! ```text
 //!  ElementId        Dioxus 的编号，只在 root/动态节点上有；
@@ -44,10 +44,14 @@
 //!  node id          本 renderer 的树节点编号；占位节点也有，
 //!                   因为 Dioxus 的 path 数是它在模板里的位置
 //!      ↓  Node::object
-//!  object id        C++ 那边 QtHost::Impl::objects 的 key，0 = 窗口根
-//!      ↓  objects
-//!  QObject*         真正的 QtQuick 对象
+//!  QQuickItem*      C++ 实例化出来的那个 Qt 对象的裸指针，
+//!                   Rust 直接握着它去 mount / set_property / set_geometry
 //! ```
+//!
+//! 以前这第三层是一个 u64 object id，C++ 侧再用 unordered_map 查回指针；
+//! 现在指针本身就是句柄，少一次查找，也少一本要维护的账。
+//! 代价是 Rust 这边拿的是 `*mut QQuickItem` —— 裸指针没有生命周期，
+//! 「对象还活着吗」这个问题只能靠 Qt 的 parent tree 回答。
 //!
 //!
 //! ## 阅读顺序建议
@@ -166,8 +170,16 @@ mod ffi {
             self: Pin<&mut QtHost>
         );
 
+        // 窗口根 = window.contentItem()。
+        //
+        // node 0 的 object 存的就是它。以前这里不需要问：
+        // Rust 记一个约定的 id 0，C++ 那边再翻译成 contentItem。
+        fn root_item(
+            self: &QtHost,
+        ) -> *mut QQuickItem;
+
         // 实例化一个 QtQuick.Text。
-        // 返回值是 C++ 侧分配的 object id（0 表示创建失败）。
+        // 返回值是这个 Qt 对象的裸指针（nullptr = 创建失败）。
         //
         // 两个地方会调它：
         //   - 模板里的静态文本（TemplateNode::Text）
@@ -192,8 +204,9 @@ mod ffi {
 
         // 把 child 挂到 parent 下面，正式进 visual tree。
         //
-        // parent_id == 0 是约定好的「窗口根」，
-        // C++ 那边翻译成 window.contentItem()。
+        // parent 就是一个真实的 QQuickItem 指针：
+        // 挂到窗口根时传的是 root_item() 拿到的那个 contentItem，
+        // 不再有「id 0 表示窗口根」那层约定。
         unsafe fn mount(
             self: Pin<&mut QtHost>,
             parent: *mut QQuickItem,
@@ -399,19 +412,22 @@ fn app() -> Element {
 
 // 树里的一个节点。
 //
-//     object = Some(id)   已经在 Qt 里实体化了的对象
-//     object = None       占位节点（模板里的动态位置），
-//                         树里有它，Qt 里还没有东西，
-//                         等着被 ReplacePlaceholder 顶掉
+//     object = Some(item)   已经在 Qt 里实体化了的对象，
+//                           这里存的就是那个对象的裸指针
+//     object = None         占位节点（模板里的动态位置），
+//                           树里有它，Qt 里还没有东西，
+//                           等着被 ReplacePlaceholder 顶掉
 //
 // children 的顺序就是 Dioxus 模板里的顺序，占位节点也占一格 ——
 // resolve_slot 拿 path 的下标直接索引它，顺序错一个就全错。
 //
-// 根节点的 object 是 Some(0)：0 在 C++ 那边表示「窗口根」。
+// 根节点的 object 是 window.contentItem()（由 root_item() 拿到的真实指针）。
+// 以前这里是约定的 id 0，C++ 那边再翻译回 contentItem；
+// 现在两层是同一个东西，没有那层翻译了。
 
 #[derive(Default)]
 struct Node {
-    object: Option<u64>,
+    object: Option<QQuickItemId>,
 
     // 子节点的 node id，按模板顺序
     children: Vec<u64>,
@@ -439,32 +455,32 @@ struct Node {
 }
 
 
-// renderer 的全部状态就是这四个字段。
+// renderer 的全部状态就是这几个字段。
 //
 // 本质工作是在翻译两套编号：
 //
 //     Dioxus 只会说  ElementId / 模板里的 path
-//     Qt   只认     object id
+//     Qt   只认     QQuickItem*
 //
 // 所以中间必须有一棵树把两者接起来，而且要维持住 Dioxus 期望的
 // 「第几个孩子」的顺序 —— 哪怕那个位置上的东西在 Qt 里根本不存在。
 //
-//     nodes            node id -> Node（它有没有 Qt 对象 + 孩子顺序）
+//     nodes            node id -> Node（它的 Qt 指针 + 孩子顺序）
 //                      这是「按 Dioxus 的视角」建的树，占位节点也算一格
 //     element_to_node  ElementId -> node id
 //                      所有按 id 寻址的 mutation 都靠它落地
 //     stack            Dioxus 约定的临时栈，见 WriteMutations 的注释
 //     host             唯一能碰 Qt 的入口
 //
-// C++ 那边还有第四本账：QtHost::Impl::objects（object id -> QObject*），
-// Rust 侧看不到它，也不需要看到 —— Rust 只握着 id。
+// C++ 那边以前还有第四本账（QtHost::Impl::objects，id -> QObject*），
+// 每次调用都要查一次表。现在 Rust 直接握着指针，那张表整个没了。
 struct QtRenderer {
     host: UniquePtr<ffi::QtHost>,
 
 
     // 节点 id -> 节点
     //
-    // 注意这不是 Qt 的 object id：
+    // 注意这套 node id 和 Qt 那边完全无关：
     // 占位节点没有 Qt 对象，但树里得有它的位置，
     // 而且 mutation 里的路径是按「第几个子节点」走的，
     // 所以要自己维护父子关系。
@@ -524,8 +540,9 @@ struct QtRenderer {
     tree: TaffyTree<String>,
 
     // 布局根 = node 0（窗口内容区）。
-    // 它没有 Qt 对象可写几何（0 是约定的「窗口根」），
-    // 只有孩子会被 apply。
+    // node 0 的 object 是 contentItem 那个真实指针，
+    // 但几何从来不往它身上写（apply_geometry 的 DFS 从它的孩子开始），
+    // 所以只有孩子会被 apply。
     root_taffy: NodeId,
 }
 
@@ -559,16 +576,18 @@ impl QtRenderer {
             .expect("taffy: 建布局根失败");
 
 
-        // renderer root：没有真的 Qt 对象，
-        // 但它的目标就是窗口根，
-        // 所以直接按 C++ 那边的约定记成 0。
-        //
+        // renderer root：它自己没有可以「写几何」的对象，
+        // 但它是所有顶层节点的挂载目标 —— 就是窗口的 contentItem。
+        // 以前这里按 C++ 的约定记成 id 0，现在直接存真实指针。
+        let root_item: QQuickItemId =
+            host.root_item();
+
         // 它的样式也走「属性账本」这一条路，
         // 这样 style_for 就是全项目唯一的样式来源。
         nodes.insert(
             0,
             Node {
-                object: Some(0),
+                object: Some(root_item),
                 children: Vec::new(),
                 taffy: Some(root_taffy),
                 style: vec![
@@ -614,7 +633,7 @@ impl QtRenderer {
 
     fn new_node(
         &mut self,
-        object: Option<u64>,
+        object: Option<QQuickItemId>,
     ) -> u64 {
         let id = self.next_node;
 
@@ -663,10 +682,11 @@ impl QtRenderer {
     }
 
 
+    // node id -> 它的 Qt 对象指针（占位节点是 None）。
     fn object_of_node(
         &self,
         id: u64,
-    ) -> Option<u64> {
+    ) -> Option<QQuickItemId> {
         self.nodes
             .get(&id)
             .and_then(|node| node.object)
@@ -725,7 +745,7 @@ impl QtRenderer {
     fn object_of(
         &self,
         id: ElementId,
-    ) -> Option<u64> {
+    ) -> Option<QQuickItemId> {
         self.object_of_node(self.lookup(id)?)
     }
 
@@ -830,13 +850,18 @@ impl QtRenderer {
                         let value = cxx_qt_lib::QVariant::from(&value);
 
                         if !is_layout_prop(name) {
-                            self.host
-                                .pin_mut()
-                                .set_property(
-                                    object,
-                                    name,
-                                    &value,
-                                );
+                            // SAFETY: object 是 create_element 刚拿回来的
+                            // QQuickItem 指针，还没被任何人释放
+                            // （它挂在 Qt 的 parent tree 上，或等着被挂）。
+                            unsafe {
+                                self.host
+                                    .pin_mut()
+                                    .set_property(
+                                        object,
+                                        name,
+                                        &value,
+                                    );
+                            }
                         }
                     }
                 }
@@ -858,7 +883,7 @@ impl QtRenderer {
 
                 println!(
                     "[renderer] <{tag}> -> node \
-                     {element_node} (QtObject {object})"
+                     {element_node} (QtObject {object:p})"
                 );
 
 
@@ -922,7 +947,7 @@ impl QtRenderer {
     fn create_element(
         &mut self,
         tag: &str,
-    ) -> u64 {
+    ) -> QQuickItemId {
         let object = match tag {
             "qt-text" => self
                 .host
@@ -948,12 +973,12 @@ impl QtRenderer {
         };
 
 
-        // C++ 那边实例化失败也是返回 0，而 0 在本项目里是
-        // 「窗口根」这个约定值 —— 不拦的话一个建失败的节点
-        // 会被当成窗口根去挂载、去写几何，症状会非常难读。
+        // C++ 那边实例化失败就是返回 nullptr。
+        // 不拦的话这个「有节点、没对象」的东西会一路走下去：
+        // 挂载、写几何全都拿空指针，症状会散成一片很难读。
         // 真正的错误信息（QML 报错）已经由 qWarning 打出去了。
-        assert_ne!(
-            object, 0,
+        assert!(
+            !object.is_null(),
             "Qt 侧实例化 <{tag}> 失败，见上面的 qWarning"
         );
 
@@ -1207,17 +1232,24 @@ impl QtRenderer {
             let w = layout.size.width as f64;
             let h = layout.size.height as f64;
 
-            // object 0 是「窗口根」那个约定值，
-            // C++ 的 objects 表里没有它，写进去只会刷一条警告。
+            // 每个有 Qt 对象的节点都写；
+            // 占位节点上面已经被 taffy 那层过滤掉了（它没有布局节点）。
+            //
+            // 以前这里还要把「id 0 = 窗口根」那个约定值排除掉，
+            // 现在不用：这个 DFS 从 node 0 的孩子们开始，
+            // node 0 自己（contentItem）从来不是被写的那个。
             let object = self
                 .node(child)
-                .object
-                .filter(|id| *id != 0);
+                .object;
 
             if let Some(object) = object {
-                self.host
-                    .pin_mut()
-                    .set_geometry(object, x, y, w, h);
+                // SAFETY: 这个指针来自 create_* 或 root_item()，
+                // 对象由 Qt 的 parent tree 持有，活着。
+                unsafe {
+                    self.host
+                        .pin_mut()
+                        .set_geometry(object, x, y, w, h);
+                }
             }
 
             self.apply_geometry(child);
@@ -1250,7 +1282,7 @@ impl QtRenderer {
 
         for id in ids {
             let Some(object) =
-                self.node(id).object.filter(|o| *o != 0)
+                self.node(id).object
             else {
                 continue;
             };
@@ -1265,11 +1297,17 @@ impl QtRenderer {
             let free = self.host.measure_text(&content, -1.0);
             let wrapped = self.host.measure_text(&content, 100.0);
 
-            let implicit_w = self.host.implicit_width(object);
-            let implicit_h = self.host.implicit_height(object);
+            // SAFETY: 同一个对象指针，来自 create_*；
+            // 读 implicit size 不改对象所有权，也不管它挂没挂。
+            let implicit_w = unsafe {
+                self.host.implicit_width(object)
+            };
+            let implicit_h = unsafe {
+                self.host.implicit_height(object)
+            };
 
             println!(
-                "[measure] node {id} obj {object} \
+                "[measure] node {id} obj {object:p} \
                  text={content:?}"
             );
             println!(
@@ -1342,12 +1380,16 @@ impl QtRenderer {
             self.object_of_node(parent),
             self.object_of_node(child),
         ) {
-            self.host
-                .pin_mut()
-                .mount(
-                    parent_object,
-                    child_object,
-                );
+            // SAFETY: 两个指针都来自 create_* / root_item()，
+            // 且这一刻都还没被释放（挂载本身就是让它们被 parent 接管的动作）。
+            unsafe {
+                self.host
+                    .pin_mut()
+                    .mount(
+                        parent_object,
+                        child_object,
+                    );
+            }
         }
 
 
@@ -1705,13 +1747,17 @@ impl WriteMutations for QtRenderer {
         {
             let value = cxx_qt_lib::QString::from(value);
             let value = cxx_qt_lib::QVariant::from(&value);
-            self.host
-                .pin_mut()
-                .set_property(
-                    object,
-                    "text",
-                    &value,
-                );
+
+            // SAFETY: object 来自 object_of，即某个还活在树上的节点。
+            unsafe {
+                self.host
+                    .pin_mut()
+                    .set_property(
+                        object,
+                        "text",
+                        &value,
+                    );
+            }
         }
     }
 
@@ -1926,21 +1972,27 @@ impl WriteMutations for QtRenderer {
                 };
 
 
-                self.host
-                    .pin_mut()
-                    .mount(
-                        parent_object,
-                        child_object,
-                    );
-
-
-                if let Some(sibling) = next_sibling {
+                // SAFETY: parent_object / child_object / sibling 都是
+                // create_* 返回过、且还没被删的指针。
+                // 这里也解释了为什么「先 mount 再 stack_before」是安全的：
+                // stackBefore 要求 child 已经在这个 parent 的 childItems 里。
+                unsafe {
                     self.host
                         .pin_mut()
-                        .stack_before(
+                        .mount(
+                            parent_object,
                             child_object,
-                            sibling,
                         );
+
+
+                    if let Some(sibling) = next_sibling {
+                        self.host
+                            .pin_mut()
+                            .stack_before(
+                                child_object,
+                                sibling,
+                            );
+                    }
                 }
             }
         }
@@ -2128,13 +2180,16 @@ impl WriteMutations for QtRenderer {
         let value = cxx_qt_lib::QString::from(text);
         let value = cxx_qt_lib::QVariant::from(&value);
 
-        self.host
-            .pin_mut()
-            .set_property(
-                object,
-                name,
-                &value,
-            );
+        // SAFETY: object 是 object_of 查出来的、某个还活在树上的节点的指针。
+        unsafe {
+            self.host
+                .pin_mut()
+                .set_property(
+                    object,
+                    name,
+                    &value,
+                );
+        }
     }
 
 

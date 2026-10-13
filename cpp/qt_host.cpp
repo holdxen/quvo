@@ -22,8 +22,6 @@
 #include <QtQuick/QQuickItem>
 #include <QtQuick/QQuickWindow>
 
-#include <unordered_map>
-
 // FLT_MAX —— QQuickText 不限宽时用的也是它（qquicktext.cpp:834）。
 #include <cfloat>
 
@@ -37,10 +35,10 @@ QString to_qstring(rust::Str text)
     );
 }
 
-// 共用：把一段内联 QML 实例化成 QQuickItem，登记进 objects 并返回 id。
+// 共用：把一段内联 QML 实例化成 QQuickItem 并把指针交出去。
 //
-// 返回 0 表示失败（Rust 侧会把 0 当成「这个节点没有 Qt 对象」，
-// 于是既不挂载也不参与布局）。
+// 返回 nullptr 表示失败。此刻对象还没有 parent，也就还不属于任何人 ——
+// 是 Rust 侧随后的 mount 把它送进 Qt 的 parent tree，从此由那条树负责释放。
 QQuickItem* instantiate(
     QQmlEngine& engine,
     const char* qml,
@@ -59,7 +57,7 @@ QQuickItem* instantiate(
             qWarning().noquote() << error.toString();
         }
 
-        return 0;
+        return nullptr;
     }
 
     QObject* object = component.create();
@@ -68,7 +66,7 @@ QQuickItem* instantiate(
         qWarning()
             << "QQmlComponent::create failed" << label;
 
-        return 0;
+        return nullptr;
     }
 
     auto* item = qobject_cast<QQuickItem*>(object);
@@ -82,18 +80,12 @@ QQuickItem* instantiate(
         return nullptr;
     }
 
+    qDebug()
+        << "[Qt] create" << label
+        << "at" << item
+        << "but NOT mounted yet";
+
     return item;
-
-    // const std::uint64_t id = next_id++;
-
-    // objects.emplace(id, object);
-
-    // qDebug()
-    //     << "[Qt] create" << label
-    //     << "id =" << id
-    //     << "but NOT mounted yet";
-
-    // return id;
 }
 
 } // namespace
@@ -105,29 +97,13 @@ struct QtHost::Impl {
     QQmlEngine engine;
     QQuickWindow window;
 
-    std::uint64_t next_id = 1;
-
-    std::unordered_map<
-        std::uint64_t,
-        QObject*
-    > objects;
-
-    ~Impl()
-    {
-        // 已经 mount 的对象由 Qt parent tree 管理。
-        //
-        // 没 mount 的对象我们自己释放。
-        for (auto const& [id, object] : objects) {
-            Q_UNUSED(id);
-
-            if (
-                object != nullptr &&
-                object->parent() == nullptr
-            ) {
-                delete object;
-            }
-        }
-    }
+    // 这里不再存 id -> 对象的表：指针本身就是句柄，
+    // Rust 侧拿着它直接调下面的方法。
+    //
+    // 代价是「没 mount 出去的对象」从此没人负责释放了。
+    // 现在这条路上每个建出来的节点都会被挂上，所以没有泄漏；
+    // 真要不泄漏得等 C++ 侧有 destroy（remove_node 那一版）。
+    ~Impl() = default;
 };
 
 
@@ -162,6 +138,14 @@ std::unique_ptr<QtHost> new_qt_host()
 void QtHost::show()
 {
     impl_->window.show();
+}
+
+
+QQuickItem* QtHost::root_item() const
+{
+    // 窗口的内容区 —— 所有顶层节点的 parentItem。
+    // 它由 window 持有，我们只是把指针交出去。
+    return impl_->window.contentItem();
 }
 
 
@@ -217,16 +201,8 @@ Text {
         "Text"
     );
 
-    // if (id == 0) {
-    //     return 0;
-    // }
-
-    // object_for(id)->setProperty(
-    //     "text",
-    //     to_qstring(text)
-    // );
-
-    if (item) {
+    // 此刻对象已经有了内容，但还没进 visual tree。
+    if (item != nullptr) {
         item->setProperty("text", to_qstring(text));
     }
 
@@ -240,43 +216,6 @@ QtHost::mount(
     QQuickItem* child
 )
 {
-    // QObject* child =
-    //     object_for(child_id);
-
-    // auto* child_item =
-    //     qobject_cast<QQuickItem*>(
-    //         child
-    //     );
-
-    // if (
-    //     child == nullptr ||
-    //     child_item == nullptr
-    // ) {
-    //     qWarning()
-    //         << "[Qt] cannot mount object"
-    //         << child_id;
-
-    //     return;
-    // }
-
-
-    // // parent_id == 0 就是窗口根。
-    // QQuickItem* parent =
-    //     parent_id == 0
-    //         ? impl_->window.contentItem()
-    //         : qobject_cast<QQuickItem*>(
-    //               object_for(parent_id)
-    //           );
-
-    // if (parent == nullptr) {
-    //     qWarning()
-    //         << "[Qt] unknown parent"
-    //         << parent_id;
-
-    //     return;
-    // }
-
-
     // -----------------------------
     // QObject ownership tree
     // -----------------------------
@@ -291,11 +230,9 @@ QtHost::mount(
     child->setParentItem(parent);
 
 
-    // qDebug()
-    //     << "[Qt] mount object"
-    //     << child_id
-    //     << "into parent"
-    //     << parent_id;
+    qDebug()
+        << "[Qt] mount" << child
+        << "into parent" << parent;
 }
 
 
@@ -347,26 +284,9 @@ double QtHost::window_height() const
 }
 
 
-QObject*
-QtHost::object_for(
-    std::uint64_t id
-) const
-{
-    const auto it =
-        impl_->objects.find(id);
-
-    if (it == impl_->objects.end()) {
-        return nullptr;
-    }
-
-
-    return it->second;
-}
-
-
 void
 QtHost::set_property(
-    QObject *object,
+    QQuickItem *item,
     rust::Str name,
     const QVariant &value
 )
@@ -380,7 +300,7 @@ QtHost::set_property(
     // 例如 color 是 QColor、font.pixelSize 是嵌套属性，
     // 都不是 QString 能直接写进去的。
     if (
-        !object->setProperty(
+        !item->setProperty(
             property.constData(),
             value
         )

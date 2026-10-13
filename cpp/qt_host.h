@@ -2,11 +2,9 @@
 
 #include "rust/cxx.h"
 
-#include <cstdint>
 #include <memory>
 
 class QQuickItem;
-class QObject;
 class QVariant;
 
 // 文本测量结果，和 QQuickText 的 implicitWidth / implicitHeight 同一口径。
@@ -24,8 +22,19 @@ public:
 
     void show();
 
+    // 窗口根 = window.contentItem()。
+    //
+    // 以前 Rust 侧用约定的 id 0 表示「挂到窗口根」；
+    // id 没了之后，这里把真实指针交出去，
+    // Rust 那边 node 0 的 object 就是它。
+    QQuickItem* root_item() const;
+
     // 每个 create_* 都是「把一段 QML 组件实例化成 Qt 对象」。
     // 刚造出来的对象还没有 parent，也还没进 visual tree。
+    //
+    // 返回值就是这个对象的裸指针，Rust 侧直接拿它当句柄
+    // （以前是一个 id，C++ 还要查 map 换回指针）。
+    // 失败返回 nullptr。
     QQuickItem* create_rectangle();
 
     QQuickItem* create_text(rust::Str text);
@@ -36,8 +45,9 @@ public:
 
     // 把一个对象挂到父对象下面。
     //
-    // parent_id == 0 表示窗口根（window.contentItem()）。
     // 这一步才真正进入 Qt 的 visual tree。
+    // 「窗口根」不再是约定值：Rust 侧挂根时用 root_item() 拿到的
+    // 那个真实 contentItem 指针当 parent。
     void mount(
         QQuickItem* parent,
         QQuickItem* child
@@ -71,7 +81,7 @@ public:
     // 目前就是 QObject::setProperty(name, value)，
     // 属性名与 Qt 属性名同名（Dioxus 的 text -> QtQuick.Text::text）。
     void set_property(
-        QObject *obj,
+        QQuickItem *item,
         rust::Str name,
         const QVariant &value
     );
@@ -96,10 +106,6 @@ public:
     ) const;
 
 private:
-    QObject* object_for(
-        std::uint64_t id
-    ) const;
-
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

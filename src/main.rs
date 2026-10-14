@@ -57,7 +57,7 @@
 //! ## 阅读顺序建议
 //!
 //! 1. `app()` —— counter demo 那一屏，加三个按钮
-//! 2. `mod ffi` —— Rust ↔ C++ 的双向接口：20 个正向（1 个造 QtHost + 19 个方法）
+//! 2. `mod ffi` —— Rust ↔ C++ 的双向接口：21 个正向（1 个造 QtHost + 20 个方法）
 //!    + 1 个 C++ 自由函数 + 10 个 C++ 回调 Rust（1 个回路 poll + 1 个窗口尺寸
 //!    + 8 支事件）
 //! 3. `struct QtRenderer` 的字段注释 —— 树账（nodes/stack）、
@@ -95,6 +95,17 @@
 //!   resize（盯 QQuickItem 的尺寸信号）、mounted（渲染批次结束后补发）。
 //!   负载是三套坐标（元素本地 / 窗口 / 屏幕）+ Qt 的按键位掩码 + 修饰键位，
 //!   冒泡那个布尔查 dioxus-core-types 的 `event_bubbles()`，不自己拍。
+//! - 窗口尺寸变化会重排：`QEvent::Resize` → `ResizeFilter` → `qt_window_resized`
+//!   → `relayout`，这条链不经过 Dioxus（视口是布局的输入，不是应用状态）。
+//!   配套的是尺寸属性现在认百分比（`"100%"`）和 `flex_grow`，
+//!   `app()` 的根节点写死 100%、中间那块按钮 `flex_grow: "1"`，
+//!   所以拖动窗口是屏幕上看得见的伸缩。
+//! - 属性值四种形态都收：`AttributeValue::{Text, Int, Float, Bool}` 各包成
+//!   对应类型的 QVariant 写给 Qt（`variant_of`），布局那条路认数字
+//!   （`width: 110` 不再要引号）；`AttributeValue::None` 是**撤掉这个属性** ——
+//!   布局属性从账本里摘掉（回到 auto），Qt 属性由 C++ 写回
+//!   「对象刚建出来时的值」（那份抄存在对象的动态属性上，见 clear_property）。
+//!   `Any` 翻译不了、`Listener` 不该走这条路，两者都在门口拒绝并打出理由。
 //!
 //! 还缺的：
 //!
@@ -106,15 +117,9 @@
 //! - keydown 那三支要 item 能拿 active focus（注册时把 focusPolicy
 //!   开成 ClickFocus），但按键的 left/right 位置 Qt 给不出，一律报 Standard；
 //!   `is_composing` 要 QInputMethod 才有，报 false。
-//! - 窗口尺寸变化会重排：`QEvent::Resize` → `ResizeFilter` → `qt_window_resized`
-//!   → `relayout`，这条链不经过 Dioxus（视口是布局的输入，不是应用状态）。
-//!   配套的是尺寸属性现在认百分比（`"100%"`）和 `flex_grow`，
-//!   `app()` 的根节点写死 100%、中间那块按钮 `flex_grow: "1"`，
-//!   所以拖动窗口是屏幕上看得见的伸缩。
 //! - 字体还是 Qt 自己的默认值，没和 `measure_item` 用同一个来源
 //!   （现在两边都是「item 上那个默认字体」，所以量出来刚好对得上；
-//!   一旦 font 变成 Rust 下发的样式，两处要一起改）；
-//!   `AttributeValue::{Int, Float, Bool, None}` 在属性过滤那步被丢掉。
+//!   一旦 font 变成 Rust 下发的样式，两处要一起改）。
 //! - 因为事件源只剩鼠标/键盘这些真输入，offscreen 跑起来之后日志里
 //!   不会再有渲染 —— 回路醒着但没人叫醒它。click→handle_event→渲染那一段
 //!   的回归测试搬到了 `mod tests` 里（不碰 Qt，直接在 VirtualDom 上派发事件）。
@@ -370,17 +375,41 @@ mod ffi {
             sibling: *mut QQuickItem,
         );
 
-        // QObject::setProperty(name, QVariant( QString(value)) )。
+        // QObject::setProperty(name, value)。
+        //
+        // value 现在是**带类型**的 QVariant：Text → QString、Int → qlonglong、
+        // Float → double、Bool → bool（Rust 侧 variant_of 包的）。
+        // 类型对不上时 Qt 自己会做数值转换（比如 Int 写进 qreal radius），
+        // 但字符串往 bool 属性里塞 "false" 会转成 true，
+        // 所以「把类型包对」这件事必须在 Rust 侧做完。
         //
         // 属性名直接对上 Qt 的属性名：
         // Dioxus 侧写 text: "..."，这里就落到 QtQuick.Text::text。
-        // 写不进去的（类型不匹配，比如 color 要 QColor、
-        // font.pixelSize 要 int）会在 C++ 侧 qWarning。
+        // 写不进去的（这个对象上没这个属性，或者类型转不过去）
+        // 会在 C++ 侧 qWarning。
+        //
+        // 第一次写某个属性之前，C++ 会把该属性当时的值抄存一份，
+        // 供 clear_property 用 —— 见 cpp/qt_host.cpp。
         unsafe fn set_property(
             self: Pin<&mut QtHost>,
             item: *mut QQuickItem,
             name: &str,
             value: &QVariant,
+        );
+
+        // 「这个属性被撤掉了」（AttributeValue::None）。
+        //
+        // 语义是回到**这个对象刚建出来时的值**，靠的是上面那份抄存。
+        // 不能走 QObject::resetProperty：我们用的那几个属性
+        // （Rectangle::color、Text::text、Item::visible/opacity）
+        // 在 Q_PROPERTY 里都没声明 RESET
+        // （qquickrectangle_p.h:133、qquicktext_p.h:33、qquickitem.h:79-81），
+        // 那条路对它们一律返回 false。
+        // 没抄存过（从来没写过）就是无事发生，日志里会说明。
+        unsafe fn clear_property(
+            self: Pin<&mut QtHost>,
+            item: *mut QQuickItem,
+            name: &str,
         );
 
         // 布局结果写给 Qt：几何的唯一入口。
@@ -753,6 +782,14 @@ fn app() -> Element {
             // 没有 ElementId 的话监听器根本送不到节点上。
             // rsx 里写的是 onclick，送到我们手里已经是 "click"
             // （:533 把 "on" 前缀剥掉了）。
+            //
+            // 这一屏同时是「属性值四种形态 + 撤掉属性」的演示，
+            // 每块按钮各演一种（注释就写在各自身上）：
+            //     Text   —— 所有引号里写的，包括下面那些颜色字面量
+            //     Int    —— 归零那块：不带引号的 110 / 48 / 12
+            //     Float  —— 加一那块：opacity
+            //     Bool   —— 那条奇偶条：visible
+            //     None   —— 减一那块：color 在偶数次时是整个属性被撤掉
             qt-column {
                 width: "100%",
                 height: "48",
@@ -762,13 +799,24 @@ fn app() -> Element {
                 qt-rectangle {
                     width: "110",
                     height: "48",
-                    color: "#d9825f",
+
+                    // Option<String>：Some → AttributeValue::Text，
+                    // None → AttributeValue::None（nodes.rs:1117-1124）。
+                    // 所以偶数次点完之后这块不是「变成透明」也不是「变成黑色」，
+                    // 而是**回到 Rectangle 刚建出来时的颜色**（白色）——
+                    // C++ 那边第一次写 color 之前抄存的就是它。
+                    color: if shown % 2 == 1 {
+                        Some("#d9825f".to_string())
+                    } else {
+                        None
+                    },
+
                     onclick: move |_| {
                         count -= 1;
                     },
 
                     qt-text {
-                        text: "减一",
+                        text: "减一（偶数次时 color 被撤掉）",
                     }
                 }
 
@@ -779,6 +827,15 @@ fn app() -> Element {
                     height: "48",
                     flex_grow: "1",
                     color: "#5f9ed9",
+
+                    // Float → QVariant(double) → QQuickItem::opacity（qreal）。
+                    // 一次都没点过的时候它是半透明的。
+                    opacity: if shown == 0 {
+                        0.45
+                    } else {
+                        1.0
+                    },
+
                     onclick: move |_| {
                         count += 1;
                     },
@@ -788,9 +845,16 @@ fn app() -> Element {
                     }
                 }
 
+                // 这块的尺寸写成**数字字面量**（不带引号）：
+                // 静态模板属性只能是 &str（nodes.rs:670-677 那句注释），
+                // 所以它们走的是动态属性那条路，交过来是 AttributeValue::Int，
+                // 由 dimension_of 直接当成长度用 —— 不必再写 "110"。
+                // radius 也演一次 Int：它不是布局属性，
+                // 是真正落到 Qt 对象上的那个属性。
                 qt-rectangle {
-                    width: "110",
-                    height: "48",
+                    width: 110,
+                    height: 48,
+                    radius: 12,
                     color: "#8a8f98",
                     onclick: move |_| {
                         count.set(0);
@@ -800,6 +864,18 @@ fn app() -> Element {
                         text: "归零",
                     }
                 }
+            }
+
+            // 一条奇偶指示条：Bool → QVariant(bool) → QQuickItem::visible。
+            // 它不参与交互，所以关掉之后不会影响点按钮 ——
+            // 用别的东西演示 visible 会顺手把命中测试也关掉（不可见的项
+            // 直接被 hit test 跳过，qquickdeliveryagent.cpp:2202），
+            // 那就不是一堂属性课而是一堂「为什么点不动」的课了。
+            qt-rectangle {
+                width: "100%",
+                height: "6",
+                color: "#3fbf7f",
+                visible: shown % 2 == 1,
             }
 
             // 每个条目是「一个容器 + 两个孩子」，也就是 3 个节点的一棵小子树。
@@ -883,7 +959,11 @@ struct Node {
     // 记在这里而不是立刻用：属性可能比节点晚到
     // （动态属性是 SetAttribute，静态属性在模板里），
     // 真正的输入时刻是 relayout()。
-    style: Vec<(&'static str, String)>,
+    //
+    // 值是类型化的（PropValue），并且同一名字只有一条：
+    // 写就是覆盖，清空（AttributeValue::None）就是把那条摘掉。
+    // 两个动作的实现见 set_prop_entry / clear_prop_entry。
+    style: Vec<(&'static str, PropValue)>,
 }
 
 
@@ -1049,7 +1129,9 @@ impl QtRenderer {
                 style: vec![
                     (
                         "flex_direction",
-                        "column".to_string(),
+                        PropValue::Text(
+                            "column".to_string()
+                        ),
                     ),
                 ],
             },
@@ -1298,8 +1380,16 @@ impl QtRenderer {
                 // 动态属性（text: "{expr}"）Dioxus 稍后会通过
                 // set_attribute 送过来。
                 //
-                // 布局属性（width / height / gap / flex-direction）
+                // 布局属性（width / height / gap / flex-direction / flex_grow）
                 // 只记账，不写给 Qt —— 几何只有一个作者。
+                //
+                // 静态属性在模板里永远是 &str ——
+                // `TemplateAttribute::Static` 自己就这么写着
+                // （dioxus-core-0.7.10/src/nodes.rs:670-677：
+                // "Currently this only accepts &str, so values, even if they're
+                // known at compile time, are not known"），
+                // 所以这一路只有 PropValue::Text 一种形态；
+                // 类型化的值要从动态属性那条路才走得通。
                 for attr in attrs.iter() {
                     if let TemplateAttribute::Static {
                         name,
@@ -1307,14 +1397,17 @@ impl QtRenderer {
                         ..
                     } = attr
                     {
+                        let value = PropValue::Text(
+                            (*value).to_string(),
+                        );
+
                         self.record_style(
                             element_node,
                             name,
-                            value,
+                            value.clone(),
                         );
 
-                        let value = cxx_qt_lib::QString::from(*value);
-                        let value = cxx_qt_lib::QVariant::from(&value);
+                        let variant = variant_of(&value);
 
                         if !is_layout_prop(name) {
                             // SAFETY: object 是 create_element 刚拿回来的
@@ -1326,7 +1419,7 @@ impl QtRenderer {
                                     .set_property(
                                         object,
                                         name,
-                                        &value,
+                                        &variant,
                                     );
                             }
                         }
@@ -1475,25 +1568,47 @@ impl QtRenderer {
 
     // 把布局属性记到节点上（不写给 Qt）。
     //
-    // 同一名字重复记没关系：style_for 按顺序读，后面的覆盖前面的。
+    // 同一名字只留一条，写第二次就是覆盖 —— 本体在 set_prop_entry，
+    // 这里只管找节点。
     fn record_style(
         &mut self,
         node: u64,
         name: &'static str,
-        value: &str,
+        value: PropValue,
     ) {
         if !is_layout_prop(name) {
             return;
         }
 
+        let entry =
+            self.nodes
+                .get_mut(&node)
+                .unwrap_or_else(|| {
+                    panic!("unknown node id {node}")
+                });
 
-        self.nodes
-            .get_mut(&node)
-            .unwrap_or_else(|| {
-                panic!("unknown node id {node}")
-            })
-            .style
-            .push((name, value.to_string()));
+        set_prop_entry(
+            &mut entry.style,
+            name,
+            value,
+        );
+    }
+
+
+    /// 属性被撤（AttributeValue::None）：把账本里那一条摘掉，
+    /// 于是这个属性在 style_for 眼里回到「从来没写过」。
+    ///
+    /// 返回是否真摘掉了什么 —— 没写过却被 clear，日志要说清楚。
+    fn forget_style(
+        &mut self,
+        node: u64,
+        name: &'static str,
+    ) -> bool {
+        let Some(entry) = self.nodes.get_mut(&node) else {
+            return false;
+        };
+
+        clear_prop_entry(&mut entry.style, name)
     }
 
 
@@ -2380,6 +2495,150 @@ impl QtRenderer {
 // 配合根节点的 width/height: "100%" 和中间那块 flex_grow: "1"，
 // 拖动窗口时屏幕上能看见伸缩（不是只有日志里的数字变了）。
 
+// ============================================================
+// 属性的值：Dioxus 那边有四种形态，第五种是「这个属性没了」
+// ============================================================
+//
+// AttributeValue 的全体变体写死在 dioxus-core-0.7.10/src/nodes.rs:749-770：
+//     Text(String) / Float(f64) / Int(i64) / Bool(bool)
+//     / Listener(..) / Any(..) / None
+//
+// 前一版只认 Text，其余全丢在 `let AttributeValue::Text(text) = value`
+// 那一步 —— 于是 rsx 里不带引号的 `width: 110` 是白写，
+// `color: None`（`Option::None` 也会变成 AttributeValue::None，
+// nodes.rs:1117-1124）更是什么都不会发生。
+//
+// 这里把能表达的四种收成 PropValue，并把 None 单独当成一个**动作**（清空）。
+// 两种要走门口拒绝而不是静默吞掉的：
+//   - Any：`Rc<dyn AnyValue>` 和 Qt 的属性系统之间没有对应类型，翻译不出来；
+//   - Listener：它根本不该出现在这条路上 —— write_attribute 在更早的地方
+//     就把它换成 CreateEventListener 了（diff/node.rs:525-538）。
+//     真走到这里说明上面那层假设破了，得让它响。
+
+#[derive(Clone, Debug, PartialEq)]
+enum PropValue {
+    Text(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+
+/// set_attribute 拿到一份值之后的三个决定之一。
+#[derive(Debug, PartialEq)]
+enum AttrInput {
+    /// 写一个值进去
+    Write(PropValue),
+
+    /// AttributeValue::None：属性被撤了，
+    /// 布局属性从账本里摘掉，Qt 属性回到对象刚建出来时的值
+    Clear,
+
+    /// 我们表达不了这种值，带理由（和 unsupported_reason 同一套路：
+    /// 出声拒绝，不静默）
+    Refused(&'static str),
+}
+
+
+fn classify_attr(
+    value: &AttributeValue,
+) -> AttrInput {
+    match value {
+        AttributeValue::Text(text) => {
+            AttrInput::Write(PropValue::Text(text.clone()))
+        }
+        AttributeValue::Int(v) => {
+            AttrInput::Write(PropValue::Int(*v))
+        }
+        AttributeValue::Float(v) => {
+            AttrInput::Write(PropValue::Float(*v))
+        }
+        AttributeValue::Bool(v) => {
+            AttrInput::Write(PropValue::Bool(*v))
+        }
+
+        AttributeValue::None => AttrInput::Clear,
+
+        AttributeValue::Any(_) => {
+            AttrInput::Refused(
+                "Any(Rc<dyn AnyValue>) 没有对应的 Qt 属性类型，翻译不了"
+            )
+        }
+        AttributeValue::Listener(_) => {
+            AttrInput::Refused(
+                "监听器不走属性这条路：它应该由 write_attribute 变成 CreateEventListener"
+            )
+        }
+    }
+}
+
+
+// 把四种值包成对应类型的 QVariant —— 这是「类型化」的全部意义：
+// Qt 那边 `visible` 要 bool、`opacity` 要 double、`text` 要 QString，
+// 全靠 setProperty 的隐式转换的话，字符串往 bool 属性里塞 "false"
+// 会转成 true（非空即真），那是「看着对其实错」的一类坑。
+//
+// 四种 QVariantValue 实现在 cxx-qt-lib-0.10.0/src/core/qvariant/mod.rs:210-216
+// （bool / f64 / i64 / QString 都在表上），所以这里不需要为哪个类型加一支 C++。
+fn variant_of(
+    value: &PropValue,
+) -> cxx_qt_lib::QVariant {
+    match value {
+        PropValue::Text(text) => {
+            let text = cxx_qt_lib::QString::from(text.as_str());
+
+            cxx_qt_lib::QVariant::from(&text)
+        }
+
+        PropValue::Int(v) => cxx_qt_lib::QVariant::from(v),
+        PropValue::Float(v) => cxx_qt_lib::QVariant::from(v),
+        PropValue::Bool(v) => cxx_qt_lib::QVariant::from(v),
+    }
+}
+
+
+// ============================================================
+// 属性账本：每个节点记「现在写过的属性各是什么值」
+// ============================================================
+//
+// 两个动作抽成自由函数（而不是只写在 QtRenderer 的方法里），
+// 是为了让 mod tests 能不带 Qt 断言它们 —— 尤其「清空」这一条，
+// 光看日志不够，得能证明账本里真的少了那一条。
+//
+// 同一名字只留一份：覆盖，不是往后追加。
+// 追加的话「最后一次写的是什么」没人说得清，
+// 清空还要摘好几条，漏摘一条就变成账本上一个幽灵。
+
+fn set_prop_entry(
+    entries: &mut Vec<(&'static str, PropValue)>,
+    name: &'static str,
+    value: PropValue,
+) {
+    match entries
+        .iter_mut()
+        .find(|(key, _)| *key == name)
+    {
+        Some(slot) => slot.1 = value,
+
+        None => entries.push((name, value)),
+    }
+}
+
+
+/// 返回「本来有没有这一条」。
+/// 没有就返回 false —— 调用方别在日志里谎称清掉了什么。
+fn clear_prop_entry(
+    entries: &mut Vec<(&'static str, PropValue)>,
+    name: &'static str,
+) -> bool {
+    let before = entries.len();
+
+    entries.retain(|(key, _)| *key != name);
+
+    entries.len() != before
+}
+
+
 // 这些属性名不写给 Qt，只进布局。
 // 名字同时接受下划线和短横两种写法：rsx! 里两种都能写。
 const LAYOUT_PROPS: &[&str] = &[
@@ -2438,15 +2697,64 @@ fn parse_size(
 }
 
 
+// 类型化的值 → 长度。
+//
+// Int / Float 就是数，不用解析字符串；字符串走上面那套「纯数字」规则；
+// 布尔不是长度（`gap: true` 应当算没写过，而不是算 1）。
+fn length_of(
+    value: &PropValue,
+) -> Option<f32> {
+    match value {
+        PropValue::Int(v) => Some(*v as f32),
+        PropValue::Float(v) => Some(*v as f32),
+        PropValue::Text(text) => parse_length(text),
+        PropValue::Bool(_) => None,
+    }
+}
+
+
+// 类型化的值 → 尺寸。
+//
+// 百分比只有字符串写得出：`width: 100`（Int）的意思是 100 个像素，
+// 不是 100%。这条区分是故意的，别「顺手」给数字也加百分比语义。
+fn dimension_of(
+    value: &PropValue,
+) -> Option<Dimension> {
+    match value {
+        PropValue::Text(text) => parse_size(text),
+        other => length_of(other).map(Dimension::length),
+    }
+}
+
+
+// 方向只认那两个词；其它值（包括拼错的字符串和任何布尔）当没写过。
+// 前一版是「不是 column 就设成 Row」，那等于把「看不懂」当成「看明白了」：
+// 读的人从结果里分不出「写了 row」和「写了 colum」。
+fn direction_of(
+    value: &PropValue,
+) -> Option<FlexDirection> {
+    match value {
+        PropValue::Text(text) => match text.as_str() {
+            "column" => Some(FlexDirection::Column),
+            "row" => Some(FlexDirection::Row),
+            _ => None,
+        },
+
+        _ => None,
+    }
+}
+
+
 // 把记下来的属性拼成 taffy 的输入。
 //
-// 没写 width / height 的节点就是 auto。
+// 没写 width / height 的节点就是 auto —— 被清空（AttributeValue::None）
+// 之后也是 auto，因为账本里那一条已经被摘掉了（见 clear_prop_entry）。
 // 对文本节点，auto 现在有人接了：relayout 的测量回调会问 Qt 要尺寸。
 // 对矩形 / Item，auto 还是「按内容撑开」而内容没有尺寸来源 → 算出 0，
 // 屏幕上就是空白。这是刻意的：几何不写就没有，不会被 Qt 的
 // implicit size 偷偷填上。
 fn style_for(
-    props: &[(&'static str, String)],
+    props: &[(&'static str, PropValue)],
 ) -> Style {
     let mut style = Style {
         display: Display::Flex,
@@ -2457,19 +2765,19 @@ fn style_for(
     for (name, value) in props {
         match *name {
             "width" => {
-                if let Some(v) = parse_size(value) {
+                if let Some(v) = dimension_of(value) {
                     style.size.width = v;
                 }
             }
 
             "height" => {
-                if let Some(v) = parse_size(value) {
+                if let Some(v) = dimension_of(value) {
                     style.size.height = v;
                 }
             }
 
             "gap" => {
-                if let Some(v) = parse_length(value) {
+                if let Some(v) = length_of(value) {
                     style.gap = Size {
                         width: length(v),
                         height: length(v),
@@ -2480,18 +2788,15 @@ fn style_for(
             // grow：把父节点在主轴上剩下来的空间按份数分掉。
             // 这一支 + 「父节点用 100%」是界面上能跟着窗口伸缩的机制本身。
             "flex_grow" => {
-                if let Some(v) = parse_length(value) {
+                if let Some(v) = length_of(value) {
                     style.flex_grow = v;
                 }
             }
 
             "flex_direction" | "flex-direction" => {
-                style.flex_direction =
-                    if value == "column" {
-                        FlexDirection::Column
-                    } else {
-                        FlexDirection::Row
-                    };
+                if let Some(direction) = direction_of(value) {
+                    style.flex_direction = direction;
+                }
             }
 
             // 数字、百分比都解析不出来的（"" / "abc" / "50vw"）当没写过，不猜。
@@ -3120,90 +3425,144 @@ impl WriteMutations for QtRenderer {
         value: &AttributeValue,
         id: ElementId,
     ) {
-        // 动态属性走这里。
-        //
-        // 例如组件传下来的 text：
+        // 动态属性走这里。例如组件传下来的 text：
         //
         //     模板里是 @dynamic#0
         //
         //     Dioxus:
         //
-        //     SetAttribute {
-        //         id: 1,
-        //         text: "Hello ..."
-        //     }
+        //     SetAttribute { id: 1, value: Text("Hello ...") }
         //
         // id 就是 load_template 里那个元素的 ElementId。
-
-        // 这一版只处理字符串值。
         //
-        // Int / Float / Bool 也会从 Dioxus 过来，
-        // 但那要在 C++ 侧包成对应类型的 QVariant 才有意义，
-        // 例如 color（QColor）。
-        let AttributeValue::Text(text) = value
-        else {
-            println!(
-                "[renderer] 暂不支持非字符串属性 \
-                 {name}={value:?}"
-            );
-
-            return;
-        };
-
-
-        // 布局属性在这里只记账，不写给 Qt：
-        // width / height 之类的最终归宿是 taffy 的输入，
-        // 再由 relayout() 通过 set_geometry 推回去。
-        // 让 set_property 也写一遍就会出现两个作者。
-        if is_layout_prop(name) {
-            match self.lookup(id) {
-                Some(node) => self.record_style(
-                    node, name, text,
-                ),
-
-                None => println!(
-                    "[renderer] SetAttribute id={} \
-                     找不到节点，布局属性被丢弃",
+        // 值的四种形态（Text / Int / Float / Bool）先收成 PropValue，
+        // 再按「是不是布局属性」分两条路走。两条路的分别只有一处：
+        // 布局属性只记账（最终归宿是 taffy 的输入，由 relayout()
+        // 通过 set_geometry 推回去；让 set_property 也写一遍就会出现两个作者），
+        // Qt 属性直接落到对象上。
+        //
+        // **清空（AttributeValue::None）在两条路上都是一等公民**，
+        // 只是清的东西不一样：
+        //     布局属性 → 账本里那一条摘掉，于是它回到 auto
+        //     Qt 属性   → 对象上那个属性回到「刚建出来时的值」（C++ 那份抄存）
+        match classify_attr(value) {
+            AttrInput::Refused(reason) => {
+                println!(
+                    "[renderer] 属性 {name} 被拒绝：{reason} \
+                     （id={}，值={value:?}）",
                     id.0
-                ),
+                );
             }
 
-            return;
-        }
+            AttrInput::Clear if is_layout_prop(name) => {
+                match self.lookup(id) {
+                    Some(node) => {
+                        let removed = self.forget_style(node, name);
 
+                        println!(
+                            "[Dioxus] SetAttribute(None) id={node} \
+                             布局属性 {name} —— {}",
+                            if removed {
+                                "账本里那条已摘掉，尺寸回到 auto"
+                            } else {
+                                "本来就没写过，没什么可摘"
+                            }
+                        );
+                    }
 
-        let Some(object) =
-            self.object_of(id)
-        else {
-            println!(
-                "[renderer] SetAttribute \
-                 id={} 还没有映射到 Qt 对象",
-                id.0
-            );
+                    None => println!(
+                        "[renderer] SetAttribute(None) id={} \
+                         找不到节点，布局属性 {name} 的清空被丢弃",
+                        id.0
+                    ),
+                }
+            }
 
-            return;
-        };
+            AttrInput::Clear => {
+                match self.object_of(id) {
+                    Some(object) => {
+                        println!(
+                            "[Dioxus] SetAttribute(None) id={} {name} \
+                             → 请 Qt 写回刚建出来时的值",
+                            id.0
+                        );
 
+                        // SAFETY: object 是 object_of 查出来的、
+                        // 某个还活在树上的节点的指针。
+                        unsafe {
+                            self.host
+                                .pin_mut()
+                                .clear_property(
+                                    object,
+                                    name,
+                                );
+                        }
+                    }
 
-        println!(
-            "[Dioxus] SetAttribute \
-             id={} {name}={text:?}",
-            id.0
-        );
+                    None => println!(
+                        "[renderer] SetAttribute(None) id={} \
+                         还没有映射到 Qt 对象，{name} 的清空被丢弃",
+                        id.0
+                    ),
+                }
+            }
 
-        
-        let value = cxx_qt_lib::QString::from(text);
-        let value = cxx_qt_lib::QVariant::from(&value);
+            AttrInput::Write(prop) if is_layout_prop(name) => {
+                match self.lookup(id) {
+                    Some(node) => {
+                        println!(
+                            "[Dioxus] SetAttribute 布局 id={node} \
+                             {name}={prop:?}"
+                        );
 
-        // SAFETY: object 是 object_of 查出来的、某个还活在树上的节点的指针。
-        unsafe {
-            self.host
-                .pin_mut()
-                .set_property(
-                    object,
-                    name,
-                    &value,
+                        self.record_style(
+                            node,
+                            name,
+                            prop,
+                        );
+                    }
+
+                    None => println!(
+                        "[renderer] SetAttribute id={} \
+                         找不到节点，布局属性被丢弃",
+                        id.0
+                    ),
+                }
+            }
+
+            AttrInput::Write(prop) => {
+                let Some(object) =
+                    self.object_of(id)
+                else {
+                    println!(
+                        "[renderer] SetAttribute \
+                         id={} 还没有映射到 Qt 对象",
+                        id.0
+                    );
+
+                    return;
+                };
+
+                println!(
+                    "[Dioxus] SetAttribute \
+                     id={} {name}={prop:?}",
+                    id.0
                 );
+
+                let variant = variant_of(&prop);
+
+                // SAFETY: object 是 object_of 查出来的、
+                // 某个还活在树上的节点的指针。
+                unsafe {
+                    self.host
+                        .pin_mut()
+                        .set_property(
+                            object,
+                            name,
+                            &variant,
+                        );
+                }
+            }
         }
     }
 
@@ -4938,12 +5297,14 @@ mod tests {
 
     #[test]
     fn style_for_reads_every_supported_prop() {
+        // 每种值形态都在这里有至少一次出场：宽度是百分比字符串、
+        // 高度是 Int、gap 是 Float —— 布局不该在乎它们从哪个变体来。
         let props = vec![
-            ("width", "100%".to_string()),
-            ("height", "180".to_string()),
-            ("flex_direction", "column".to_string()),
-            ("gap", "12".to_string()),
-            ("flex_grow", "1".to_string()),
+            ("width", PropValue::Text("100%".to_string())),
+            ("height", PropValue::Int(180)),
+            ("flex_direction", PropValue::Text("column".to_string())),
+            ("gap", PropValue::Float(12.0)),
+            ("flex_grow", PropValue::Int(1)),
         ];
 
         let style = style_for(&props);
@@ -4957,14 +5318,168 @@ mod tests {
 
 
     #[test]
+    fn typed_numbers_are_lengths_never_percentages() {
+        // `width: 100`（Int）= 100 个像素。
+        // 这条断言钉的是「别顺手给数字也加百分比语义」：
+        // 写成 percent(100.0) 或者 percent(1.0) 都会在这里红。
+        assert_eq!(
+            dimension_of(&PropValue::Int(100)),
+            Some(Dimension::length(100.0))
+        );
+        assert_eq!(
+            dimension_of(&PropValue::Float(12.5)),
+            Some(Dimension::length(12.5))
+        );
+
+        // 百分比只有字符串写得出来。
+        assert_eq!(
+            dimension_of(&PropValue::Text("100%".to_string())),
+            Some(Dimension::percent(1.0))
+        );
+
+        // 布尔不是长度也不是方向。
+        assert_eq!(length_of(&PropValue::Bool(true)), None);
+        assert_eq!(dimension_of(&PropValue::Bool(false)), None);
+        assert_eq!(direction_of(&PropValue::Bool(true)), None);
+    }
+
+
+    #[test]
+    fn direction_only_accepts_the_two_spellings() {
+        assert_eq!(
+            direction_of(&PropValue::Text("row".to_string())),
+            Some(FlexDirection::Row)
+        );
+        assert_eq!(
+            direction_of(&PropValue::Text("column".to_string())),
+            Some(FlexDirection::Column)
+        );
+
+        // 看不懂的就当没写过：不能把「不是 column」直接当成 row。
+        assert_eq!(
+            direction_of(&PropValue::Text("colum".to_string())),
+            None
+        );
+        assert_eq!(
+            direction_of(&PropValue::Text("".to_string())),
+            None
+        );
+    }
+
+
+    #[test]
+    fn classify_attr_covers_every_variant() {
+        // AttributeValue 一共七个变体（nodes.rs:749-770），
+        // 四个能表达、一个是「撤掉」、两个必须出声拒绝。
+        assert_eq!(
+            classify_attr(&AttributeValue::Text(
+                "hi".to_string()
+            )),
+            AttrInput::Write(PropValue::Text("hi".to_string()))
+        );
+        assert_eq!(
+            classify_attr(&AttributeValue::Int(-7)),
+            AttrInput::Write(PropValue::Int(-7))
+        );
+        assert_eq!(
+            classify_attr(&AttributeValue::Float(0.5)),
+            AttrInput::Write(PropValue::Float(0.5))
+        );
+        assert_eq!(
+            classify_attr(&AttributeValue::Bool(true)),
+            AttrInput::Write(PropValue::Bool(true))
+        );
+        assert_eq!(
+            classify_attr(&AttributeValue::None),
+            AttrInput::Clear
+        );
+
+        // 反向：Any 翻译不出来 —— 这条必须拒绝，不能凭空造一个 Qt 值。
+        assert!(matches!(
+            classify_attr(&AttributeValue::any_value(42_i32)),
+            AttrInput::Refused(_)
+        ));
+
+        // Listener 那支在这里没法构造：`AttributeValue::listener` 要拿当前
+        // scope 的 owner（ListenerCallback::new → runtime.rs:222 那句 unwrap），
+        // 而进 scope 的 push_scope 是私有的（runtime.rs:271）。
+        // 反过来这也说明它到不了 set_attribute ——
+        // write_attribute 早在 diff/node.rs:525-538 就把它换成
+        // CreateEventListener 了，classify_attr 里那一支纯属门口拦一手。
+    }
+
+
+    #[test]
+    fn prop_ledger_keeps_one_entry_per_name() {
+        let mut entries: Vec<(&'static str, PropValue)> = Vec::new();
+
+        set_prop_entry(
+            &mut entries,
+            "width",
+            PropValue::Int(110),
+        );
+        set_prop_entry(
+            &mut entries,
+            "width",
+            PropValue::Text("100%".to_string()),
+        );
+        set_prop_entry(
+            &mut entries,
+            "gap",
+            PropValue::Int(12),
+        );
+
+        // 一名一条：第二次是覆盖，不是往尾巴上追加。
+        assert_eq!(entries.len(), 2);
+        assert_eq!(style_for(&entries).size.width, Dimension::percent(1.0));
+    }
+
+
+    #[test]
+    fn clearing_a_layout_prop_returns_it_to_auto() {
+        // 这就是 AttributeValue::None 在布局那一侧的落点。
+        // 关键是「回到 auto」而不是「回到 0」：
+        // 0 会在屏幕上留下一个看不见又占位的东西。
+        let mut entries: Vec<(&'static str, PropValue)> = Vec::new();
+
+        set_prop_entry(
+            &mut entries,
+            "width",
+            PropValue::Int(300),
+        );
+        set_prop_entry(
+            &mut entries,
+            "height",
+            PropValue::Int(28),
+        );
+
+        assert_eq!(
+            style_for(&entries).size.width,
+            Dimension::length(300.0)
+        );
+
+        assert!(clear_prop_entry(&mut entries, "width"));
+        assert!(!clear_prop_entry(&mut entries, "width"));
+
+        let style = style_for(&entries);
+
+        assert_eq!(style.size.width, Dimension::auto());
+
+        // 反向：摘一个不能顺带把别的也弄没。
+        assert_eq!(style.size.height, Dimension::length(28.0));
+        assert_eq!(entries.len(), 1);
+    }
+
+
+    #[test]
     fn style_for_treats_unparsable_value_as_absent() {
         // 每个支持的属性都配一条反向断言：解析不出来时必须「当没写过」，
         // 而不是写进 0 / 0% / 默认方向。
         let props = vec![
-            ("width", "12px".to_string()),
-            ("height", "abc".to_string()),
-            ("gap", "12px".to_string()),
-            ("flex_grow", "auto".to_string()),
+            ("width", PropValue::Text("12px".to_string())),
+            ("height", PropValue::Text("abc".to_string())),
+            ("gap", PropValue::Text("12px".to_string())),
+            ("flex_grow", PropValue::Text("auto".to_string())),
         ];
 
         let style = style_for(&props);
@@ -4974,12 +5489,145 @@ mod tests {
         assert_eq!(style.gap.width, length(0.0));
         assert_eq!(style.flex_grow, 0.0);
 
+        // 字符串空值也一样："" 不是 0。
+        let empty =
+            vec![("width", PropValue::Text(String::new()))];
+        assert_eq!(
+            style_for(&empty).size.width,
+            Dimension::auto()
+        );
+
         // 方向也一样：认不出的值不该把默认的 row 翻成 column。
         let only_direction =
-            vec![("flex_direction", "colum".to_string())];
+            vec![("flex_direction", PropValue::Text("colum".to_string()))];
         assert_eq!(
             style_for(&only_direction).flex_direction,
             FlexDirection::Row
+        );
+    }
+
+
+    #[test]
+    fn numeric_literals_arrive_as_typed_attributes() {
+        // rsx 里不带引号的 110 / 48 / 12，交过来是 AttributeValue::Int；
+        // 0.45 是 Float，`shown % 2 == 1` 是 Bool。
+        // 这一条断言的就是「四种形态真的到得了 renderer」——
+        // 前一版它们全被 `let AttributeValue::Text` 那一步吞了。
+        let mut vdom = VirtualDom::new(app);
+
+        let mut out = Mutations::default();
+
+        vdom.rebuild(&mut out);
+
+        let writes = attr_writes(&out.edits);
+
+        for expect in [
+            ("width", "Int(110)"),
+            ("height", "Int(48)"),
+            ("radius", "Int(12)"),
+            ("opacity", "Float(0.45)"),
+            ("visible", "Bool(false)"),
+        ] {
+            assert!(
+                writes.contains(
+                    &(expect.0.to_string(), expect.1.to_string())
+                ),
+                "少了这一条 {:?}，实际写出的属性 = {writes:?}",
+                expect
+            );
+        }
+
+        // 反向：Int 110 不能顺带被当成「110%」。
+        assert!(
+            !writes.iter().any(
+                |(_, value)| value.contains('%')
+            ),
+            "属性值里不该出现百分比，实际 = {writes:?}"
+        );
+    }
+
+
+    #[test]
+    fn clearing_an_attribute_reaches_the_renderer() {
+        // 减一那块的颜色写成 Option：奇数次是 Some(...)，偶数次是 None。
+        // 所以「点一下让它没了」在指令流里必须是一条能指认的
+        // SetAttribute(color, AttributeValue::None) ——
+        // 这就是 C++ 那边 clear_property 的唯一触发源。
+        let mut vdom = VirtualDom::new(app);
+
+        let mut out = Mutations::default();
+
+        vdom.rebuild(&mut out);
+
+        let buttons = click_listeners(&out.edits);
+
+        assert_eq!(
+            buttons.len(),
+            3,
+            "第一屏只有三个按钮的监听器（条目要点了才长出来）"
+        );
+
+        // 0 是偶数：首屏就该已经有一条 None（我们从来没写过它，
+        // 这一条在 renderer 里落成「没什么可摘」）。
+        assert!(
+            attr_writes(&out.edits)
+                .contains(&("color".to_string(), "None".to_string())),
+            "count = 0 时 color 应该整个不存在"
+        );
+
+        // 加到 1（奇数）→ color 有了、opacity 回到 1.0、指示条显形。
+        send_click(&vdom, buttons[1]);
+
+        let at_one = render(&mut vdom);
+        let writes = attr_writes(&at_one);
+
+        assert!(
+            writes.contains(
+                &("color".to_string(), "Text(\"#d9825f\")".to_string())
+            ),
+            "点到 1 该把颜色写回来，实际 = {writes:?}"
+        );
+        assert!(
+            writes.contains(
+                &("opacity".to_string(), "Float(1.0)".to_string())
+            ),
+            "点到 1 那块该不透明了，实际 = {writes:?}"
+        );
+        assert!(
+            writes.contains(
+                &("visible".to_string(), "Bool(true)".to_string())
+            ),
+            "奇数次指示条该显形，实际 = {writes:?}"
+        );
+
+        // 减回 0（偶数）→ 这三条各自被**撤掉 / 改回去**。
+        send_click(&vdom, buttons[0]);
+
+        let back_to_zero = render(&mut vdom);
+        let writes = attr_writes(&back_to_zero);
+
+        assert!(
+            writes.contains(
+                &("color".to_string(), "None".to_string())
+            ),
+            "回到 0，color 这一条要被撤掉，实际 = {writes:?}"
+        );
+        assert!(
+            writes.contains(
+                &("opacity".to_string(), "Float(0.45)".to_string())
+            ),
+            "回到 0，opacity 要改回 0.45，实际 = {writes:?}"
+        );
+
+        // 反向：撤属性是 SetAttribute(value=None)，不是别的什么指令。
+        // dioxus 没有 RemoveAttribute 这一支（remove_attribute 也是
+        // 走 set_attribute，diff/node.rs:500-512），
+        // 所以「值变成 None」就是唯一的信号。
+        assert!(
+            !kinds(&back_to_zero)
+                .iter()
+                .any(|kind| kind.contains("RemoveAttribute")),
+            "要是哪天出现专门的撤属性指令，这条会红"
         );
     }
 
@@ -5091,6 +5739,58 @@ mod tests {
                     _ => None,
                 },
                 Mutation::SetText { value, .. } => Some(value.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+
+    /// 值的形态，打成一小段文字。
+    ///
+    /// 为什么要这个而不是直接用 `{:?}`：断言里要写的是
+    /// 「color 这一条变成了 None」，Debug 的整段输出会把测试改成
+    /// 一改就红的字符串。
+    fn describe_value(
+        value: &AttributeValue,
+    ) -> String {
+        match value {
+            AttributeValue::Text(text) => {
+                format!("Text({text:?})")
+            }
+            AttributeValue::Int(v) => {
+                format!("Int({v})")
+            }
+            AttributeValue::Float(v) => {
+                format!("Float({v:?})")
+            }
+            AttributeValue::Bool(v) => {
+                format!("Bool({v})")
+            }
+            AttributeValue::None => "None".to_string(),
+            AttributeValue::Listener(_) => {
+                "Listener".to_string()
+            }
+            AttributeValue::Any(_) => "Any".to_string(),
+        }
+    }
+
+
+    /// 这一轮写出去的所有属性：(名字, 值的形态)。
+    ///
+    /// 有了这个，「撤掉一个属性」在指令流里就是可指认的一条
+    /// `("color", "None")`，而不是「SetAttribute 好像多了一条」。
+    fn attr_writes(
+        edits: &[Mutation],
+    ) -> Vec<(String, String)> {
+        edits
+            .iter()
+            .filter_map(|edit| match edit {
+                Mutation::SetAttribute {
+                    name, value, ..
+                } => Some((
+                    name.to_string(),
+                    describe_value(value),
+                )),
                 _ => None,
             })
             .collect()
@@ -5378,14 +6078,21 @@ mod tests {
             texts(&back_to_two)
         );
 
-        // 实测 3→2 的指令流（ kinds ）：
-        //     SetAttribute, CreatePlaceholder, ReplaceWith,
-        //     SetAttribute, SetAttribute, Remove
+        // 实测 3→2 的指令流（kinds）：
+        //     SetAttribute ×3, CreatePlaceholder, ReplaceWith,
+        //     SetAttribute ×2, Remove
         // 前面那条 CreatePlaceholder+ReplaceWith 是提示那一格**换回占位节点**，
         // 最后那条 Remove 是行数从 3 缩到 2 —— 两件事走的是两支。
+        //
+        // 五条 SetAttribute 各是谁（下面按名字逐条钉住，光数条数说明不了什么）：
+        //     color → None（3 是奇数、2 是偶数：这个属性被**撤掉**）
+        //     visible → Bool(false)（指示条跟着奇偶关掉）
+        //     text → "counter = 2"，再加两行条目的 text
         assert_eq!(
             kinds(&back_to_two),
             vec![
+                "SetAttribute",
+                "SetAttribute",
                 "SetAttribute",
                 "CreatePlaceholder",
                 "ReplaceWith",
@@ -5393,6 +6100,29 @@ mod tests {
                 "SetAttribute",
                 "Remove",
             ]
+        );
+
+        let writes = attr_writes(&back_to_two);
+
+        assert!(
+            writes.contains(
+                &("color".to_string(), "None".to_string())
+            ),
+            "3→2 该有一条 color 被撤，实际 = {writes:?}"
+        );
+        assert!(
+            writes.contains(
+                &("visible".to_string(), "Bool(false)".to_string())
+            ),
+            "3→2 该关掉指示条，实际 = {writes:?}"
+        );
+
+        // 反向：opacity 在 1→2→3 全程都是 1.0，没变过就不该重发
+        // （diff/node.rs:449-463 那条 value_changed 判据）。
+        // 哪天它变成每次重发，这条会红 —— 那也意味着我们在重写没动的属性。
+        assert!(
+            !writes.iter().any(|(name, _)| name == "opacity"),
+            "opacity 没变，不该出现在这一轮里，实际 = {writes:?}"
         );
     }
 
@@ -5459,15 +6189,21 @@ mod tests {
         );
 
         // 实测 5→0 的指令流（kinds，跑出来的原样）：
-        //     SetAttribute, CreatePlaceholder, ReplaceWith,
+        //     SetAttribute ×4, CreatePlaceholder, ReplaceWith,
         //     CreatePlaceholder, Remove, Remove, Remove, ReplaceWith
         // 四行条目 + 提示那一格一起消失。两个格各自**换回占位节点**
         // （两个 CreatePlaceholder + 两个 ReplaceWith），
         // 行数从 4 缩到 0 时前面三条走 Remove、最后一条被新建的占位换掉。
         // 直觉里的「五条 Remove」是不存在的 —— 收缩到空那一支不发明 Remove。
+        //
+        // 那四条 SetAttribute 是：color 被撤（None）、opacity 回到 0.45、
+        // visible 关掉、标题写成 counter = 0。
         assert_eq!(
             kinds(&wiped),
             vec![
+                "SetAttribute",
+                "SetAttribute",
+                "SetAttribute",
                 "SetAttribute",
                 "CreatePlaceholder",
                 "ReplaceWith",
@@ -5478,5 +6214,23 @@ mod tests {
                 "ReplaceWith",
             ]
         );
+
+        let writes = attr_writes(&wiped);
+
+        for expect in [
+            ("color", "None"),
+            ("opacity", "Float(0.45)"),
+            ("visible", "Bool(false)"),
+            ("text", "Text(\"counter = 0\")"),
+        ] {
+            assert!(
+                writes.contains(
+                    &(expect.0.to_string(), expect.1.to_string())
+                ),
+                "归零这一轮少了 ({0}, {1})，实际 = {writes:?}",
+                expect.0,
+                expect.1
+            );
+        }
     }
 }

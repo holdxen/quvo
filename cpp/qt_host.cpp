@@ -1294,6 +1294,27 @@ double QtHost::window_height() const
 }
 
 
+namespace {
+
+// 抄存用的动态属性名：__dq_saved_<属性名>。
+//
+// 为什么存在 QObject 的动态属性里，而不是 QtHost 的一张 map 里：
+// 对象销毁的时候动态属性跟着一起走。我们这套里 destroy() 只被子树根调用一次，
+// 孩子是随 ~QObject 递归死的（见 QtHost::destroy），
+// 换成 map 就必须也在那个递归里逐个摘除 —— 漏一个就是悬空指针。
+QByteArray
+saved_key_of(
+    rust::Str name
+)
+{
+    return (
+        QStringLiteral("__dq_saved_") + to_qstring(name)
+    ).toUtf8();
+}
+
+}
+
+
 void
 QtHost::set_property(
     QQuickItem *item,
@@ -1301,17 +1322,31 @@ QtHost::set_property(
     const QVariant &value
 )
 {
-    const QByteArray property =
-        to_qstring(name).toUtf8();
+    const QString property = to_qstring(name);
+    const QByteArray propertyUtf8 = property.toUtf8();
+
+
+    // 第一次写之前先抄一份现值 —— 那份就是「没写过它时对象是什么样」，
+    // clear_property 靠它把属性还原回去。
+    //
+    // 判「抄过没有」用 isValid()：我们写的这些属性都是真 Q_PROPERTY，
+    // property() 读出来一定是个带类型的有效值（bool 的 false、QString 的 ""、
+    // QColor 的白），所以无效 QVariant 就等于「还没有抄本」。
+    const QByteArray savedKey = saved_key_of(name);
+
+    if (!item->property(savedKey.constData()).isValid()) {
+        item->setProperty(
+            savedKey.constData(),
+            item->property(propertyUtf8.constData())
+        );
+    }
 
 
     // setProperty 返回 false 说明这个 Qt 对象上没有这个属性，
     // 或者值没法转换成属性需要的类型。
-    // 例如 color 是 QColor、font.pixelSize 是嵌套属性，
-    // 都不是 QString 能直接写进去的。
     if (
         !item->setProperty(
-            property.constData(),
+            propertyUtf8.constData(),
             value
         )
     ) {
@@ -1321,6 +1356,49 @@ QtHost::set_property(
             << "="
             << value;
     }
+}
+
+
+void
+QtHost::clear_property(
+    QQuickItem *item,
+    rust::Str name
+)
+{
+    const QString property = to_qstring(name);
+    const QByteArray propertyUtf8 = property.toUtf8();
+    const QByteArray savedKey = saved_key_of(name);
+
+    const QVariant saved = item->property(savedKey.constData());
+
+    if (!saved.isValid()) {
+        // 没抄本 = 这个名字我们从来没写过，对象本来就没被我们动过。
+        // 如实说一句，不谎称「已还原」。
+        qDebug()
+            << "[Qt] clear" << property
+            << "：没有抄存过（这个属性我们从来没写过），无事可做";
+        return;
+    }
+
+    item->setProperty(
+        propertyUtf8.constData(),
+        saved
+    );
+
+    // 撤掉抄本：给动态属性写一个无效 QVariant，Qt 的行为是**删掉这条动态属性**。
+    // 于是下一次写同一个名字会重新抄一遍（那时现值就是刚还原出来的那个）。
+    item->setProperty(
+        savedKey.constData(),
+        QVariant()
+    );
+
+    // 把「对象现在自己报什么」也读回来打一遍：
+    // 这一列才是证据，前面那个是「我打算写什么」。
+    qDebug()
+        << "[Qt] clear" << property
+        << "→ 写回刚建出来时的" << saved
+        << "，对象现在报"
+        << item->property(propertyUtf8.constData());
 }
 
 namespace {

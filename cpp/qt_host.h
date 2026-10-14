@@ -144,12 +144,38 @@ public:
     );
 
     // 把 Dioxus 侧送来的属性写到 Qt 对象上。
-    // 目前就是 QObject::setProperty(name, value)，
+    // 就是 QObject::setProperty(name, value)，
     // 属性名与 Qt 属性名同名（Dioxus 的 text -> QtQuick.Text::text）。
+    //
+    // value 是带类型的 QVariant（QString / qlonglong / double / bool），
+    // 类型在 Rust 侧按 AttributeValue 的变体包好（variant_of）。
+    //
+    // 第一次写某个名字之前，会把该名字此刻的值抄存成这个对象的一条
+    // **动态属性**（键名 __dq_saved_<name>），给 clear_property 用。
+    // 动态属性跟着 QObject 一起死，所以不需要另建一张 id -> 值 的表，
+    // 也不会被 destroy 只删子树根那件事漏掉。
     void set_property(
         QQuickItem *item,
         rust::Str name,
         const QVariant &value
+    );
+
+    // 「这个属性被撤掉了」——AttributeValue::None 的落点。
+    //
+    // 语义：回到该对象刚建出来时的值，也就是 set_property 抄存下来的那一份。
+    // 这就是 Web 那边「属性没了」的意思：不是变成 0，也不是变成空串，
+    // 是回到没写过它时的那个状态。
+    //
+    // 为什么不能用现成的 QObject::resetProperty：它要求属性在 Q_PROPERTY 里
+    // 声明 RESET，而我们用的那几个全都没有声明
+    // （Rectangle::color qquickrectangle_p.h:133、Text::text qquicktext_p.h:33、
+    //  Item::visible/opacity qquickitem.h:79-81），对它们 resetProperty
+    // 只会 qWarning 然后返回 false。
+    //
+    // 没抄存过（这个名字我们从来没写过）就是无事发生，日志会说明是这种。
+    void clear_property(
+        QQuickItem *item,
+        rust::Str name
     );
 
     // 量一个 item 需要多大 —— 文本的**唯一来源就是这个 item**，

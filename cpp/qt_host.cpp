@@ -834,6 +834,52 @@ void refresh_item_capabilities(
 }
 
 
+// 窗口尺寸一变，就叫 Rust 重算一次布局。
+//
+// 为什么是 event filter 而不是 connect 一个信号：QWindow 没有
+// widthChanged 这种信号，尺寸变化是以 QEvent::Resize 的形式进来的。
+// Qt 自己的东西会跟着变（contentItem 会自动重设大小），
+// 但我们这套几何的唯一作者是 relayout() —— 没人重算，屏幕上就一直是旧数字。
+class ResizeFilter : public QObject
+{
+public:
+    explicit ResizeFilter(QQuickWindow *window)
+        : QObject(window)
+        , m_window(window)
+    {
+    }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        // 装在 window 上，只看它的 Resize，不需要分辨 watched。
+        Q_UNUSED(watched)
+
+        if (event->type() != QEvent::Resize) {
+            return false;
+        }
+
+        qDebug()
+            << "[Qt] window resized to"
+            << m_window->width() << "x" << m_window->height()
+            << "-> 请 Rust 重算布局";
+
+        // 交的是窗口自己的大小（设备无关像素），和 relayout 里
+        // window_width()/window_height() 读的是同一对数 —— 
+        // 这个参数只是让 Rust 那边日志里能说清是哪种变化引起的。
+        qt_window_resized(
+            m_window->width(),
+            m_window->height()
+        );
+
+        return false;
+    }
+
+private:
+    QQuickWindow* m_window;
+};
+
+
 struct QtHost::Impl {
     // 登记簿必须**最先声明**：声明越靠后析构越早，
     // 而 filter 死的时候（随 item 递归删、或被 remove 显式删）要回来把自己摘掉，
@@ -875,6 +921,11 @@ QtHost::QtHost()
         QColor(
             QStringLiteral("#f6f1e8")
         )
+    );
+
+    // 尺寸变化的触发点。parent 给 window，窗口死时它跟着死。
+    impl_->window.installEventFilter(
+        new ResizeFilter(&impl_->window)
     );
 }
 

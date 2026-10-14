@@ -58,7 +58,8 @@
 //!
 //! 1. `app()` —— counter demo 那一屏，加三个按钮
 //! 2. `mod ffi` —— Rust ↔ C++ 的双向接口：20 个正向（1 个造 QtHost + 19 个方法）
-//!    + 1 个 C++ 自由函数 + 9 个 C++ 回调 Rust（1 个回路 poll + 8 支事件）
+//!    + 1 个 C++ 自由函数 + 10 个 C++ 回调 Rust（1 个回路 poll + 1 个窗口尺寸
+//!    + 8 支事件）
 //! 3. `struct QtRenderer` 的字段注释 —— 树账（nodes/stack）、
 //!    id 账（element_to_node/instance_paths）、布局账（tree/root_taffy）各记什么
 //! 4. `impl WriteMutations` —— 指令如何变成 Qt 调用（核心）
@@ -105,10 +106,14 @@
 //! - keydown 那三支要 item 能拿 active focus（注册时把 focusPolicy
 //!   开成 ClickFocus），但按键的 left/right 位置 Qt 给不出，一律报 Standard；
 //!   `is_composing` 要 QInputMethod 才有，报 false。
-//! - 窗口 resize 没有触发重排（元素自己的尺寸变化有 resize，
-//!   窗口变了却没人重算布局，这是队列里的第一条）；字体还是 Qt 自己的默认值，
-//!   没和 `measure_item` 用同一个来源（现在两边都是「item 上那个默认字体」，
-//!   所以量出来刚好对得上；一旦 font 变成 Rust 下发的样式，两处要一起改）；
+//! - 窗口尺寸变化会重排：`QEvent::Resize` → `ResizeFilter` → `qt_window_resized`
+//!   → `relayout`，这条链不经过 Dioxus（视口是布局的输入，不是应用状态）。
+//!   配套的是尺寸属性现在认百分比（`"100%"`）和 `flex_grow`，
+//!   `app()` 的根节点写死 100%、中间那块按钮 `flex_grow: "1"`，
+//!   所以拖动窗口是屏幕上看得见的伸缩。
+//! - 字体还是 Qt 自己的默认值，没和 `measure_item` 用同一个来源
+//!   （现在两边都是「item 上那个默认字体」，所以量出来刚好对得上；
+//!   一旦 font 变成 Rust 下发的样式，两处要一起改）；
 //!   `AttributeValue::{Int, Float, Bool, None}` 在属性过滤那步被丢掉。
 //! - 因为事件源只剩鼠标/键盘这些真输入，offscreen 跑起来之后日志里
 //!   不会再有渲染 —— 回路醒着但没人叫醒它。click→handle_event→渲染那一段
@@ -480,6 +485,12 @@ mod ffi {
         // 回路本身：poll 一次 wait_for_work，醒了才渲染。
         fn qt_pump_poll();
 
+        // 窗口尺寸变了：几何的唯一作者是 relayout，所以重算也要有人在这里喊。
+        fn qt_window_resized(
+            width: f64,
+            height: f64,
+        );
+
         // 八支事件回调，一支一类负载（对应 dioxus-html 的 MouseData/
         // PointerData/WheelData/KeyboardData/FocusData/TouchData/ResizeData）。
         //
@@ -709,9 +720,14 @@ fn app() -> Element {
         // 没有 main.qml，也没有 QML 的 Layout / anchors ——
         // 这里的 width / height / gap / flex_direction 是布局输入，
         // 唯一作者还是 relayout()。
+        //
+        // 根节点用 100%：它跟着窗口伸缩，下面的东西才谈得上伸缩。
+        // 视口那两个数不在这里写死，是 relayout 问 Qt 的
+        // （window_width/window_height），拖动窗口 → ResizeFilter →
+        // qt_window_resized → 重算，一整条链都不经过 Dioxus。
         qt-column {
-            width: "600",
-            height: "320",
+            width: "100%",
+            height: "100%",
             flex_direction: "column",
             gap: "12",
 
@@ -738,7 +754,7 @@ fn app() -> Element {
             // rsx 里写的是 onclick，送到我们手里已经是 "click"
             // （:533 把 "on" 前缀剥掉了）。
             qt-column {
-                width: "380",
+                width: "100%",
                 height: "48",
                 flex_direction: "row",
                 gap: "12",
@@ -756,16 +772,19 @@ fn app() -> Element {
                     }
                 }
 
+                // 中间这块 flex_grow=1：拖动窗口时多出来的宽度都归它，
+                // 于是「伸缩」是屏幕上看得见的，不是只在日志里的数字。
                 qt-rectangle {
                     width: "110",
                     height: "48",
+                    flex_grow: "1",
                     color: "#5f9ed9",
                     onclick: move |_| {
                         count += 1;
                     },
 
                     qt-text {
-                        text: "加一",
+                        text: "加一（跟着窗口变宽）",
                     }
                 }
 
@@ -1555,14 +1574,46 @@ impl QtRenderer {
 
         // 2. 视口问 Qt 要，不在 Rust 里再写一个 640x220。
         //    taffy 用 f32，bridge 用 f64，边界处换算一次。
+        let viewport_px = Size {
+            width: self.host.window_width() as f32,
+            height: self.host.window_height() as f32,
+        };
+
         let viewport = Size {
             width: AvailableSpace::Definite(
-                self.host.window_width() as f32,
+                viewport_px.width,
             ),
             height: AvailableSpace::Definite(
-                self.host.window_height() as f32,
+                viewport_px.height,
             ),
         };
+
+        // 布局根（0 号节点 = 窗口的 contentItem）的尺寸就是视口本身，
+        // 它不吃 rsx 里的属性 —— 这一步是「百分比的基准」：
+        // 下面每一层的 100% 都是相对包含块算的，根如果是 auto，
+        // 它就按内容收缩，整棵树跟着内容走而不是跟着窗口走。
+        // 第一版正是这样：根算出 354x75（三个按钮加间距的宽度），
+        // 于是拖动窗口什么也不会变。
+        //
+        // 每次 relayout 都重读一遍，所以 resize 那条链路改的就是这两个数。
+        let mut root_style =
+            style_for(&self.node(0).style.clone());
+
+        root_style.size = Size {
+            width: Dimension::length(
+                viewport_px.width,
+            ),
+            height: Dimension::length(
+                viewport_px.height,
+            ),
+        };
+
+        self.tree
+            .set_style(
+                self.root_taffy,
+                root_style,
+            )
+            .expect("taffy: 布局根样式写入失败");
 
 
         // 3. 算布局。
@@ -2317,14 +2368,17 @@ impl QtRenderer {
 // 检验办法（负向检查）：把 main() 里那句 relayout() 注释掉再跑，
 // 屏幕应该只剩背景色 —— 因为除了窗口本身，没有任何东西有尺寸。
 //
-// 还没接的两件事：
+// 还剩的一件：
 //   - 字体：两边现在都用 QGuiApplication::font()（C++ 那边是默认构造的
 //     QFont，QML 里那个 Text 没写 font）。所以「量的」和「画的」恰好是
 //     同一个字体，Δ 才是 0。一旦 font 变成 Rust 下发的样式属性，
 //     measure_layout 必须收同一个 QFont，不能各拿各的 ——
 //     改成从 item 量之后这条更要做，因为量的时候就该用那个 item 的字体。
-//   - 窗口 resize：视口尺寸只在 relayout 那一刻读一次，
-//     拖动窗口不会重算（连重算的触发点都还没接）。
+//
+// 窗口 resize 已经接了：C++ 的 ResizeFilter 收到 QEvent::Resize 就叫
+// qt_window_resized → relayout，视口的两个数每次都是当场问 Qt 的。
+// 配合根节点的 width/height: "100%" 和中间那块 flex_grow: "1"，
+// 拖动窗口时屏幕上能看见伸缩（不是只有日志里的数字变了）。
 
 // 这些属性名不写给 Qt，只进布局。
 // 名字同时接受下划线和短横两种写法：rsx! 里两种都能写。
@@ -2334,6 +2388,8 @@ const LAYOUT_PROPS: &[&str] = &[
     "gap",
     "flex_direction",
     "flex-direction",
+    "flex_grow",
+    "flex-grow",
 ];
 
 
@@ -2344,14 +2400,41 @@ fn is_layout_prop(
 }
 
 
-// 只接受纯数字。
+// 只接受纯数字，给 gap / flex_grow 这类「没有百分比语义」的值用。
 //
-// 故意不接受 "50%"：百分比需要知道父节点尺寸，
+// 故意不接受 "50%"：间距按百分比要走父节点的尺寸，grow 的份数更不是长度，
 // 现在支持它就会让人以为整条百分比链路都通了。
 fn parse_length(
     value: &str,
 ) -> Option<f32> {
     value.trim().parse::<f32>().ok()
+}
+
+
+// 尺寸属性（width / height）的两种写法：
+//     "110"    → 死的 110
+//     "100%"   → 跟着父节点 / 视口走，这是「拖动窗口能看到界面伸缩」的前提
+// 其它一律当没写过（不猜）。
+//
+// 百分比这里要除以 100：taffy 的 `Dimension::percent` 收的是 [0.0, 1.0]
+// 那个区间，不是 [0.0, 100.0]
+// （taffy-0.15.0/src/style/dimension.rs:396-402，注释里加粗写了 NOTE）。
+// 第一版没除，"100%" 直接变成 100 倍：日志里那一行
+// node 4  35400x48 就是父节点 354 被乘出来的。
+fn parse_size(
+    value: &str,
+) -> Option<Dimension> {
+    let text = value.trim();
+
+    if let Some(percent) = text.strip_suffix('%') {
+        return percent
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|v| Dimension::percent(v / 100.0));
+    }
+
+    parse_length(text).map(Dimension::length)
 }
 
 
@@ -2372,26 +2455,37 @@ fn style_for(
 
 
     for (name, value) in props {
-        match (*name, parse_length(value)) {
-            ("width", Some(v)) => {
-                style.size.width =
-                    Dimension::length(v);
+        match *name {
+            "width" => {
+                if let Some(v) = parse_size(value) {
+                    style.size.width = v;
+                }
             }
 
-            ("height", Some(v)) => {
-                style.size.height =
-                    Dimension::length(v);
+            "height" => {
+                if let Some(v) = parse_size(value) {
+                    style.size.height = v;
+                }
             }
 
-            ("gap", Some(v)) => {
-                style.gap = Size {
-                    width: length(v),
-                    height: length(v),
-                };
+            "gap" => {
+                if let Some(v) = parse_length(value) {
+                    style.gap = Size {
+                        width: length(v),
+                        height: length(v),
+                    };
+                }
             }
 
-            ("flex_direction", _)
-            | ("flex-direction", _) => {
+            // grow：把父节点在主轴上剩下来的空间按份数分掉。
+            // 这一支 + 「父节点用 100%」是界面上能跟着窗口伸缩的机制本身。
+            "flex_grow" => {
+                if let Some(v) = parse_length(value) {
+                    style.flex_grow = v;
+                }
+            }
+
+            "flex_direction" | "flex-direction" => {
                 style.flex_direction =
                     if value == "column" {
                         FlexDirection::Column
@@ -2400,8 +2494,7 @@ fn style_for(
                     };
             }
 
-            // 数字解析不出来的（比如 "" / "abc" / "50%"）
-            // 当没写过，不猜。
+            // 数字、百分比都解析不出来的（"" / "abc" / "50vw"）当没写过，不猜。
             _ => {}
         }
     }
@@ -3452,6 +3545,43 @@ fn qt_pump_poll() {
     // 派发会 wake，而 wake 的那条路要回来 poll 这个 slot，
     // 在 borrow 里派发就是当场 panic（RefCell already borrowed）。
     drain_pending_mounted();
+}
+
+
+/// 窗口尺寸变了 → 重算一次布局。
+///
+/// 这条链和事件那条链一样是「Qt 先动」，但它**不经过 Dioxus**：
+/// 视口大小是布局的输入，不是应用状态，vdom 里没有任何东西因此变脏，
+/// 所以不需要 render，只需要 relayout —— 几何的作者是我们自己。
+///
+/// 也是因为这个，「攒一个 layout_dirty 标记、等下一轮再算」那套设计现在没必要：
+/// 喊重算的只有两处（渲染批次结束、窗口 resize），两处都是当场就算，没有攒着的机会。
+fn qt_window_resized(
+    width: f64,
+    height: f64,
+) {
+    PUMP.with(|slot| {
+        let mut guard = slot.borrow_mut();
+
+        let Some(pump) = guard.as_mut() else {
+            // 第一次 show / 建树之前也会走到这里，那时候还没什么可算的。
+            println!(
+                "[layout] 窗口 {width:.0}x{height:.0}，回路还没装好，不重算"
+            );
+
+            return;
+        };
+
+        println!(
+            "[layout] 窗口 {width:.0}x{height:.0} → relayout"
+        );
+
+        pump.renderer.relayout();
+
+        // 顺手把树打一遍：这样离屏日志里能直接看到伸缩有没有真的发生
+        // （dump_tree 里那行 叠放顺序 同时还是个免费的自检）。
+        pump.renderer.dump_tree();
+    });
 }
 
 
@@ -4640,6 +4770,7 @@ fn main() {
     renderer.verify_text_measurement();
 
 
+
     // --------------------------------------------------------
     // 5. 回路装上，然后交给 Qt 的主循环
     // --------------------------------------------------------
@@ -4714,6 +4845,36 @@ mod tests {
         assert_eq!(parse_length(""), None);
         assert_eq!(parse_length("abc"), None);
         assert_eq!(parse_length("50%"), None);
+
+        // 带单位的写法一律不当数：本项目没有 px/em 的换算规则，
+        // 「12px」被当成 12 和当成没写，前者更难查。
+        assert_eq!(parse_length("12px"), None);
+    }
+
+
+    #[test]
+    fn parse_size_accepts_length_and_percent() {
+        assert_eq!(parse_size("460"), Some(Dimension::length(460.0)));
+        assert_eq!(parse_size(" 60 "), Some(Dimension::length(60.0)));
+
+        // 百分比是伸缩那条链的前提：根节点 100% 才跟着窗口走。
+        // 注意存进去的是 1.0 而不是 100.0 —— taffy 的 percent 收 [0.0, 1.0]
+        // （dimension.rs:398 那句 NOTE），写成 100.0 就是 100 倍父节点，
+        // 这条断言就是为了钉住这个坑。
+        assert_eq!(parse_size("100%"), Some(Dimension::percent(1.0)));
+        assert_eq!(parse_size(" 50 %"), Some(Dimension::percent(0.5)));
+        assert_eq!(parse_size("0%"), Some(Dimension::percent(0.0)));
+    }
+
+
+    #[test]
+    fn parse_size_rejects_anything_else() {
+        assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("abc"), None);
+        assert_eq!(parse_size("50vw"), None);
+
+        // 反向：% 后面没有数，不能当成 100%。
+        assert_eq!(parse_size("%"), None);
     }
 
 
@@ -4724,38 +4885,65 @@ mod tests {
         assert!(is_layout_prop("gap"));
         assert!(is_layout_prop("flex-direction"));
         assert!(is_layout_prop("flex_direction"));
+        assert!(is_layout_prop("flex-grow"));
+        assert!(is_layout_prop("flex_grow"));
 
         // 反向：这些必须照常写给 Qt，不然文字和颜色没人画
         assert!(!is_layout_prop("text"));
         assert!(!is_layout_prop("color"));
+
+        // 反向：短横写法认了，拼错的不能认（认了就会从 Qt 那边被吞掉，
+        // 又没人画它）
+        assert!(!is_layout_prop("flexdirection"));
+        assert!(!is_layout_prop("grow"));
     }
 
 
     #[test]
     fn style_for_reads_every_supported_prop() {
         let props = vec![
-            ("width", "600".to_string()),
+            ("width", "100%".to_string()),
             ("height", "180".to_string()),
             ("flex_direction", "column".to_string()),
             ("gap", "12".to_string()),
+            ("flex_grow", "1".to_string()),
         ];
 
         let style = style_for(&props);
 
-        assert_eq!(style.size.width, Dimension::length(600.0));
+        assert_eq!(style.size.width, Dimension::percent(1.0));
         assert_eq!(style.size.height, Dimension::length(180.0));
         assert_eq!(style.flex_direction, FlexDirection::Column);
         assert_eq!(style.gap.width, length(12.0));
+        assert_eq!(style.flex_grow, 1.0);
     }
 
 
     #[test]
     fn style_for_treats_unparsable_value_as_absent() {
-        let props = vec![("width", "50%".to_string())];
+        // 每个支持的属性都配一条反向断言：解析不出来时必须「当没写过」，
+        // 而不是写进 0 / 0% / 默认方向。
+        let props = vec![
+            ("width", "12px".to_string()),
+            ("height", "abc".to_string()),
+            ("gap", "12px".to_string()),
+            ("flex_grow", "auto".to_string()),
+        ];
 
         let style = style_for(&props);
 
         assert_eq!(style.size.width, Dimension::auto());
+        assert_eq!(style.size.height, Dimension::auto());
+        assert_eq!(style.gap.width, length(0.0));
+        assert_eq!(style.flex_grow, 0.0);
+
+        // 方向也一样：认不出的值不该把默认的 row 翻成 column。
+        let only_direction =
+            vec![("flex_direction", "colum".to_string())];
+        assert_eq!(
+            style_for(&only_direction).flex_direction,
+            FlexDirection::Row
+        );
     }
 
 

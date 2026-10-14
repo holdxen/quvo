@@ -3472,6 +3472,38 @@ fn install_pump(
 }
 
 
+/// 收尾：把 Pump 从 thread_local 里摘出来，**趁 TLS 还活着**的时候释放。
+///
+/// 为什么非得主动拆，不能等线程退出时 TLS 自动析构：
+/// Pump 里装着 `VirtualDom`，而 `VirtualDom::drop`
+/// （dioxus-core-0.7.10/src/virtual_dom.rs:786）会把每个 scope 逐个 drop，
+/// `ScopeState::drop`（scopes.rs:157）→ `Runtime::remove_scope`
+/// → `RuntimeGuard::new` → `Runtime::push`（runtime.rs:312）——
+/// 那一步要读写 **dioxus 自己的那个 thread_local**（runtime stack）。
+/// 线程退出时各 TLS 析构器之间没有任何顺序保证：轮到 `PUMP` 的时候
+/// runtime stack 很可能已经在销毁中了，于是当场 panic
+/// （实测：点窗口关闭按钮 → exec 返回 → main 收尾，栈就是这个）——
+///
+///     cannot access a Thread Local Storage value during or after destruction: AccessError
+///
+/// 放在 exec 之后、main 返回之前，两件事同时成立：所有 thread_local
+/// 都还在正常状态，而且 `qt_app` 还没析构（QGuiApplication 在场，
+/// 删 QQuickWindow 那一串才安全）。
+fn dismantle_pump() {
+    // `take` 出来的值在 with 结束、借据释放之后才 drop：
+    // drop 虚拟 dom 的过程中不管拐回哪里，都不会撞上 already borrowed。
+    let taken = PUMP.with(|slot| slot.borrow_mut().take());
+
+    if taken.is_some() {
+        println!(
+            "[pump] 回路已拆除：VirtualDom / QtRenderer 在 TLS 析构之前就还掉了"
+        );
+    } else {
+        println!("[pump] 回路本来就没装上，没什么可拆");
+    }
+}
+
+
 /// 回路本身：反复 poll `wait_for_work` 直到 Pending，中间每次 Ready 都渲染一轮。
 /// 调用者只有一个：C++ 的 `schedule_pump_poll()` 排进事件队列的那个 functor。
 ///
@@ -4785,8 +4817,9 @@ fn main() {
     //     → C++ schedule_pump_poll() → 排一个 Qt 事件
     //     → qt_pump_poll：poll wait_for_work → Ready → 渲染 + 布局
     //
-    // main 到这里就把 vdom / renderer 整个交出去，之后自己再也不碰它们 ——
+    // main 到这里就把 vdom / renderer 整个交出去，运行期间再也不碰它们 ——
     // 也就是说 exec() 之后如果没有人点按钮，日志里不会再出现一行渲染。
+    // 唯一还会回头碰一次的地方是 exec 返回之后的 dismantle_pump()。
 
     // 转换器必须比第一次点击更早装好：
     // onclick 的 listener 里那步 `From<&PlatformEventData> for MouseData`
@@ -4810,6 +4843,10 @@ fn main() {
     {
         app.exec();
     }
+
+    // exec 回来 = 窗口关了（或者 quit 了）。
+    // 回路必须在这里当场拆掉，不能留给线程退出时的 TLS 析构 —— 见 dismantle_pump。
+    dismantle_pump();
 }
 
 
